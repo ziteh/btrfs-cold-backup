@@ -75,21 +75,21 @@ btrfs-cold-backup/
 ├── src/
 │   ├── main.rs          # 入口，dispatch 子命令
 │   ├── cli.rs           # clap CLI 定義
-│   ├── config.rs        # Config/Task/S3Config + validate()
-│   ├── manifest.rs      # Backup/Last/State/PartInfo + serde
+│   ├── config.rs        # Config/Task/S3Config + validate() + #[cfg(test)] Layer 1 tests
+│   ├── manifest.rs      # Backup/Last/State/PartInfo + serde + #[cfg(test)] Layer 1 tests
+│   ├── util.rs          # 路徑建構、時間格式等 + #[cfg(test)] Layer 1 tests
 │   ├── btrfs.rs         # BtrfsOps trait + BtrfsDriver 實作
 │   ├── crypto.rs        # Age encrypt/decrypt + BLAKE3
 │   ├── remote.rs        # RemoteBackend trait + S3Backend 實作
-│   ├── lock.rs          # PID lock file（guard 模式）
+│   ├── lock.rs          # PID lock file（guard 模式） + #[cfg(test)] 並行測試
 │   ├── backup.rs        # 備份編排
 │   ├── restore.rs       # 還原編排
 │   ├── list.rs          # 列出備份
 │   ├── check.rs         # 前置驗證
 │   ├── keys.rs          # age 金鑰生成
-│   └── util.rs          # 路徑建構、時間格式等
+│   └── lib.rs           # 公開 API（為了 tests/ 能呼叫）
 └── tests/
-    ├── unit/            # Layer 1：純邏輯，無外部依賴
-    ├── integration/     # Layer 2：mockall mock FS + Remote
+    ├── integration/     # Layer 2：mockall mock FS + Remote（業務邏輯整合測試）
     ├── vm/              # Layer 3：真實 btrfs（CI privileged VM）
     └── e2e/             # Layer 4：VM + MinIO 完整生命週期
 ```
@@ -123,49 +123,53 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 ### Phase 1 — Foundation（純型別，無外部依賴）
 
-1. 初始化 Cargo project，設定 `Cargo.toml`
-2. `config.rs`：定義型別與 `validate()` 方法
-3. `manifest.rs`：定義 `Backup`、`Last`、`State`、`PartInfo`，全部實作 serde
-4. `util.rs`：路徑建構（subvolume path sanitize → S3 key、`task_dir_name(level, ts)`）
-5. **Layer 1 tests**（`#[cfg(test)]` 內聯）：
+1. 初始化 Cargo project，設定 `Cargo.toml` + `lib.rs`
+2. `config.rs`：定義型別與 `validate()` 方法，內含 `#[cfg(test)]` Layer 1 tests
    - 設定驗證（空欄位、非法 age key、重複 task name、負層級）
-   - Manifest serde 往返一致性（含 null 層級）
-   - 路徑建構（特殊字元、manifest 路徑 vs 資料路徑不衝突）
-   - 鎖定並行測試
+3. `manifest.rs`：定義 `Backup`、`Last`、`State`、`PartInfo`，全部實作 serde，內含 `#[cfg(test)]` Layer 1 tests
+   - Serde 往返一致性（含 null 層級）
+   - 時間戳記格式驗證
+4. `util.rs`：路徑建構（subvolume path sanitize → S3 key、`task_dir_name(level, ts)`），內含 `#[cfg(test)]` Layer 1 tests
+   - 特殊字元處理、manifest 路徑 vs 資料路徑不衝突
+5. `lock.rs`：PID lock（drop guard 自動釋放，陳舊鎖回收），內含 `#[cfg(test)]` 並行測試
 
-步驟 2/3/4 可並行實作。
+步驟 2/3/4/5 可並行實作。`cargo test` 即可執行所有 Layer 1 tests。
 
-### Phase 2 — 核心抽象層（trait + 實作 + Layer 2 tests）
+### Phase 2 — 核心抽象層（trait + 實作）
 
-6. `btrfs.rs`：定義 `BtrfsOps` trait，實作 `BtrfsDriver`（呼叫 `btrfs` CLI）
-7. `remote.rs`：定義 `RemoteBackend` trait，實作 `S3Backend`
+6. `btrfs.rs`：定義 `BtrfsOps` trait（`list_snapshots`, `send_full`, `send_incremental`, `create_snapshot`, `delete_snapshot`, `subvolume_exists`），實作 `BtrfsDriver`（呼叫 `btrfs` CLI）
+7. `remote.rs`：定義 `RemoteBackend` trait（`upload`, `head`, `download`, `verify_credentials`），實作 `S3Backend`（aws-sdk-s3）
 8. `crypto.rs`：`encrypt_file`、`decrypt_file`、`blake3_file`
-9. `lock.rs`：PID lock（drop guard 自動釋放，陳舊鎖回收）
-10. **Layer 2 tests**（`tests/integration/`，使用 `mockall`）：
-    - Level 0 完整備份流程、快照不存在時拒絕、上傳失敗重試
-    - Level 1 增量備份（Level 0 不存在時拒絕、parent 遺失偵測）
-    - 中斷續傳（各種恢復場景）
-    - 還原流程（hash 不符中止、目標已存在確認）
 
-步驟 6/7/8 可並行；9 依賴 4。
+步驟 6/7/8 可並行實作。
+
+### Phase 2.5 — Layer 2 整合測試（使用 mockall）
+
+9. `tests/integration/backup_test.rs`：測試 backup 業務邏輯（使用 mock BtrfsOps + RemoteBackend）
+   - Level 0 完整備份流程、快照不存在時拒絕、上傳失敗重試
+   - Level 1 增量備份（Level 0 不存在時拒絕、parent 遺失偵測）
+   - 中斷續傳（各種恢復場景）
+   - 還原流程（hash 不符中止、目標已存在確認）
+
+執行：`cargo test --test backup_test` 或 `cargo test integration`
 
 ### Phase 3 — 業務邏輯
 
-12. `backup.rs`：備份編排（load config → lock → list snapshots → send → encrypt → upload）
-13. `restore.rs`：還原編排（download → verify → decrypt → concat → `btrfs receive`）
-14. `check.rs`：前置驗證（config validate → subvolume_exists → S3 verify_credentials）
-15. `list.rs`：列出備份（S3 prefix 列舉 manifest，格式化輸出）
-16. `keys.rs`：age 金鑰生成
+10. `backup.rs`：備份編排（load config → lock → list snapshots → send → encrypt → upload）
+11. `restore.rs`：還原編排（download → verify → decrypt → concat → `btrfs receive`）
+12. `check.rs`：前置驗證（config validate → subvolume_exists → S3 verify_credentials）
+13. `list.rs`：列出備份（S3 prefix 列舉 manifest，格式化輸出）
+14. `keys.rs`：age 金鑰生成
 
 ### Phase 4 — CLI 接線
 
-17. `cli.rs`：clap 定義所有子命令（`genkey`, `check`, `backup`, `list`, `restore`）
-18. `main.rs`：dispatch + tracing 日誌初始化
+15. `cli.rs`：clap 定義所有子命令（`genkey`, `check`, `backup`, `list`, `restore`）
+16. `main.rs`：dispatch + tracing 日誌初始化
 
 ### Phase 5 — VM / E2E 測試
 
-19. `tests/vm/btrfs_driver_test.rs`：對真實 btrfs loop device 測試 `BtrfsDriver`（需 CI privileged VM）
-20. `tests/e2e/`：完整生命週期（Level 0 + Level 1 + 還原、中途中斷續傳、加密驗證；需 VM + MinIO）
+17. `tests/vm/btrfs_driver_test.rs`：對真實 btrfs loop device 測試 `BtrfsDriver`（需 CI privileged VM）
+18. `tests/e2e/`：完整生命週期（Level 0 + Level 1 + 還原、中途中斷續傳、加密驗證；需 VM + MinIO）
 
 ---
 

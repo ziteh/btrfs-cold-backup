@@ -1,0 +1,23 @@
+[package]
+name = "btrfs-cold-backup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+age = "0.11"
+anyhow = "1"
+aws-config = "1"
+aws-sdk-s3 = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+mockall = "0.14"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
