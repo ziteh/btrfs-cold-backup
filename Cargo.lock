@@ -726,6 +726,7 @@ dependencies = [
  "aws-sdk-s3",
  "blake3",
  "clap",
+ "libc",
  "mockall",
  "serde",
  "serde_yaml",

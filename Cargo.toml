@@ -10,6 +10,7 @@ aws-config = "1"
 aws-sdk-s3 = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
