@@ -76,33 +76,35 @@ pub async fn restore_task<B: BtrfsOps, R: RemoteBackend>(
         dec_paths.push(dec_path);
     }
 
-    // Pipe decrypted stream into btrfs receive
+    // Pipe decrypted parts sequentially into btrfs receive
     tokio::fs::create_dir_all(target_dir).await?;
     let target_str = target_dir
         .to_str()
         .ok_or_else(|| anyhow!("target_dir contains invalid UTF-8"))?;
 
-    match dec_paths.as_slice() {
-        [dec_path] => {
-            use std::process::Stdio;
-            let stdin_file = std::fs::File::open(dec_path)?;
-            let output = tokio::process::Command::new("btrfs")
-                .args(["receive", target_str])
-                .stdin(Stdio::from(stdin_file))
-                .output()
-                .await?;
+    use tokio::process::Command;
+    let mut child = Command::new("btrfs")
+        .args(["receive", target_str])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open btrfs receive stdin"))?;
+        for dec_path in &dec_paths {
+            let mut f = tokio::fs::File::open(dec_path).await?;
+            tokio::io::copy(&mut f, &mut stdin).await?;
             let _ = tokio::fs::remove_file(dec_path).await;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow!("btrfs receive failed: {}", stderr.trim()));
-            }
         }
-        _ => {
-            for p in &dec_paths {
-                let _ = tokio::fs::remove_file(p).await;
-            }
-            return Err(anyhow!("multi-part restore not yet implemented"));
-        }
+    }
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("btrfs receive failed: {}", stderr.trim()));
     }
 
     Ok(())
