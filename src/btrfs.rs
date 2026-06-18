@@ -49,8 +49,8 @@ pub struct BtrfsDriver;
 
 impl BtrfsOps for BtrfsDriver {
     async fn list_snapshots(&self, snapshot_dir: &Path) -> Result<Vec<String>> {
-        let mut entries = tokio::fs::read_dir(snapshot_dir).await?;
         let mut names = Vec::new();
+        let mut entries = tokio::fs::read_dir(snapshot_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();

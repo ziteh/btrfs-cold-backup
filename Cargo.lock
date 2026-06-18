@@ -728,6 +728,7 @@ dependencies = [
  "clap",
  "libc",
  "mockall",
+ "secrecy",
  "serde",
  "serde_yaml",
  "tempfile",
