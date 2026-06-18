@@ -1,7 +1,10 @@
 pub mod backup;
 pub mod btrfs;
+pub mod check;
 pub mod config;
 pub mod crypto;
+pub mod keys;
+pub mod list;
 pub mod lock;
 pub mod manifest;
 pub mod remote;
