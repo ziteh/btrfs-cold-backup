@@ -1,5 +1,3 @@
-//! Configuration types with serialization and validation
-
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

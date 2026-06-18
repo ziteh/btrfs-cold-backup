@@ -1,4 +1,4 @@
-//! Backup manifest structures for serialization and state tracking
+//! Backup manifest for state tracking
 
 use serde::{Deserialize, Serialize};
 
