@@ -79,6 +79,12 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        let bytes =
+            std::fs::read(path).map_err(|e| anyhow!("failed to read config {:?}: {e}", path))?;
+        Ok(serde_yaml::from_slice(&bytes)?)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.base_dir.as_os_str().is_empty() {
             return Err(anyhow!("base_dir cannot be empty"));
