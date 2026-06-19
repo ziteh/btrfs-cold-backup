@@ -8,8 +8,8 @@ pub struct BackupEntry {
 }
 
 fn parse_entry(key: &str) -> Option<BackupEntry> {
-    // key format: {prefix}manifests/{sanitized_subvol}/bcr_level{N}_{YYYYMMDD}/task_manifest.yaml
-    let dir = key.split('/').find(|s| s.starts_with("bcr_level"))?;
+    // key format: {prefix}manifests/{sanitized_subvol}/bcb_level{N}_{YYYYMMDD}/task_manifest.yaml
+    let dir = key.split('/').find(|s| s.starts_with("bcb_level"))?;
     let parts: Vec<&str> = dir.split('_').collect();
     let [_, level_str, date, ..] = parts.as_slice() else {
         return None;

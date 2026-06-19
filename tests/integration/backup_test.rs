@@ -83,7 +83,7 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
-    let snap = "bcr_level0_20260602_14-30";
+    let snap = "bcb_level0_20260602_14-30";
 
     let mut btrfs = MockBtrfs::new();
     btrfs
@@ -131,8 +131,8 @@ async fn level1_incremental_should_use_level0_as_parent() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
-    let parent = "bcr_level0_20260601_14-30";
-    let snap = "bcr_level1_20260602_14-30";
+    let parent = "bcb_level0_20260601_14-30";
+    let snap = "bcb_level1_20260602_14-30";
 
     let mut btrfs = MockBtrfs::new();
     btrfs
@@ -173,7 +173,7 @@ async fn level1_should_fail_when_no_remote_level0_exists() {
     let mut btrfs = MockBtrfs::new();
     btrfs
         .expect_list_snapshots()
-        .returning(|_| Ok(vec!["bcr_level1_20260602_14-30".to_string()]));
+        .returning(|_| Ok(vec!["bcb_level1_20260602_14-30".to_string()]));
 
     let mut remote = MockRemote::new();
     remote
@@ -191,8 +191,8 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
-    let parent = "bcr_level0_20260601_14-30";
-    let snap = "bcr_level1_20260602_14-30";
+    let parent = "bcb_level0_20260601_14-30";
+    let snap = "bcb_level1_20260602_14-30";
 
     let mut btrfs = MockBtrfs::new();
     // parent snapshot has been deleted locally
@@ -264,7 +264,7 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
     let backup_manifest = Backup {
         timestamp: "2026-06-02T14:30:00Z".to_string(),
         level: 0,
-        snapshot_name: "bcr_level0_20260602_14-30".to_string(),
+        snapshot_name: "bcb_level0_20260602_14-30".to_string(),
         parent_snapshot: None,
         total_size_bytes: encrypted_bytes.len() as u64,
         sha256: blake3_hash.clone(),
@@ -321,7 +321,7 @@ async fn restore_should_fail_on_blake3_mismatch() {
     let backup_manifest = Backup {
         timestamp: "2026-06-02T14:30:00Z".to_string(),
         level: 0,
-        snapshot_name: "bcr_level0_20260602_14-30".to_string(),
+        snapshot_name: "bcb_level0_20260602_14-30".to_string(),
         parent_snapshot: None,
         total_size_bytes: 10,
         sha256: "wrong_hash_that_will_never_match".to_string(),

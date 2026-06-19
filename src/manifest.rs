@@ -82,7 +82,7 @@ mod tests {
         let backup = Backup {
             timestamp: "2026-06-02T14:30:00Z".to_string(),
             level: 0,
-            snapshot_name: "bcr_level0_2026-06-02_14-30".to_string(),
+            snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
             parent_snapshot: None,
             total_size_bytes: 5120,
             sha256: "def456".to_string(),
@@ -109,8 +109,8 @@ mod tests {
         let backup = Backup {
             timestamp: "2026-06-02T15:30:00Z".to_string(),
             level: 1,
-            snapshot_name: "bcr_level1_2026-06-02_15-30".to_string(),
-            parent_snapshot: Some("bcr_level0_2026-06-02_14-30".to_string()),
+            snapshot_name: "bcb_level1_2026-06-02_15-30".to_string(),
+            parent_snapshot: Some("bcb_level0_2026-06-02_14-30".to_string()),
             total_size_bytes: 2048,
             sha256: "ghi789".to_string(),
             parts: vec![PartInfo {
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(backup, deserialized);
         assert_eq!(
             deserialized.parent_snapshot,
-            Some("bcr_level0_2026-06-02_14-30".to_string())
+            Some("bcb_level0_2026-06-02_14-30".to_string())
         );
     }
 
@@ -133,7 +133,7 @@ mod tests {
         let last = Last {
             timestamp: "2026-06-02T14:30:00Z".to_string(),
             level: 0,
-            snapshot_name: "bcr_level0_2026-06-02_14-30".to_string(),
+            snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
         };
         let yaml = serde_yaml::to_string(&last).unwrap();
         let deserialized: Last = serde_yaml::from_str(&yaml).unwrap();
@@ -145,7 +145,7 @@ mod tests {
         let backup = Backup {
             timestamp: "2026-06-02T14:30:00Z".to_string(),
             level: 0,
-            snapshot_name: "bcr_level0_2026-06-02_14-30".to_string(),
+            snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
             parent_snapshot: None,
             total_size_bytes: 5120,
             sha256: "def456".to_string(),
@@ -172,10 +172,10 @@ mod tests {
         let mut state = BackupState {
             task_name: "home".to_string(),
             level: 0,
-            snapshot_name: "bcr_level0_2026-06-02_14-30".to_string(),
+            snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
             parent_snapshot: None,
             timestamp: "2026-06-02T14:30:00Z".to_string(),
-            output_dir: "/var/lib/bcr/task/mnt_data/bcr_level0_20260602".to_string(),
+            output_dir: "/var/lib/bcb/task/mnt_data/bcb_level0_20260602".to_string(),
             stream_hash: Some("abc123".to_string()),
             parts_completed: HashMap::new(),
             manifest_uploaded: false,
@@ -215,10 +215,10 @@ mod tests {
         let state = BackupState {
             task_name: "test-task".to_string(),
             level: 1,
-            snapshot_name: "bcr_level1_2026-06-02_14-30".to_string(),
-            parent_snapshot: Some("bcr_level0_2026-06-01_10-00".to_string()),
+            snapshot_name: "bcb_level1_2026-06-02_14-30".to_string(),
+            parent_snapshot: Some("bcb_level0_2026-06-01_10-00".to_string()),
             timestamp: "2026-06-02T14:30:00Z".to_string(),
-            output_dir: "/tmp/bcr/task/mnt/bcr_level1_20260602".to_string(),
+            output_dir: "/tmp/bcb/task/mnt/bcb_level1_20260602".to_string(),
             stream_hash: Some("streamhash".to_string()),
             parts_completed: HashMap::new(),
             manifest_uploaded: true,

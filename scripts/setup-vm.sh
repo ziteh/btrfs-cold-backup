@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# Run inside the Multipass VM as root to prepare btrfs + MinIO.
-# Rust is NOT needed here — test binaries are cross-compiled on the host.
 set -euo pipefail
 
-LOOP_IMG=/var/lib/bcr-test/btrfs.img
-BTRFS_MOUNT=/mnt/bcr-test
+LOOP_IMG=/var/lib/bcb-test/btrfs.img
+BTRFS_MOUNT=/mnt/bcb-test
 MINIO_DATA=/var/lib/minio
 MINIO_BIN=/usr/local/bin/minio
 MC_BIN=/usr/local/bin/mc
-S3_BUCKET=bcr-test
+S3_BUCKET=bcb-test
 S3_USER=minioadmin
 S3_PASS=minioadmin
 
-# Sync clock before apt (VM time drift causes "not valid yet" errors)
+# Sync clock before apt
 chronyc makestep 2>/dev/null || true
 
 apt-get update -q

@@ -1,21 +1,39 @@
 #!/usr/bin/env bash
-# Cross-compile test binaries on macOS (via Docker + cross) and run them in the Multipass VM.
 set -euo pipefail
 
-VM=bcr-dev
-BTRFS_MOUNT=/mnt/bcr-test
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VM=bcb-dev
+BTRFS_MOUNT=/mnt/bcb-test
 S3_ENDPOINT=http://localhost:9000
-S3_BUCKET=bcr-test
+S3_BUCKET=bcb-test
 S3_USER=minioadmin
 S3_PASS=minioadmin
 TARGET=aarch64-unknown-linux-gnu
 
+# VM setup
+
+if ! multipass info "$VM" &>/dev/null; then
+    echo "==> Launching VM $VM..."
+    multipass launch --name "$VM" --disk 10G
+fi
+
+if ! multipass exec "$VM" -- mountpoint -q "$BTRFS_MOUNT" &>/dev/null || \
+   ! multipass exec "$VM" -- pgrep -x minio &>/dev/null; then
+    echo "==> Running VM setup..."
+    multipass transfer "$SCRIPT_DIR/setup-vm.sh" "$VM:setup-vm.sh"
+    multipass exec "$VM" -- sudo bash setup-vm.sh
+fi
+
+# Host toolchain
+
 if ! command -v cross &>/dev/null; then
-    echo "Installing cross..."
+    echo "==> Installing cross..."
     cargo install cross
 fi
 
 rustup target add "$TARGET"
+
+# Build and run
 
 build_and_run() {
     local test_name=$1
@@ -42,12 +60,12 @@ build_and_run() {
 }
 
 build_and_run vm \
-    "BCR_BTRFS_MOUNT=$BTRFS_MOUNT"
+    "BCB_BTRFS_MOUNT=$BTRFS_MOUNT"
 
 build_and_run e2e \
-    "BCR_BTRFS_MOUNT=$BTRFS_MOUNT" \
-    "BCR_S3_ENDPOINT=$S3_ENDPOINT" \
-    "BCR_S3_BUCKET=$S3_BUCKET" \
+    "BCB_BTRFS_MOUNT=$BTRFS_MOUNT" \
+    "BCB_S3_ENDPOINT=$S3_ENDPOINT" \
+    "BCB_S3_BUCKET=$S3_BUCKET" \
     "AWS_ACCESS_KEY_ID=$S3_USER" \
     "AWS_SECRET_ACCESS_KEY=$S3_PASS" \
     "AWS_DEFAULT_REGION=us-east-1"

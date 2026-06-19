@@ -73,7 +73,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     } else {
         let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
         let snapshots = btrfs.list_snapshots(&task.snapshot_dir).await?;
-        let level_prefix = format!("bcr_level{level}_");
+        let level_prefix = format!("bcb_level{level}_");
         let sn = snapshots
             .iter()
             .filter(|s| s.starts_with(&level_prefix))

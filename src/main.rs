@@ -5,9 +5,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "bcr", about = "btrfs cold backup")]
+#[command(name = "bcb", about = "btrfs cold backup")]
 struct Cli {
-    #[arg(long, default_value = "/etc/bcr/config.yaml")]
+    #[arg(long, default_value = "/etc/bcb/config.yaml")]
     config: PathBuf,
     #[command(subcommand)]
     command: Commands,

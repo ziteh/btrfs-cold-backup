@@ -4,9 +4,9 @@ use std::process::Command;
 use btrfs_cold_backup::{BtrfsDriver, BtrfsOps};
 use tokio::io::AsyncReadExt;
 
-/// Returns the btrfs test mount path from BCR_BTRFS_MOUNT, or None to skip.
+/// Returns the btrfs test mount path from BCB_BTRFS_MOUNT, or None to skip.
 fn btrfs_mount() -> Option<PathBuf> {
-    std::env::var("BCR_BTRFS_MOUNT").ok().map(PathBuf::from)
+    std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from)
 }
 
 /// Creates a unique working directory under the btrfs mount for one test.
@@ -86,7 +86,7 @@ async fn create_snapshot_should_create_readonly_snapshot() {
 
     let driver = BtrfsDriver;
     let snap = driver
-        .create_snapshot(&subvol, &snap_dir, "bcr_level0_20260101_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level0_20260101_00-00")
         .await
         .unwrap();
 
@@ -109,7 +109,7 @@ async fn delete_snapshot_should_remove_the_snapshot() {
 
     let driver = BtrfsDriver;
     let snap = driver
-        .create_snapshot(&subvol, &snap_dir, "bcr_level0_20260101_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level0_20260101_00-00")
         .await
         .unwrap();
     assert!(snap.exists());
@@ -121,15 +121,15 @@ async fn delete_snapshot_should_remove_the_snapshot() {
 }
 
 #[tokio::test]
-async fn list_snapshots_should_return_only_bcr_prefixed_dirs() {
+async fn list_snapshots_should_return_only_bcb_prefixed_dirs() {
     let Some(mount) = btrfs_mount() else { return };
     let dir = test_dir(&mount, "list-snaps");
     let snap_dir = dir.join("snapshots");
     std::fs::create_dir_all(&snap_dir).unwrap();
 
-    // Create bcr-prefixed snapshot dirs and one unrelated dir
-    std::fs::create_dir(snap_dir.join("bcr_level0_20260101_00-00")).unwrap();
-    std::fs::create_dir(snap_dir.join("bcr_level1_20260102_00-00")).unwrap();
+    // Create bcb-prefixed snapshot dirs and one unrelated dir
+    std::fs::create_dir(snap_dir.join("bcb_level0_20260101_00-00")).unwrap();
+    std::fs::create_dir(snap_dir.join("bcb_level1_20260102_00-00")).unwrap();
     std::fs::create_dir(snap_dir.join("unrelated")).unwrap();
 
     let driver = BtrfsDriver;
@@ -137,7 +137,7 @@ async fn list_snapshots_should_return_only_bcr_prefixed_dirs() {
 
     assert_eq!(
         names,
-        vec!["bcr_level0_20260101_00-00", "bcr_level1_20260102_00-00"]
+        vec!["bcb_level0_20260101_00-00", "bcb_level1_20260102_00-00"]
     );
 }
 
@@ -151,7 +151,7 @@ async fn send_full_should_produce_non_empty_stream() {
     btrfs_subvolume_create(&subvol);
     std::fs::write(subvol.join("data.txt"), b"btrfs send test").unwrap();
 
-    let snap = snap_dir.join("bcr_level0_20260101_00-00");
+    let snap = snap_dir.join("bcb_level0_20260101_00-00");
     btrfs_snapshot(&subvol, &snap);
 
     let driver = BtrfsDriver;
@@ -174,13 +174,13 @@ async fn send_incremental_should_produce_smaller_stream_than_full() {
     btrfs_subvolume_create(&subvol);
     std::fs::write(subvol.join("data.txt"), b"initial content").unwrap();
 
-    let snap0 = snap_dir.join("bcr_level0_20260101_00-00");
+    let snap0 = snap_dir.join("bcb_level0_20260101_00-00");
     btrfs_snapshot(&subvol, &snap0);
 
     // Make the subvolume writable again by deleting and recreating
     // (btrfs snapshot -r is read-only; add data to parent subvol)
     std::fs::write(subvol.join("extra.txt"), b"added later").unwrap();
-    let snap1 = snap_dir.join("bcr_level1_20260102_00-00");
+    let snap1 = snap_dir.join("bcb_level1_20260102_00-00");
     btrfs_snapshot(&subvol, &snap1);
 
     let driver = BtrfsDriver;

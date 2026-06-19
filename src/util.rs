@@ -38,7 +38,7 @@ pub fn task_dir_name(level: u32, timestamp: &str) -> Result<String> {
     let date_part = &timestamp[0..10];
     let date_no_dash = date_part.replace("-", "");
 
-    Ok(format!("bcr_level{}_{}", level, date_no_dash))
+    Ok(format!("bcb_level{}_{}", level, date_no_dash))
 }
 
 pub fn s3_backup_key(
@@ -111,7 +111,7 @@ pub fn snapshot_name(_level: u32, date_str: &str, time_str: &str) -> Result<Stri
         return Err(anyhow!("time_str must be in HH-MM format"));
     }
 
-    Ok(format!("bcr_level0_{}_{}", date_str, time_str))
+    Ok(format!("bcb_level0_{}_{}", date_str, time_str))
 }
 
 #[cfg(test)]
@@ -157,19 +157,19 @@ mod tests {
     #[test]
     fn test_task_dir_name_level_zero() {
         let result = task_dir_name(0, "2026-06-02T14:30:00Z").unwrap();
-        assert_eq!(result, "bcr_level0_20260602");
+        assert_eq!(result, "bcb_level0_20260602");
     }
 
     #[test]
     fn test_task_dir_name_level_one() {
         let result = task_dir_name(1, "2026-06-02T14:30:00Z").unwrap();
-        assert_eq!(result, "bcr_level1_20260602");
+        assert_eq!(result, "bcb_level1_20260602");
     }
 
     #[test]
     fn test_task_dir_name_different_date() {
         let result = task_dir_name(2, "2025-12-25T10:15:30Z").unwrap();
-        assert_eq!(result, "bcr_level2_20251225");
+        assert_eq!(result, "bcb_level2_20251225");
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
         let key = s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", 1).unwrap();
         assert_eq!(
             key,
-            "backups/backup-data/mnt_data/bcr_level0_20260602/snapshot.part-1.age"
+            "backups/backup-data/mnt_data/bcb_level0_20260602/snapshot.part-1.age"
         );
     }
 
@@ -199,7 +199,7 @@ mod tests {
             s3_backup_key("backups/", "mnt_data_movies", 1, "2026-06-02T15:00:00Z", 5).unwrap();
         assert_eq!(
             key,
-            "backups/backup-data/mnt_data_movies/bcr_level1_20260602/snapshot.part-5.age"
+            "backups/backup-data/mnt_data_movies/bcb_level1_20260602/snapshot.part-5.age"
         );
     }
 
@@ -208,7 +208,7 @@ mod tests {
         let key = s3_manifest_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z").unwrap();
         assert_eq!(
             key,
-            "backups/manifests/mnt_data/bcr_level0_20260602/task_manifest.yaml"
+            "backups/manifests/mnt_data/bcb_level0_20260602/task_manifest.yaml"
         );
     }
 
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn test_snapshot_name() {
         let name = snapshot_name(0, "2026-06-02", "14-30").unwrap();
-        assert_eq!(name, "bcr_level0_2026-06-02_14-30");
+        assert_eq!(name, "bcb_level0_2026-06-02_14-30");
     }
 
     #[test]

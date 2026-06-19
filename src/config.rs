@@ -141,7 +141,7 @@ mod tests {
 
     fn valid_config() -> Config {
         Config {
-            base_dir: PathBuf::from("/var/lib/bcr"),
+            base_dir: PathBuf::from("/var/lib/bcb"),
             age_public_key:
                 "age1qypmyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpq"
                     .to_string(),

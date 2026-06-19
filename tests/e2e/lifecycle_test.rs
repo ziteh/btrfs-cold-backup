@@ -16,9 +16,9 @@ struct E2eEnv {
 /// Returns the e2e env from env vars, or None to skip the test.
 fn e2e_env() -> Option<E2eEnv> {
     Some(E2eEnv {
-        btrfs_mount: std::env::var("BCR_BTRFS_MOUNT").ok().map(PathBuf::from)?,
-        s3_endpoint: std::env::var("BCR_S3_ENDPOINT").ok()?,
-        s3_bucket: std::env::var("BCR_S3_BUCKET").ok()?,
+        btrfs_mount: std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from)?,
+        s3_endpoint: std::env::var("BCB_S3_ENDPOINT").ok()?,
+        s3_bucket: std::env::var("BCB_S3_BUCKET").ok()?,
     })
 }
 
@@ -98,7 +98,7 @@ async fn level0_backup_and_restore_should_round_trip() {
     // Take a read-only snapshot manually (BtrfsDriver.create_snapshot creates one)
     let btrfs = BtrfsDriver;
     let snap = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcr_level0_20260601_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level0_20260601_00-00")
         .await
         .unwrap();
 
@@ -141,7 +141,7 @@ async fn level0_backup_and_restore_should_round_trip() {
 
     // Verify the restored data
     let restored_file = restore_dir
-        .join("bcr_level0_20260601_00-00")
+        .join("bcb_level0_20260601_00-00")
         .join("hello.txt");
     let content = std::fs::read(&restored_file).unwrap();
     assert_eq!(content, b"round-trip test");
@@ -168,13 +168,13 @@ async fn level1_incremental_backup_should_succeed_after_level0() {
 
     let btrfs = BtrfsDriver;
     let snap0 = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcr_level0_20260601_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level0_20260601_00-00")
         .await
         .unwrap();
 
     std::fs::write(subvol.join("delta.txt"), b"delta").unwrap();
     let snap1 = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcr_level1_20260602_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level1_20260602_00-00")
         .await
         .unwrap();
 
@@ -206,7 +206,7 @@ async fn level1_incremental_backup_should_succeed_after_level0() {
     assert_eq!(b1.level, 1);
     assert_eq!(
         b1.parent_snapshot.as_deref(),
-        Some("bcr_level0_20260601_00-00")
+        Some("bcb_level0_20260601_00-00")
     );
 
     btrfs_subvolume_delete(&snap1);
