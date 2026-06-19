@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
     let path_str = subvolume
@@ -68,6 +68,23 @@ pub fn s3_manifest_key(
         prefix, sanitized_subvol, dir_name
     );
     Ok(key)
+}
+
+pub fn state_path(base_dir: &Path, sanitized_subvol: &str) -> PathBuf {
+    base_dir
+        .join("run")
+        .join(sanitized_subvol)
+        .join("backup_state.yaml")
+}
+
+pub fn backup_output_dir(
+    base_dir: &Path,
+    sanitized_subvol: &str,
+    level: u32,
+    timestamp: &str,
+) -> Result<PathBuf> {
+    let dir_name = task_dir_name(level, timestamp)?;
+    Ok(base_dir.join("task").join(sanitized_subvol).join(dir_name))
 }
 
 pub fn s3_last_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {

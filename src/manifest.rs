@@ -1,6 +1,7 @@
-//! Backup manifest for state tracking
-
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartInfo {
@@ -21,25 +22,43 @@ pub struct Backup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct State {
-    pub upload_status: UploadStatus,
-    pub last_successful_part: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum UploadStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Last {
     pub timestamp: String, // ISO 8601
     pub level: u32,
     pub snapshot_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletedPart {
+    pub size_bytes: u64,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BackupState {
+    pub task_name: String,
+    pub level: u32,
+    pub snapshot_name: String,
+    pub parent_snapshot: Option<String>,
+    pub timestamp: String,
+    pub output_dir: String,
+    pub stream_hash: Option<String>,
+    pub parts_completed: HashMap<u32, CompletedPart>,
+    pub manifest_uploaded: bool,
+    pub last_updated: i64,
+}
+
+pub fn read_state(path: &Path) -> Result<Option<BackupState>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_yaml::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn write_state(path: &Path, state: &BackupState) -> Result<()> {
+    std::fs::write(path, serde_yaml::to_string(state)?.as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -110,29 +129,6 @@ mod tests {
     }
 
     #[test]
-    fn test_state_serialize_deserialize() {
-        let state = State {
-            upload_status: UploadStatus::InProgress,
-            last_successful_part: Some(5),
-        };
-        let yaml = serde_yaml::to_string(&state).unwrap();
-        let deserialized: State = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(state, deserialized);
-    }
-
-    #[test]
-    fn test_state_no_successful_part() {
-        let state = State {
-            upload_status: UploadStatus::Pending,
-            last_successful_part: None,
-        };
-        let yaml = serde_yaml::to_string(&state).unwrap();
-        let deserialized: State = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(state, deserialized);
-        assert_eq!(deserialized.last_successful_part, None);
-    }
-
-    #[test]
     fn test_last_serialize_deserialize() {
         let last = Last {
             timestamp: "2026-06-02T14:30:00Z".to_string(),
@@ -142,22 +138,6 @@ mod tests {
         let yaml = serde_yaml::to_string(&last).unwrap();
         let deserialized: Last = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(last, deserialized);
-    }
-
-    #[test]
-    fn test_upload_status_variants() {
-        let statuses = vec![
-            UploadStatus::Pending,
-            UploadStatus::InProgress,
-            UploadStatus::Completed,
-            UploadStatus::Failed,
-        ];
-
-        for status in statuses {
-            let yaml = serde_yaml::to_string(&status).unwrap();
-            let deserialized: UploadStatus = serde_yaml::from_str(&yaml).unwrap();
-            assert_eq!(status, deserialized);
-        }
     }
 
     #[test]
@@ -175,5 +155,78 @@ mod tests {
         let deserialized: Backup = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(backup.parent_snapshot, deserialized.parent_snapshot);
         assert!(deserialized.parent_snapshot.is_none());
+    }
+
+    #[test]
+    fn test_backup_state_default() {
+        let state = BackupState::default();
+        assert!(state.task_name.is_empty());
+        assert_eq!(state.level, 0);
+        assert!(state.stream_hash.is_none());
+        assert!(state.parts_completed.is_empty());
+        assert!(!state.manifest_uploaded);
+    }
+
+    #[test]
+    fn test_backup_state_serialize_deserialize() {
+        let mut state = BackupState {
+            task_name: "home".to_string(),
+            level: 0,
+            snapshot_name: "bcr_level0_2026-06-02_14-30".to_string(),
+            parent_snapshot: None,
+            timestamp: "2026-06-02T14:30:00Z".to_string(),
+            output_dir: "/var/lib/bcr/task/mnt_data/bcr_level0_20260602".to_string(),
+            stream_hash: Some("abc123".to_string()),
+            parts_completed: HashMap::new(),
+            manifest_uploaded: false,
+            last_updated: 1748872200,
+        };
+        state.parts_completed.insert(
+            1,
+            CompletedPart {
+                size_bytes: 3221225472,
+                hash: "hash1".to_string(),
+            },
+        );
+        state.parts_completed.insert(
+            2,
+            CompletedPart {
+                size_bytes: 1073741824,
+                hash: "hash2".to_string(),
+            },
+        );
+
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        let deserialized: BackupState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn test_read_state_not_found() {
+        let result = read_state(Path::new("/nonexistent/path/backup_state.yaml"));
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_write_and_read_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup_state.yaml");
+
+        let state = BackupState {
+            task_name: "test-task".to_string(),
+            level: 1,
+            snapshot_name: "bcr_level1_2026-06-02_14-30".to_string(),
+            parent_snapshot: Some("bcr_level0_2026-06-01_10-00".to_string()),
+            timestamp: "2026-06-02T14:30:00Z".to_string(),
+            output_dir: "/tmp/bcr/task/mnt/bcr_level1_20260602".to_string(),
+            stream_hash: Some("streamhash".to_string()),
+            parts_completed: HashMap::new(),
+            manifest_uploaded: true,
+            last_updated: 12345,
+        };
+
+        write_state(&path, &state).unwrap();
+        let loaded = read_state(&path).unwrap().unwrap();
+        assert_eq!(state, loaded);
     }
 }
