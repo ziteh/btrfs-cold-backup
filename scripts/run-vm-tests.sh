@@ -17,8 +17,7 @@ if ! multipass info "$VM" &>/dev/null; then
     multipass launch --name "$VM" --disk 10G
 fi
 
-if ! multipass exec "$VM" -- mountpoint -q "$BTRFS_MOUNT" &>/dev/null || \
-   ! multipass exec "$VM" -- pgrep -x minio &>/dev/null; then
+if ! multipass exec "$VM" -- bash -c "mountpoint -q '$BTRFS_MOUNT' && pgrep -x minio > /dev/null" 2>/dev/null; then
     echo "==> Running VM setup..."
     multipass transfer "$SCRIPT_DIR/setup-vm.sh" "$VM:setup-vm.sh"
     multipass exec "$VM" -- sudo bash setup-vm.sh

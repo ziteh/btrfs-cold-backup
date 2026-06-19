@@ -47,22 +47,11 @@ fn btrfs_subvolume_delete(path: &Path) {
         .unwrap();
 }
 
-async fn ensure_bucket(endpoint: &str, bucket: &str) {
-    let out = Command::new("aws")
-        .args([
-            "s3",
-            "mb",
-            &format!("s3://{bucket}"),
-            "--endpoint-url",
-            endpoint,
-        ])
-        .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .env("AWS_DEFAULT_REGION", "us-east-1")
+async fn ensure_bucket(_endpoint: &str, bucket: &str) {
+    Command::new("mc")
+        .args(["mb", "--ignore-existing", &format!("local/{bucket}")])
         .output()
         .unwrap();
-    // Ignore error if bucket already exists
-    let _ = out;
 }
 
 fn s3_config(env: &E2eEnv) -> S3Config {
