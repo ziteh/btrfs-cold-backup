@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Run inside the Multipass VM as root to prepare btrfs + MinIO.
+# Rust is NOT needed here — test binaries are cross-compiled on the host.
 set -euo pipefail
 
 LOOP_IMG=/var/lib/bcr-test/btrfs.img
@@ -10,13 +12,11 @@ S3_BUCKET=bcr-test
 S3_USER=minioadmin
 S3_PASS=minioadmin
 
-apt-get update -q
-apt-get install -y btrfs-progs awscli curl
+# Sync clock before apt (VM time drift causes "not valid yet" errors)
+chronyc makestep 2>/dev/null || true
 
-if ! command -v cargo &>/dev/null; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-    source "$HOME/.cargo/env"
-fi
+apt-get update -q
+apt-get install -y btrfs-progs curl
 
 # btrfs loop device
 mkdir -p "$(dirname "$LOOP_IMG")" "$BTRFS_MOUNT"
@@ -28,9 +28,15 @@ if ! mountpoint -q "$BTRFS_MOUNT"; then
     mount -o loop "$LOOP_IMG" "$BTRFS_MOUNT"
 fi
 
+# Detect architecture for MinIO downloads
+case "$(uname -m)" in
+    aarch64|arm64) ARCH=arm64 ;;
+    *)             ARCH=amd64 ;;
+esac
+
 # MinIO server
-if [ ! -f "$MINIO_BIN" ]; then
-    curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o "$MINIO_BIN"
+if [ ! -f "$MINIO_BIN" ] || ! file "$MINIO_BIN" | grep -q "$(uname -m)"; then
+    curl -fsSL "https://dl.min.io/server/minio/release/linux-${ARCH}/minio" -o "$MINIO_BIN"
     chmod +x "$MINIO_BIN"
 fi
 
@@ -42,23 +48,13 @@ if ! pgrep -x minio &>/dev/null; then
 fi
 
 # MinIO client + bucket
-if [ ! -f "$MC_BIN" ]; then
-    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$MC_BIN"
+if [ ! -f "$MC_BIN" ] || ! file "$MC_BIN" | grep -q "$(uname -m)"; then
+    curl -fsSL "https://dl.min.io/client/mc/release/linux-${ARCH}/mc" -o "$MC_BIN"
     chmod +x "$MC_BIN"
 fi
 "$MC_BIN" alias set local http://localhost:9000 "$S3_USER" "$S3_PASS" &>/dev/null
 "$MC_BIN" mb --ignore-existing "local/$S3_BUCKET"
 
+echo "VM ready."
 echo "btrfs mount : $BTRFS_MOUNT"
-echo "MinIO bucket: $S3_BUCKET (http://localhost:9000)"
-echo ""
-echo "Run Layer 3 (btrfs driver):"
-echo "  BCR_BTRFS_MOUNT=$BTRFS_MOUNT sudo -E cargo test --test vm"
-echo ""
-echo "Run Layer 4 (e2e):"
-echo "  BCR_BTRFS_MOUNT=$BTRFS_MOUNT \\"
-echo "  BCR_S3_ENDPOINT=http://localhost:9000 \\"
-echo "  BCR_S3_BUCKET=$S3_BUCKET \\"
-echo "  AWS_ACCESS_KEY_ID=$S3_USER \\"
-echo "  AWS_SECRET_ACCESS_KEY=$S3_PASS \\"
-echo "  sudo -E cargo test --test e2e"
+echo "MinIO bucket: $S3_BUCKET @ http://localhost:9000"
