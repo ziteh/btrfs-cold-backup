@@ -76,8 +76,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         let level_prefix = format!("bcb_level{level}_");
         let sn = snapshots
             .iter()
-            .filter(|s| s.starts_with(&level_prefix))
-            .last()
+            .rfind(|s| s.starts_with(&level_prefix))
             .ok_or_else(|| anyhow!("no level {level} snapshot found in {:?}", task.snapshot_dir))?
             .clone();
         let ts = snapshot_timestamp(&sn)?;
@@ -171,6 +170,16 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             ));
         }
 
+        let mut total_parts = 0u32;
+        let mut count_dir = tokio::fs::read_dir(&output_dir).await?;
+        while let Some(entry) = count_dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("snapshot.part-") && !name.ends_with(".age") {
+                total_parts += 1;
+            }
+        }
+
+        state.total_parts = Some(total_parts);
         state.stream_hash = Some(hash.clone());
         state.last_updated = now_unix();
         manifest::write_state(&sp, &state)?;
@@ -190,13 +199,27 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         }
     }
 
+    if let Some(total) = state.total_parts {
+        let accounted = state.parts_completed.len() + part_suffixes.len();
+        if accounted < total as usize {
+            return Err(anyhow!(
+                "expected {total} parts but only found {accounted} \
+                 ({} on disk, {} already uploaded); \
+                 output_dir may have been cleared — restore missing parts and re-run",
+                part_suffixes.len(),
+                state.parts_completed.len()
+            ));
+        }
+    }
+
     if part_suffixes.is_empty() && state.parts_completed.is_empty() {
         if state.stream_hash.is_some() {
             state.stream_hash = None;
+            state.total_parts = None;
             state.last_updated = now_unix();
             manifest::write_state(&sp, &state)?;
             return Err(anyhow!(
-                "output_dir vanished after split; stream_hash cleared — re-run to retry from split"
+                "output_dir vanished after split; state cleared — re-run to retry from split"
             ));
         }
         return Err(anyhow!("no snapshot parts found in {:?}", output_dir));
@@ -238,6 +261,10 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         let raw_path = output_dir.join(format!("snapshot.part-{suffix}"));
         let enc_path = output_dir.join(format!("snapshot.part-{suffix}.age"));
 
+        if enc_path.exists() && raw_path.exists() {
+            // enc_path is from a crashed partial run; discard it and re-encrypt
+            tokio::fs::remove_file(&enc_path).await?;
+        }
         if !enc_path.exists() {
             encrypt_file(&raw_path, &enc_path, &config.age_public_key).await?;
             let _ = tokio::fs::remove_file(&raw_path).await;

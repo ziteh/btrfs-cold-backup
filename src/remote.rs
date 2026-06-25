@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -32,7 +33,8 @@ impl S3Backend {
             .load()
             .await;
 
-        let mut builder = aws_sdk_s3::config::Builder::from(&shared_config);
+        let retry = RetryConfig::standard().with_max_attempts(config.retry.max_attempts);
+        let mut builder = aws_sdk_s3::config::Builder::from(&shared_config).retry_config(retry);
         if !config.endpoint.is_empty() {
             builder = builder
                 .endpoint_url(config.endpoint.clone())
@@ -46,16 +48,17 @@ impl S3Backend {
     }
 }
 
-fn parse_storage_class(s: &str) -> StorageClass {
+fn parse_storage_class(s: &str) -> Result<StorageClass> {
     match s {
-        "DEEP_ARCHIVE" => StorageClass::DeepArchive,
-        "GLACIER" => StorageClass::Glacier,
-        "GLACIER_IR" => StorageClass::GlacierIr,
-        "INTELLIGENT_TIERING" => StorageClass::IntelligentTiering,
-        "ONEZONE_IA" => StorageClass::OnezoneIa,
-        "REDUCED_REDUNDANCY" => StorageClass::ReducedRedundancy,
-        "STANDARD_IA" => StorageClass::StandardIa,
-        _ => StorageClass::Standard,
+        "DEEP_ARCHIVE" => Ok(StorageClass::DeepArchive),
+        "GLACIER" => Ok(StorageClass::Glacier),
+        "GLACIER_IR" => Ok(StorageClass::GlacierIr),
+        "INTELLIGENT_TIERING" => Ok(StorageClass::IntelligentTiering),
+        "ONEZONE_IA" => Ok(StorageClass::OnezoneIa),
+        "REDUCED_REDUNDANCY" => Ok(StorageClass::ReducedRedundancy),
+        "STANDARD" => Ok(StorageClass::Standard),
+        "STANDARD_IA" => Ok(StorageClass::StandardIa),
+        other => Err(anyhow!("unknown S3 storage class: {other}")),
     }
 }
 
@@ -65,7 +68,7 @@ impl RemoteBackend for S3Backend {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .storage_class(parse_storage_class(storage_class))
+            .storage_class(parse_storage_class(storage_class)?)
             .body(ByteStream::from(data))
             .send()
             .await
@@ -84,7 +87,7 @@ impl RemoteBackend for S3Backend {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .storage_class(parse_storage_class(storage_class))
+            .storage_class(parse_storage_class(storage_class)?)
             .content_length(metadata.len() as i64)
             .body(body)
             .send()

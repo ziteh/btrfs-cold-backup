@@ -2,10 +2,11 @@ use anyhow::{Result, anyhow};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{ChildStdout, Command};
+use tokio::sync::oneshot;
 
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
@@ -27,21 +28,64 @@ pub trait BtrfsOps: Send + Sync {
     async fn subvolume_exists(&self, path: &Path) -> Result<bool>;
 }
 
-// Keeps the child process alive while its stdout is being read.
+// Reads btrfs-send stdout; after EOF, blocks until the child exits and propagates
+// a non-zero exit code as an io::Error.  The child is awaited in a spawned task
+// so that poll_read can properly park and be woken rather than racing with try_wait.
+// Dropping BtrfsStream drops _kill_tx, which closes the kill channel and signals
+// the spawned task to SIGKILL the child — handles both early cancellation and a
+// btrfs process that ignores EPIPE.
 struct BtrfsStream {
-    _child: Child,
     stdout: Pin<Box<ChildStdout>>,
+    status_rx: oneshot::Receiver<io::Result<ExitStatus>>,
+    _kill_tx: oneshot::Sender<()>,
+    stdout_done: bool,
 }
 
 impl Unpin for BtrfsStream {}
 
+impl BtrfsStream {
+    fn poll_exit(
+        rx: &mut oneshot::Receiver<io::Result<ExitStatus>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::new(rx).poll(cx) {
+            Poll::Ready(Ok(Ok(status))) => {
+                if status.success() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(io::Error::other(format!(
+                        "btrfs send failed with {status}"
+                    ))))
+                }
+            }
+            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl AsyncRead for BtrfsStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.stdout.as_mut().poll_read(cx, buf)
+        let this = self.get_mut();
+
+        if this.stdout_done {
+            return Self::poll_exit(&mut this.status_rx, cx);
+        }
+
+        let filled_before = buf.filled().len();
+        let result = this.stdout.as_mut().poll_read(cx, buf);
+        match result {
+            Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
+                this.stdout_done = true;
+                Self::poll_exit(&mut this.status_rx, cx)
+            }
+            other => other,
+        }
     }
 }
 
@@ -81,9 +125,23 @@ impl BtrfsOps for BtrfsDriver {
             .take()
             .ok_or_else(|| anyhow!("failed to capture btrfs send stdout"))?;
 
+        let (status_tx, status_rx) = oneshot::channel();
+        let (kill_tx, kill_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = child.wait() => { let _ = status_tx.send(result); }
+                _ = kill_rx => {
+                    child.start_kill().ok();
+                    let _ = status_tx.send(child.wait().await);
+                }
+            }
+        });
+
         Ok(Box::new(BtrfsStream {
-            _child: child,
             stdout: Box::pin(stdout),
+            status_rx,
+            _kill_tx: kill_tx,
+            stdout_done: false,
         }))
     }
 
@@ -112,9 +170,23 @@ impl BtrfsOps for BtrfsDriver {
             .take()
             .ok_or_else(|| anyhow!("failed to capture btrfs send stdout"))?;
 
+        let (status_tx, status_rx) = oneshot::channel();
+        let (kill_tx, kill_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = child.wait() => { let _ = status_tx.send(result); }
+                _ = kill_rx => {
+                    child.start_kill().ok();
+                    let _ = status_tx.send(child.wait().await);
+                }
+            }
+        });
+
         Ok(Box::new(BtrfsStream {
-            _child: child,
             stdout: Box::pin(stdout),
+            status_rx,
+            _kill_tx: kill_tx,
+            stdout_done: false,
         }))
     }
 

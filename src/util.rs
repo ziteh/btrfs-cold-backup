@@ -11,11 +11,7 @@ pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
     }
 
     // Remove leading/trailing slashes and convert remaining slashes to underscores
-    let sanitized = path_str
-        .trim_matches('/')
-        .replace('/', "_")
-        .replace("\\", "_")
-        .replace(".", "_");
+    let sanitized = path_str.trim_matches('/').replace(['/', '\\'], "_");
 
     if sanitized.is_empty() {
         return Err(anyhow!(
@@ -27,18 +23,17 @@ pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
 }
 
 pub fn task_dir_name(level: u32, timestamp: &str) -> Result<String> {
-    if timestamp.is_empty() {
-        return Err(anyhow!("timestamp cannot be empty"));
+    if timestamp.len() < 16 {
+        return Err(anyhow!(
+            "timestamp must be in ISO 8601 format (YYYY-MM-DDTHH:MM...)"
+        ));
     }
-    const TARGET_LEN: usize = "YYYY-MM-DD".len();
-    if timestamp.len() < TARGET_LEN {
-        return Err(anyhow!("timestamp must be in ISO 8601 format"));
-    }
-
-    let date_part = &timestamp[0..10];
-    let date_no_dash = date_part.replace("-", "");
-
-    Ok(format!("bcb_level{}_{}", level, date_no_dash))
+    let date_no_dash = timestamp[0..10].replace('-', "");
+    let time_no_colon = timestamp[11..16].replace(':', "");
+    Ok(format!(
+        "bcb_level{}_{}{}",
+        level, date_no_dash, time_no_colon
+    ))
 }
 
 pub fn s3_backup_key(
@@ -94,24 +89,22 @@ pub fn s3_last_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
     )
 }
 
-pub fn snapshot_name(_level: u32, date_str: &str, time_str: &str) -> Result<String> {
+pub fn snapshot_name(level: u32, date_str: &str, time_str: &str) -> Result<String> {
     if date_str.is_empty() || time_str.is_empty() {
         return Err(anyhow!("date_str and time_str cannot be empty"));
     }
 
-    // Validate date format
     const DATE_LEN: usize = "YYYY-MM-DD".len();
     if date_str.len() != DATE_LEN || !date_str.contains('-') {
         return Err(anyhow!("date_str must be in YYYY-MM-DD format"));
     }
 
-    // Validate time format
     const TIME_LEN: usize = "HH-MM".len();
     if time_str.len() != TIME_LEN || !time_str.contains('-') {
         return Err(anyhow!("time_str must be in HH-MM format"));
     }
 
-    Ok(format!("bcb_level0_{}_{}", date_str, time_str))
+    Ok(format!("bcb_level{level}_{date_str}_{time_str}"))
 }
 
 #[cfg(test)]
@@ -155,21 +148,35 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_subvolume_path_dot_vs_underscore_no_collision() {
+        let a = sanitize_subvolume_path(Path::new("/mnt/data.1")).unwrap();
+        let b = sanitize_subvolume_path(Path::new("/mnt/data_1")).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn test_task_dir_name_level_zero() {
         let result = task_dir_name(0, "2026-06-02T14:30:00Z").unwrap();
-        assert_eq!(result, "bcb_level0_20260602");
+        assert_eq!(result, "bcb_level0_202606021430");
     }
 
     #[test]
     fn test_task_dir_name_level_one() {
         let result = task_dir_name(1, "2026-06-02T14:30:00Z").unwrap();
-        assert_eq!(result, "bcb_level1_20260602");
+        assert_eq!(result, "bcb_level1_202606021430");
     }
 
     #[test]
     fn test_task_dir_name_different_date() {
         let result = task_dir_name(2, "2025-12-25T10:15:30Z").unwrap();
-        assert_eq!(result, "bcb_level2_20251225");
+        assert_eq!(result, "bcb_level2_202512251015");
+    }
+
+    #[test]
+    fn test_task_dir_name_same_day_different_time() {
+        let a = task_dir_name(0, "2026-06-25T08:00:00Z").unwrap();
+        let b = task_dir_name(0, "2026-06-25T20:00:00Z").unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -189,7 +196,7 @@ mod tests {
         let key = s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", 1).unwrap();
         assert_eq!(
             key,
-            "backups/backup-data/mnt_data/bcb_level0_20260602/snapshot.part-1.age"
+            "backups/backup-data/mnt_data/bcb_level0_202606021430/snapshot.part-1.age"
         );
     }
 
@@ -199,7 +206,7 @@ mod tests {
             s3_backup_key("backups/", "mnt_data_movies", 1, "2026-06-02T15:00:00Z", 5).unwrap();
         assert_eq!(
             key,
-            "backups/backup-data/mnt_data_movies/bcb_level1_20260602/snapshot.part-5.age"
+            "backups/backup-data/mnt_data_movies/bcb_level1_202606021500/snapshot.part-5.age"
         );
     }
 
@@ -208,7 +215,7 @@ mod tests {
         let key = s3_manifest_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z").unwrap();
         assert_eq!(
             key,
-            "backups/manifests/mnt_data/bcb_level0_20260602/task_manifest.yaml"
+            "backups/manifests/mnt_data/bcb_level0_202606021430/task_manifest.yaml"
         );
     }
 
@@ -222,6 +229,12 @@ mod tests {
     fn test_snapshot_name() {
         let name = snapshot_name(0, "2026-06-02", "14-30").unwrap();
         assert_eq!(name, "bcb_level0_2026-06-02_14-30");
+    }
+
+    #[test]
+    fn test_snapshot_name_level_used() {
+        let name = snapshot_name(1, "2026-06-02", "14-30").unwrap();
+        assert_eq!(name, "bcb_level1_2026-06-02_14-30");
     }
 
     #[test]

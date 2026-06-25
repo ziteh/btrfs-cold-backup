@@ -244,20 +244,20 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
 
     // build a real encrypted part so restore has something valid to download
     let plaintext = b"btrfs receive payload";
+    let plain_path = work_dir.path().join("plain.bin");
+    std::fs::write(&plain_path, plaintext).unwrap();
+    let plaintext_hash = btrfs_cold_backup::blake3_file(&plain_path).await.unwrap();
+
     let encrypted_path = work_dir.path().join("part-1.age");
     btrfs_cold_backup::encrypt_file(
-        &{
-            let p = work_dir.path().join("plain.bin");
-            std::fs::write(&p, plaintext).unwrap();
-            p
-        },
+        &plain_path,
         &encrypted_path,
         &identity.to_public().to_string(),
     )
     .await
     .unwrap();
     let encrypted_bytes = std::fs::read(&encrypted_path).unwrap();
-    let blake3_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
+    let encrypted_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
         .await
         .unwrap();
 
@@ -267,11 +267,11 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
         snapshot_name: "bcb_level0_20260602_14-30".to_string(),
         parent_snapshot: None,
         total_size_bytes: encrypted_bytes.len() as u64,
-        sha256: blake3_hash.clone(),
+        sha256: plaintext_hash, // hash of the raw stream, verified after decryption
         parts: vec![PartInfo {
             part_number: 1,
             size_bytes: encrypted_bytes.len() as u64,
-            sha256: blake3_hash,
+            sha256: encrypted_hash, // hash of the encrypted part, verified on download
         }],
     };
     let manifest_yaml = serde_yaml::to_string(&backup_manifest)
@@ -304,7 +304,7 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
         &remote,
     )
     .await;
-    let _ = result;
+    assert!(result.is_ok(), "restore should succeed: {result:?}");
 }
 
 /// Restore must abort early when BLAKE3 hash does not match.
@@ -358,5 +358,5 @@ async fn restore_should_fail_on_blake3_mismatch() {
         &remote,
     )
     .await;
-    let _ = result;
+    assert!(result.is_err(), "restore should fail on BLAKE3 mismatch");
 }
