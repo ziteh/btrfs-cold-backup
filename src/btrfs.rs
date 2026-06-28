@@ -89,6 +89,39 @@ impl AsyncRead for BtrfsStream {
     }
 }
 
+fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
+    let mut child = Command::new("btrfs")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture btrfs send stdout"))?;
+
+    let (status_tx, status_rx) = oneshot::channel();
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        tokio::select! {
+            result = child.wait() => { let _ = status_tx.send(result); }
+            _ = kill_rx => {
+                child.start_kill().ok();
+                let _ = status_tx.send(child.wait().await);
+            }
+        }
+    });
+
+    Ok(Box::new(BtrfsStream {
+        stdout: Box::pin(stdout),
+        status_rx,
+        _kill_tx: kill_tx,
+        stdout_done: false,
+    }))
+}
+
 pub struct BtrfsDriver;
 
 impl BtrfsOps for BtrfsDriver {
@@ -112,37 +145,7 @@ impl BtrfsOps for BtrfsDriver {
         let snapshot_str = snapshot
             .to_str()
             .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8"))?;
-
-        let mut child = Command::new("btrfs")
-            .args(["send", snapshot_str])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture btrfs send stdout"))?;
-
-        let (status_tx, status_rx) = oneshot::channel();
-        let (kill_tx, kill_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = child.wait() => { let _ = status_tx.send(result); }
-                _ = kill_rx => {
-                    child.start_kill().ok();
-                    let _ = status_tx.send(child.wait().await);
-                }
-            }
-        });
-
-        Ok(Box::new(BtrfsStream {
-            stdout: Box::pin(stdout),
-            status_rx,
-            _kill_tx: kill_tx,
-            stdout_done: false,
-        }))
+        spawn_send(&["send", snapshot_str])
     }
 
     async fn send_incremental(
@@ -153,41 +156,10 @@ impl BtrfsOps for BtrfsDriver {
         let parent_str = parent
             .to_str()
             .ok_or_else(|| anyhow!("parent path is not valid UTF-8"))?;
-
         let snapshot_str = snapshot
             .to_str()
             .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8"))?;
-
-        let mut child = Command::new("btrfs")
-            .args(["send", "-p", parent_str, snapshot_str])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture btrfs send stdout"))?;
-
-        let (status_tx, status_rx) = oneshot::channel();
-        let (kill_tx, kill_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = child.wait() => { let _ = status_tx.send(result); }
-                _ = kill_rx => {
-                    child.start_kill().ok();
-                    let _ = status_tx.send(child.wait().await);
-                }
-            }
-        });
-
-        Ok(Box::new(BtrfsStream {
-            stdout: Box::pin(stdout),
-            status_rx,
-            _kill_tx: kill_tx,
-            stdout_done: false,
-        }))
+        spawn_send(&["send", "-p", parent_str, snapshot_str])
     }
 
     async fn create_snapshot(

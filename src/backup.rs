@@ -59,17 +59,13 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         None => manifest::BackupState::default(),
     };
 
-    // Phase 0: determine snapshot, timestamp, parent, output_dir
-    let snapshot_name: String;
-    let timestamp: String;
-    let parent: Option<String>;
-    let output_dir: PathBuf;
-
-    if !state.snapshot_name.is_empty() {
-        snapshot_name = state.snapshot_name.clone();
-        timestamp = state.timestamp.clone();
-        parent = state.parent_snapshot.clone();
-        output_dir = PathBuf::from(&state.output_dir);
+    let (snapshot_name, timestamp, parent, output_dir) = if !state.snapshot_name.is_empty() {
+        (
+            state.snapshot_name.clone(),
+            state.timestamp.clone(),
+            state.parent_snapshot.clone(),
+            PathBuf::from(&state.output_dir),
+        )
     } else {
         let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
         let snapshots = btrfs.list_snapshots(&task.snapshot_dir).await?;
@@ -108,13 +104,9 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         state.last_updated = now_unix();
         manifest::write_state(&sp, &state)?;
 
-        snapshot_name = sn;
-        timestamp = ts;
-        parent = par;
-        output_dir = od;
-    }
+        (sn, ts, par, od)
+    };
 
-    // Phase 1: btrfs send + split (skip if already done)
     let stream_hash = if let Some(ref h) = state.stream_hash {
         tracing::info!("btrfs send already done, skipping");
         h.clone()
@@ -186,7 +178,6 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         hash
     };
 
-    // Phase 2: collect part suffixes from output_dir
     let mut part_suffixes: BTreeSet<String> = BTreeSet::new();
     if output_dir.exists() {
         let mut read_dir = tokio::fs::read_dir(&output_dir).await?;
@@ -200,7 +191,13 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     }
 
     if let Some(total) = state.total_parts {
-        let accounted = state.parts_completed.len() + part_suffixes.len();
+        let mut accounted_parts: BTreeSet<u32> = state.parts_completed.keys().copied().collect();
+        for suffix in &part_suffixes {
+            if let Ok(n) = suffix.parse::<u32>() {
+                accounted_parts.insert(n + 1);
+            }
+        }
+        let accounted = accounted_parts.len();
         if accounted < total as usize {
             return Err(anyhow!(
                 "expected {total} parts but only found {accounted} \
@@ -225,7 +222,6 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         return Err(anyhow!("no snapshot parts found in {:?}", output_dir));
     }
 
-    // Phase 3: encrypt + upload each part
     let storage_class = config
         .s3
         .storage_class
@@ -237,7 +233,6 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     let mut parts_info: Vec<PartInfo> = Vec::new();
     let mut total_enc_size: u64 = 0;
 
-    // Include already-completed parts from state
     for (&part_number, completed) in &state.parts_completed {
         total_enc_size += completed.size_bytes;
         parts_info.push(PartInfo {
@@ -262,7 +257,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         let enc_path = output_dir.join(format!("snapshot.part-{suffix}.age"));
 
         if enc_path.exists() && raw_path.exists() {
-            // enc_path is from a crashed partial run; discard it and re-encrypt
+            // coexisting raw+enc means encryption was interrupted; enc may be truncated
             tokio::fs::remove_file(&enc_path).await?;
         }
         if !enc_path.exists() {
@@ -316,7 +311,6 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         parts: parts_info,
     };
 
-    // Phase 4: upload task manifest
     if !state.manifest_uploaded {
         let manifest_class = &config.s3.storage_class.manifest;
         let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp)?;
@@ -333,7 +327,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         manifest::write_state(&sp, &state)?;
     }
 
-    // Phase 5: upload last manifest (always — authoritative pointer)
+    // always upload — authoritative pointer for future incremental parents
     let last = Last {
         timestamp,
         level,
@@ -349,7 +343,6 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         )
         .await?;
 
-    // Phase 6: cleanup
     let _ = tokio::fs::remove_dir_all(&output_dir).await;
     let _ = tokio::fs::remove_file(&sp).await;
 

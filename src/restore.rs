@@ -104,6 +104,7 @@ pub async fn restore_task<B: BtrfsOps, R: RemoteBackend>(
             .args(["receive", target_str])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
 
         let stream_hash = {

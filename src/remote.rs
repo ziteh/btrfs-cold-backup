@@ -96,16 +96,13 @@ impl RemoteBackend for S3Backend {
             use tokio::io::AsyncReadExt;
             use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+            let metadata = tokio::fs::metadata(path).await?;
+            req = req.content_length(metadata.len() as i64);
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| anyhow!("failed to open file for upload: {e}"))?;
             let (mut sender, hyper_body) = hyper::Body::channel();
-            let path_owned = path.to_owned();
             tokio::spawn(async move {
-                let file = match tokio::fs::File::open(&path_owned).await {
-                    Ok(f) => f,
-                    Err(_) => {
-                        sender.abort();
-                        return;
-                    }
-                };
                 let mut limited = Limiter::<StandardClock>::new(bps)
                     .limit(file.compat())
                     .compat();
@@ -224,7 +221,14 @@ impl RemoteBackend for S3Backend {
             }
 
             if resp.is_truncated().unwrap_or(false) {
-                continuation_token = resp.next_continuation_token().map(str::to_string);
+                match resp.next_continuation_token() {
+                    Some(token) => continuation_token = Some(token.to_string()),
+                    None => {
+                        return Err(anyhow!(
+                            "S3 list_objects_v2 returned is_truncated=true with no NextContinuationToken"
+                        ));
+                    }
+                }
             } else {
                 break;
             }
