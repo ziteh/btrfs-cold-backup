@@ -49,6 +49,7 @@ fn test_config(base_dir: &Path) -> Config {
             endpoint: String::new(),
             storage_class: S3StorageClass::default(),
             retry: S3RetryConfig::default(),
+            upload_speed_limit_kbps: 0,
         },
         tasks: vec![],
     }
@@ -236,6 +237,7 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
             endpoint: String::new(),
             storage_class: S3StorageClass::default(),
             retry: S3RetryConfig::default(),
+            upload_speed_limit_kbps: 0,
         },
         tasks: vec![],
     };

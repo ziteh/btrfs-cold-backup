@@ -34,6 +34,9 @@ pub struct S3Config {
     /// Retry config
     #[serde(default)]
     pub retry: S3RetryConfig,
+    /// Upload speed cap in KiB/s; 0 means unlimited
+    #[serde(default)]
+    pub upload_speed_limit_kbps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -153,6 +156,7 @@ mod tests {
                 endpoint: "".to_string(),
                 storage_class: S3StorageClass::default(),
                 retry: S3RetryConfig::default(),
+                upload_speed_limit_kbps: 0,
             },
             tasks: vec![Task {
                 name: "test".to_string(),

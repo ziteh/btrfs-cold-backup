@@ -23,6 +23,7 @@ pub trait RemoteBackend: Send + Sync {
 pub struct S3Backend {
     client: Client,
     bucket: String,
+    upload_speed_limit_bps: Option<f64>,
 }
 
 impl S3Backend {
@@ -41,9 +42,13 @@ impl S3Backend {
                 .force_path_style(true);
         }
 
+        let upload_speed_limit_bps = (config.upload_speed_limit_kbps > 0)
+            .then_some(config.upload_speed_limit_kbps as f64 * 1024.0);
+
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: config.bucket.clone(),
+            upload_speed_limit_bps,
         })
     }
 }
@@ -77,19 +82,63 @@ impl RemoteBackend for S3Backend {
     }
 
     async fn upload_file(&self, key: &str, path: &Path, storage_class: &str) -> Result<()> {
-        let metadata = tokio::fs::metadata(path).await?;
-
-        let body = ByteStream::from_path(path)
-            .await
-            .map_err(|e| anyhow!("failed to open file for upload: {e}"))?;
-
-        self.client
+        let mut req = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .storage_class(parse_storage_class(storage_class)?)
-            .content_length(metadata.len() as i64)
-            .body(body)
+            .storage_class(parse_storage_class(storage_class)?);
+
+        let body = if let Some(bps) = self.upload_speed_limit_bps {
+            use async_speed_limit::Limiter;
+            use async_speed_limit::clock::StandardClock;
+            use aws_smithy_types::body::SdkBody;
+            use tokio::io::AsyncReadExt;
+            use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+
+            let (mut sender, hyper_body) = hyper::Body::channel();
+            let path_owned = path.to_owned();
+            tokio::spawn(async move {
+                let file = match tokio::fs::File::open(&path_owned).await {
+                    Ok(f) => f,
+                    Err(_) => {
+                        sender.abort();
+                        return;
+                    }
+                };
+                let mut limited = Limiter::<StandardClock>::new(bps)
+                    .limit(file.compat())
+                    .compat();
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match limited.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if sender
+                                .send_data(bytes::Bytes::copy_from_slice(&buf[..n]))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            sender.abort();
+                            break;
+                        }
+                    }
+                }
+            });
+            ByteStream::new(SdkBody::from_body_0_4(hyper_body))
+        } else {
+            let metadata = tokio::fs::metadata(path).await?;
+            req = req.content_length(metadata.len() as i64);
+            ByteStream::from_path(path)
+                .await
+                .map_err(|e| anyhow!("failed to open file for upload: {e}"))?
+        };
+
+        req.body(body)
             .send()
             .await
             .map_err(|e| anyhow!("S3 put_object failed: {e}"))?;

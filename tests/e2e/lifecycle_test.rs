@@ -63,6 +63,7 @@ fn s3_config(env: &E2eEnv) -> S3Config {
         endpoint: env.s3_endpoint.clone(),
         storage_class: S3StorageClass::default(),
         retry: S3RetryConfig::default(),
+        upload_speed_limit_kbps: 0,
     }
 }
 
