@@ -3,7 +3,6 @@ pub mod btrfs;
 pub mod check;
 pub mod config;
 pub mod crypto;
-pub mod keys;
 pub mod list;
 pub mod lock;
 pub mod manifest;
@@ -13,7 +12,9 @@ pub mod util;
 
 pub use btrfs::{BtrfsDriver, BtrfsOps};
 pub use config::{Config, S3Config, S3RetryConfig, S3StorageClass, Task};
-pub use crypto::{blake3_file, decrypt_file, encrypt_file};
+pub use crypto::{
+    AgeKeyPair, blake3_file, decrypt_file, encrypt_file, generate_key_pair, write_private_key,
+};
 pub use lock::PidLock;
 pub use manifest::{Backup, BackupState, CompletedPart, Last, PartInfo};
 pub use remote::{RemoteBackend, S3Backend};

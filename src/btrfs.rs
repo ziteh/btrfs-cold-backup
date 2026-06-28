@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::oneshot;
 
@@ -36,7 +36,7 @@ pub trait BtrfsOps: Send + Sync {
 // btrfs process that ignores EPIPE.
 struct BtrfsStream {
     stdout: Pin<Box<ChildStdout>>,
-    status_rx: oneshot::Receiver<io::Result<ExitStatus>>,
+    status_rx: oneshot::Receiver<io::Result<(ExitStatus, Vec<u8>)>>,
     _kill_tx: oneshot::Sender<()>,
     stdout_done: bool,
 }
@@ -45,17 +45,23 @@ impl Unpin for BtrfsStream {}
 
 impl BtrfsStream {
     fn poll_exit(
-        rx: &mut oneshot::Receiver<io::Result<ExitStatus>>,
+        rx: &mut oneshot::Receiver<io::Result<(ExitStatus, Vec<u8>)>>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         match Pin::new(rx).poll(cx) {
-            Poll::Ready(Ok(Ok(status))) => {
+            Poll::Ready(Ok(Ok((status, stderr)))) => {
                 if status.success() {
                     Poll::Ready(Ok(()))
                 } else {
-                    Poll::Ready(Err(io::Error::other(format!(
-                        "btrfs send failed with {status}"
-                    ))))
+                    let msg = if stderr.is_empty() {
+                        format!("btrfs send failed with {status}")
+                    } else {
+                        format!(
+                            "btrfs send failed with {status}: {}",
+                            String::from_utf8_lossy(&stderr).trim()
+                        )
+                    };
+                    Poll::Ready(Err(io::Error::other(msg)))
                 }
             }
             Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
@@ -89,11 +95,16 @@ impl AsyncRead for BtrfsStream {
     }
 }
 
+fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str> {
+    p.to_str()
+        .ok_or_else(|| anyhow!("{label} path is not valid UTF-8"))
+}
+
 fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
     let mut child = Command::new("btrfs")
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
 
@@ -101,15 +112,30 @@ fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
         .stdout
         .take()
         .ok_or_else(|| anyhow!("failed to capture btrfs send stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture btrfs send stderr"))?;
 
     let (status_tx, status_rx) = oneshot::channel();
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
+
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).await.ok();
+        buf
+    });
+
     tokio::spawn(async move {
         tokio::select! {
-            result = child.wait() => { let _ = status_tx.send(result); }
+            result = child.wait() => {
+                let stderr_bytes = stderr_task.await.unwrap_or_default();
+                let _ = status_tx.send(result.map(|s| (s, stderr_bytes)));
+            }
             _ = kill_rx => {
                 child.start_kill().ok();
-                let _ = status_tx.send(child.wait().await);
+                let result = child.wait().await.map(|s| (s, vec![]));
+                let _ = status_tx.send(result);
             }
         }
     });
@@ -142,10 +168,7 @@ impl BtrfsOps for BtrfsDriver {
     }
 
     async fn send_full(&self, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
-        let snapshot_str = snapshot
-            .to_str()
-            .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8"))?;
-        spawn_send(&["send", snapshot_str])
+        spawn_send(&["send", path_to_str(snapshot, "snapshot")?])
     }
 
     async fn send_incremental(
@@ -153,13 +176,12 @@ impl BtrfsOps for BtrfsDriver {
         parent: &Path,
         snapshot: &Path,
     ) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
-        let parent_str = parent
-            .to_str()
-            .ok_or_else(|| anyhow!("parent path is not valid UTF-8"))?;
-        let snapshot_str = snapshot
-            .to_str()
-            .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8"))?;
-        spawn_send(&["send", "-p", parent_str, snapshot_str])
+        spawn_send(&[
+            "send",
+            "-p",
+            path_to_str(parent, "parent")?,
+            path_to_str(snapshot, "snapshot")?,
+        ])
     }
 
     async fn create_snapshot(
@@ -168,17 +190,16 @@ impl BtrfsOps for BtrfsDriver {
         snapshot_dir: &Path,
         name: &str,
     ) -> Result<PathBuf> {
-        let subvolume_str = subvolume
-            .to_str()
-            .ok_or_else(|| anyhow!("subvolume path is not valid UTF-8"))?;
-
         let dest = snapshot_dir.join(name);
-        let dest_str = dest
-            .to_str()
-            .ok_or_else(|| anyhow!("snapshot destination path is not valid UTF-8"))?;
 
         let output = Command::new("btrfs")
-            .args(["subvolume", "snapshot", "-r", subvolume_str, dest_str])
+            .args([
+                "subvolume",
+                "snapshot",
+                "-r",
+                path_to_str(subvolume, "subvolume")?,
+                path_to_str(&dest, "snapshot destination")?,
+            ])
             .output()
             .await?;
 
@@ -191,12 +212,8 @@ impl BtrfsOps for BtrfsDriver {
     }
 
     async fn delete_snapshot(&self, snapshot: &Path) -> Result<()> {
-        let snapshot_str = snapshot
-            .to_str()
-            .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8"))?;
-
         let output = Command::new("btrfs")
-            .args(["subvolume", "delete", snapshot_str])
+            .args(["subvolume", "delete", path_to_str(snapshot, "snapshot")?])
             .output()
             .await?;
 
@@ -209,12 +226,8 @@ impl BtrfsOps for BtrfsDriver {
     }
 
     async fn subvolume_exists(&self, path: &Path) -> Result<bool> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow!("path is not valid UTF-8"))?;
-
         let output = Command::new("btrfs")
-            .args(["subvolume", "show", path_str])
+            .args(["subvolume", "show", path_to_str(path, "path")?])
             .output()
             .await?;
 

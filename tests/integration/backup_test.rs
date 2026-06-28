@@ -7,6 +7,7 @@ use btrfs_cold_backup::{
     backup::backup_task, manifest::Last, restore::restore_task,
 };
 use mockall::mock;
+#[cfg(target_os = "linux")]
 use secrecy::ExposeSecret;
 use tokio::io::AsyncRead;
 
@@ -220,6 +221,7 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
 }
 
 /// Restore flow: download, verify BLAKE3, decrypt, btrfs receive.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn restore_should_download_and_pipe_to_btrfs_receive() {
     use btrfs_cold_backup::manifest::{Backup, PartInfo};
@@ -269,11 +271,11 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
         snapshot_name: "bcb_level0_20260602_14-30".to_string(),
         parent_snapshot: None,
         total_size_bytes: encrypted_bytes.len() as u64,
-        sha256: plaintext_hash, // hash of the raw stream, verified after decryption
+        blake3: plaintext_hash,
         parts: vec![PartInfo {
             part_number: 1,
             size_bytes: encrypted_bytes.len() as u64,
-            sha256: encrypted_hash, // hash of the encrypted part, verified on download
+            blake3: encrypted_hash,
         }],
     };
     let manifest_yaml = serde_yaml::to_string(&backup_manifest)
@@ -302,7 +304,6 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
         "20260602",
         &target_dir,
         private_key_secret.expose_secret(),
-        &btrfs,
         &remote,
     )
     .await;
@@ -326,11 +327,11 @@ async fn restore_should_fail_on_blake3_mismatch() {
         snapshot_name: "bcb_level0_20260602_14-30".to_string(),
         parent_snapshot: None,
         total_size_bytes: 10,
-        sha256: "wrong_hash_that_will_never_match".to_string(),
+        blake3: "wrong_hash_that_will_never_match".to_string(),
         parts: vec![PartInfo {
             part_number: 1,
             size_bytes: 10,
-            sha256: "wrong_hash_that_will_never_match".to_string(),
+            blake3: "wrong_hash_that_will_never_match".to_string(),
         }],
     };
     let manifest_yaml = serde_yaml::to_string(&backup_manifest)
@@ -347,8 +348,6 @@ async fn restore_should_fail_on_blake3_mismatch() {
         .withf(|key| key.contains("snapshot.part"))
         .returning(|_| Ok(b"some random bytes".to_vec()));
 
-    let btrfs = MockBtrfs::new();
-
     let result = restore_task(
         &config,
         &task,
@@ -356,7 +355,6 @@ async fn restore_should_fail_on_blake3_mismatch() {
         "20260602",
         &target_dir,
         "AGE-SECRET-KEY-1FAKE",
-        &btrfs,
         &remote,
     )
     .await;

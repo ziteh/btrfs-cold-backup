@@ -1,8 +1,35 @@
+use age::secrecy::SecretString;
 use age::x25519;
 use anyhow::{Result, anyhow};
 use std::io::Read;
 use std::path::Path;
 use tokio::task;
+
+pub struct AgeKeyPair {
+    pub public_key: String,
+    pub private_key: SecretString,
+}
+
+pub fn write_private_key(path: &std::path::Path, key: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow!("failed to create {:?}: {e}", path))?;
+    file.write_all(key.as_bytes())
+        .map_err(|e| anyhow!("failed to write private key to {:?}: {e}", path))
+}
+
+pub fn generate_key_pair() -> AgeKeyPair {
+    let identity = age::x25519::Identity::generate();
+    AgeKeyPair {
+        public_key: identity.to_public().to_string(),
+        private_key: identity.to_string(),
+    }
+}
 
 pub async fn encrypt_file(input: &Path, output: &Path, public_key_str: &str) -> Result<()> {
     let public_key = public_key_str.to_string();

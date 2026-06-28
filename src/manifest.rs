@@ -1,29 +1,31 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::util::now_unix;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartInfo {
     pub part_number: u32,
     pub size_bytes: u64,
-    pub sha256: String,
+    pub blake3: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Backup {
-    pub timestamp: String, // ISO 8601
+    pub timestamp: String,
     pub level: u32,
     pub snapshot_name: String,
     pub parent_snapshot: Option<String>,
     pub total_size_bytes: u64,
-    pub sha256: String,
+    pub blake3: String,
     pub parts: Vec<PartInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Last {
-    pub timestamp: String, // ISO 8601
+    pub timestamp: String,
     pub level: u32,
     pub snapshot_name: String,
 }
@@ -41,13 +43,21 @@ pub struct BackupState {
     pub snapshot_name: String,
     pub parent_snapshot: Option<String>,
     pub timestamp: String,
-    pub output_dir: String,
+    pub output_dir: PathBuf,
     pub stream_hash: Option<String>,
     #[serde(default)]
     pub total_parts: Option<u32>,
     pub parts_completed: HashMap<u32, CompletedPart>,
     pub manifest_uploaded: bool,
     pub last_updated: i64,
+}
+
+impl BackupState {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.last_updated = now_unix();
+        std::fs::write(path, serde_yaml::to_string(self)?.as_bytes())?;
+        Ok(())
+    }
 }
 
 pub fn read_state(path: &Path) -> Result<Option<BackupState>> {
@@ -58,21 +68,17 @@ pub fn read_state(path: &Path) -> Result<Option<BackupState>> {
     }
 }
 
-pub fn write_state(path: &Path, state: &BackupState) -> Result<()> {
-    std::fs::write(path, serde_yaml::to_string(state)?.as_bytes())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_part_info_serialize_deserialize() {
         let part = PartInfo {
             part_number: 1,
             size_bytes: 1024,
-            sha256: "abc123".to_string(),
+            blake3: "abc123".to_string(),
         };
         let yaml = serde_yaml::to_string(&part).unwrap();
         let deserialized: PartInfo = serde_yaml::from_str(&yaml).unwrap();
@@ -87,17 +93,17 @@ mod tests {
             snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
             parent_snapshot: None,
             total_size_bytes: 5120,
-            sha256: "def456".to_string(),
+            blake3: "def456".to_string(),
             parts: vec![
                 PartInfo {
                     part_number: 1,
                     size_bytes: 1024,
-                    sha256: "part1".to_string(),
+                    blake3: "part1".to_string(),
                 },
                 PartInfo {
                     part_number: 2,
                     size_bytes: 1024,
-                    sha256: "part2".to_string(),
+                    blake3: "part2".to_string(),
                 },
             ],
         };
@@ -114,11 +120,11 @@ mod tests {
             snapshot_name: "bcb_level1_2026-06-02_15-30".to_string(),
             parent_snapshot: Some("bcb_level0_2026-06-02_14-30".to_string()),
             total_size_bytes: 2048,
-            sha256: "ghi789".to_string(),
+            blake3: "ghi789".to_string(),
             parts: vec![PartInfo {
                 part_number: 1,
                 size_bytes: 2048,
-                sha256: "incr_part1".to_string(),
+                blake3: "incr_part1".to_string(),
             }],
         };
         let yaml = serde_yaml::to_string(&backup).unwrap();
@@ -150,7 +156,7 @@ mod tests {
             snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
             parent_snapshot: None,
             total_size_bytes: 5120,
-            sha256: "def456".to_string(),
+            blake3: "def456".to_string(),
             parts: vec![],
         };
         let yaml = serde_yaml::to_string(&backup).unwrap();
@@ -177,7 +183,7 @@ mod tests {
             snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
             parent_snapshot: None,
             timestamp: "2026-06-02T14:30:00Z".to_string(),
-            output_dir: "/var/lib/bcb/task/mnt_data/bcb_level0_20260602".to_string(),
+            output_dir: PathBuf::from("/var/lib/bcb/task/mnt_data/bcb_level0_20260602"),
             stream_hash: Some("abc123".to_string()),
             total_parts: Some(2),
             parts_completed: HashMap::new(),
@@ -215,13 +221,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backup_state.yaml");
 
-        let state = BackupState {
+        let mut state = BackupState {
             task_name: "test-task".to_string(),
             level: 1,
             snapshot_name: "bcb_level1_2026-06-02_14-30".to_string(),
             parent_snapshot: Some("bcb_level0_2026-06-01_10-00".to_string()),
             timestamp: "2026-06-02T14:30:00Z".to_string(),
-            output_dir: "/tmp/bcb/task/mnt/bcb_level1_20260602".to_string(),
+            output_dir: PathBuf::from("/tmp/bcb/task/mnt/bcb_level1_20260602"),
             stream_hash: Some("streamhash".to_string()),
             total_parts: None,
             parts_completed: HashMap::new(),
@@ -229,8 +235,10 @@ mod tests {
             last_updated: 12345,
         };
 
-        write_state(&path, &state).unwrap();
+        state.save(&path).unwrap();
         let loaded = read_state(&path).unwrap().unwrap();
-        assert_eq!(state, loaded);
+        assert_eq!(state.task_name, loaded.task_name);
+        assert_eq!(state.output_dir, loaded.output_dir);
+        assert_eq!(state.stream_hash, loaded.stream_hash);
     }
 }

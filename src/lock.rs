@@ -1,5 +1,3 @@
-//! Process ID based file locking
-
 use anyhow::{Result, anyhow};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -7,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 pub struct PidLock {
     path: PathBuf,
-    _file: Option<File>,
+    // Holds the flock for the duration of the lock's lifetime.
+    file: Option<File>,
 }
 
 impl PidLock {
     pub fn acquire(lock_path: &Path) -> Result<Self> {
-        // Attempt to open the lock file exclusively
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -20,16 +18,10 @@ impl PidLock {
             .open(lock_path)
             .map_err(|e| anyhow!("failed to create lock file: {}", e))?;
 
-        // Try to lock the file
-        #[cfg(unix)]
-        {
-            // Check if we can get an exclusive lock
-            if Self::try_lock(&file).is_err() {
-                return Err(anyhow!("failed to acquire lock on {}", lock_path.display()));
-            }
+        if Self::try_lock(&file).is_err() {
+            return Err(anyhow!("failed to acquire lock on {}", lock_path.display()));
         }
 
-        // Write PID to the lock file
         let pid = std::process::id();
         let mut file = file;
         writeln!(file, "{}", pid)
@@ -37,7 +29,7 @@ impl PidLock {
 
         Ok(PidLock {
             path: lock_path.to_path_buf(),
-            _file: Some(file),
+            file: Some(file),
         })
     }
 
@@ -49,23 +41,13 @@ impl PidLock {
         let content = std::fs::read_to_string(lock_path)
             .map_err(|e| anyhow!("failed to read lock file: {}", e))?;
 
-        let pid_str = content.trim();
-        let pid: u32 = pid_str
+        let pid: u32 = content
+            .trim()
             .parse()
             .map_err(|e| anyhow!("invalid PID in lock file: {}", e))?;
 
-        // Check if process is still running
-        #[cfg(unix)]
-        {
-            let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-            Ok(!is_alive)
-        }
-
-        #[cfg(not(unix))]
-        {
-            // Assume lock is stale if file exists
-            Ok(true)
-        }
+        let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        Ok(!is_alive)
     }
 
     pub fn remove_stale(lock_path: &Path) -> Result<()> {
@@ -76,7 +58,6 @@ impl PidLock {
         Ok(())
     }
 
-    #[cfg(unix)]
     fn try_lock(file: &File) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
         unsafe {
@@ -92,8 +73,7 @@ impl PidLock {
 
 impl Drop for PidLock {
     fn drop(&mut self) {
-        // Automatically release lock by dropping the file
-        self._file = None;
+        self.file = None;
         let _ = std::fs::remove_file(&self.path);
     }
 }

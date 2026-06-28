@@ -122,7 +122,6 @@ async fn level0_backup_and_restore_should_round_trip() {
         "20260601",
         &restore_dir,
         private_key.expose_secret(),
-        &btrfs,
         &remote,
     )
     .await;

@@ -1,11 +1,11 @@
 use age::secrecy::ExposeSecret;
 use anyhow::{Result, anyhow};
-use btrfs_cold_backup::{BtrfsDriver, Config, S3Backend};
+use btrfs_cold_backup::{BtrfsDriver, Config, PidLock, S3Backend, Task, write_private_key};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "bcb", about = "btrfs cold backup")]
+#[command(name = "bcb", about = "btrfs cold backup", version)]
 struct Cli {
     #[arg(long, default_value = "/etc/bcb/config.yaml")]
     config: PathBuf,
@@ -61,38 +61,40 @@ enum Commands {
     },
 }
 
+fn select_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
+    tasks
+        .iter()
+        .filter(|t| t.enabled)
+        .filter(|t| name.is_none_or(|n| t.name == n))
+        .collect()
+}
+
+async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, PidLock)> {
+    std::fs::create_dir_all(&config.base_dir)
+        .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
+
+    let lock_path = config.base_dir.join("bcb.lock");
+    PidLock::remove_stale(&lock_path)?;
+
+    let lock = PidLock::acquire(&lock_path)?;
+    let btrfs = BtrfsDriver;
+    let remote = S3Backend::new(&config.s3).await?;
+    Ok((btrfs, remote, lock))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Logging
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     match cli.command {
         Commands::Genkey { output } => {
-            let pair = btrfs_cold_backup::keys::generate_key_pair();
-            {
-                use std::io::Write;
-                #[cfg(unix)]
-                let mut file = {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&output)
-                        .map_err(|e| anyhow!("failed to create {:?}: {e}", output))?
-                };
-                #[cfg(not(unix))]
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&output)
-                    .map_err(|e| anyhow!("failed to create {:?}: {e}", output))?;
-                file.write_all(pair.private_key.expose_secret().as_bytes())
-                    .map_err(|e| anyhow!("failed to write private key to {:?}: {e}", output))?;
-            }
+            let pair = btrfs_cold_backup::generate_key_pair();
+            write_private_key(&output, pair.private_key.expose_secret())?;
             println!("{}", pair.public_key);
         }
 
@@ -108,19 +110,12 @@ async fn main() -> Result<()> {
             let config = Config::from_file(&cli.config)?;
             let remote = S3Backend::new(&config.s3).await?;
 
-            let tasks: Vec<_> = config
-                .tasks
-                .iter()
-                .filter(|t| t.enabled)
-                .filter(|t| task.as_deref().is_none_or(|name| t.name == name))
-                .collect();
-
-            for t in tasks {
+            for t in select_tasks(&config.tasks, task.as_deref()) {
                 match btrfs_cold_backup::list::list_backups(&config, t, &remote).await {
                     Ok(entries) => {
                         for entry in entries {
                             if level.is_none_or(|l| l == entry.level) {
-                                println!("{}\tlevel{}\t{}", t.name, entry.level, entry.date);
+                                println!("{}\tlevel{}\t{}", t.name, entry.level, entry.timestamp);
                             }
                         }
                     }
@@ -131,21 +126,9 @@ async fn main() -> Result<()> {
 
         Commands::Backup { level, task } => {
             let config = Config::from_file(&cli.config)?;
-            std::fs::create_dir_all(&config.base_dir)
-                .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
-            let lock_path = config.base_dir.join("bcb.lock");
-            btrfs_cold_backup::PidLock::remove_stale(&lock_path)?;
-            let _lock = btrfs_cold_backup::PidLock::acquire(&lock_path)?;
-            let btrfs = BtrfsDriver;
-            let remote = S3Backend::new(&config.s3).await?;
+            let (btrfs, remote, _lock) = acquire_runtime(&config).await?;
 
-            let tasks: Vec<_> = config
-                .tasks
-                .iter()
-                .filter(|t| t.enabled)
-                .filter(|t| task.as_deref().is_none_or(|name| t.name == name))
-                .collect();
-
+            let tasks = select_tasks(&config.tasks, task.as_deref());
             if tasks.is_empty() {
                 return Err(anyhow!("no matching enabled tasks found"));
             }
@@ -169,13 +152,7 @@ async fn main() -> Result<()> {
             private_key,
         } => {
             let config = Config::from_file(&cli.config)?;
-            std::fs::create_dir_all(&config.base_dir)
-                .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
-            let lock_path = config.base_dir.join("bcb.lock");
-            btrfs_cold_backup::PidLock::remove_stale(&lock_path)?;
-            let _lock = btrfs_cold_backup::PidLock::acquire(&lock_path)?;
-            let btrfs = BtrfsDriver;
-            let remote = S3Backend::new(&config.s3).await?;
+            let (_btrfs, remote, _lock) = acquire_runtime(&config).await?;
 
             let t = config
                 .tasks
@@ -193,7 +170,6 @@ async fn main() -> Result<()> {
                 &date,
                 &target,
                 key_str.trim(),
-                &btrfs,
                 &remote,
             )
             .await?;

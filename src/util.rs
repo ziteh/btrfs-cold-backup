@@ -1,5 +1,30 @@
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub fn compact_to_iso(s: &str) -> Result<String> {
+    if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(format!(
+            "{}-{}-{}T{}:{}:00Z",
+            &s[0..4],
+            &s[4..6],
+            &s[6..8],
+            &s[8..10],
+            &s[10..12]
+        ))
+    } else if s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(format!("{}-{}-{}T00:00:00Z", &s[0..4], &s[4..6], &s[6..8]))
+    } else {
+        Err(anyhow!("date must be YYYYMMDD or YYYYMMDDHHMM, got: {s}"))
+    }
+}
 
 pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
     let path_str = subvolume
@@ -10,7 +35,6 @@ pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
         return Err(anyhow!("subvolume path cannot be empty"));
     }
 
-    // Remove leading/trailing slashes and convert remaining slashes to underscores
     let sanitized = path_str.trim_matches('/').replace(['/', '\\'], "_");
 
     if sanitized.is_empty() {
@@ -87,24 +111,6 @@ pub fn s3_last_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
         "{}manifests/{}/last_backup_manifest.yaml",
         prefix, sanitized_subvol
     )
-}
-
-pub fn snapshot_name(level: u32, date_str: &str, time_str: &str) -> Result<String> {
-    if date_str.is_empty() || time_str.is_empty() {
-        return Err(anyhow!("date_str and time_str cannot be empty"));
-    }
-
-    const DATE_LEN: usize = "YYYY-MM-DD".len();
-    if date_str.len() != DATE_LEN || !date_str.contains('-') {
-        return Err(anyhow!("date_str must be in YYYY-MM-DD format"));
-    }
-
-    const TIME_LEN: usize = "HH-MM".len();
-    if time_str.len() != TIME_LEN || !time_str.contains('-') {
-        return Err(anyhow!("time_str must be in HH-MM format"));
-    }
-
-    Ok(format!("bcb_level{level}_{date_str}_{time_str}"))
 }
 
 #[cfg(test)]
@@ -226,39 +232,22 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_name() {
-        let name = snapshot_name(0, "2026-06-02", "14-30").unwrap();
-        assert_eq!(name, "bcb_level0_2026-06-02_14-30");
+    fn test_compact_to_iso_12() {
+        assert_eq!(
+            compact_to_iso("202606021430").unwrap(),
+            "2026-06-02T14:30:00Z"
+        );
     }
 
     #[test]
-    fn test_snapshot_name_level_used() {
-        let name = snapshot_name(1, "2026-06-02", "14-30").unwrap();
-        assert_eq!(name, "bcb_level1_2026-06-02_14-30");
+    fn test_compact_to_iso_8() {
+        assert_eq!(compact_to_iso("20260602").unwrap(), "2026-06-02T00:00:00Z");
     }
 
     #[test]
-    fn test_snapshot_name_empty_date() {
-        let result = snapshot_name(0, "", "14-30");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_snapshot_name_empty_time() {
-        let result = snapshot_name(0, "2026-06-02", "");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_snapshot_name_invalid_date_format() {
-        let result = snapshot_name(0, "2026/06/02", "14-30");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_snapshot_name_invalid_time_format() {
-        let result = snapshot_name(0, "2026-06-02", "14:30");
-        assert!(result.is_err());
+    fn test_compact_to_iso_invalid() {
+        assert!(compact_to_iso("invalid").is_err());
+        assert!(compact_to_iso("2026060214").is_err());
     }
 
     #[test]

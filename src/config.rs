@@ -1,11 +1,10 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3RetryConfig {
-    /// Maximum number of retry attempts for S3 uploads
     pub max_attempts: u32,
 }
 
@@ -17,36 +16,28 @@ impl Default for S3RetryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct S3Config {
-    /// Whether upload is enabled
     pub enabled: bool,
-    /// Bucket name
     pub bucket: String,
-    /// Region
     pub region: String,
-    /// Prefix for backup keys
     pub prefix: String,
-    /// Endpoint URL (for S3-compatible)
+    /// For S3-compatible endpoints.
     #[serde(default)]
     pub endpoint: String,
-    /// Storage class
     #[serde(default)]
     pub storage_class: S3StorageClass,
-    /// Retry config
     #[serde(default)]
     pub retry: S3RetryConfig,
-    /// Upload speed cap in KiB/s; 0 means unlimited
+    /// KiB/s; 0 means unlimited.
     #[serde(default)]
     pub upload_speed_limit_kbps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct S3StorageClass {
-    /// Storage class for manifest files
     #[serde(default = "default_manifest_class")]
     pub manifest: String,
-    /// Storage class for backup data parts by level
     #[serde(default)]
-    pub backup_data: Vec<String>,
+    pub backup_data: HashMap<u32, String>,
 }
 
 fn default_manifest_class() -> String {
@@ -55,15 +46,10 @@ fn default_manifest_class() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
-    /// Unique name for the backup task
     pub name: String,
-    /// Description of the backup task
     pub description: String,
-    /// Path to the btrfs subvolume to back up
     pub subvolume: PathBuf,
-    /// Directory to store snapshots
     pub snapshot_dir: PathBuf,
-    /// Whether this task is enabled
     #[serde(default = "default_true")]
     pub enabled: bool,
 }

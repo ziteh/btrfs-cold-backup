@@ -1,24 +1,24 @@
 use anyhow::{Result, anyhow};
 
-use crate::{Config, RemoteBackend, Task, util::sanitize_subvolume_path};
+use crate::{
+    Config, RemoteBackend, Task,
+    util::{compact_to_iso, sanitize_subvolume_path},
+};
 
 pub struct BackupEntry {
     pub level: u32,
-    pub date: String,
+    pub timestamp: String,
 }
 
 fn parse_entry(key: &str) -> Option<BackupEntry> {
-    // key format: {prefix}manifests/{sanitized_subvol}/bcb_level{N}_{YYYYMMDD}/task_manifest.yaml
     let dir = key.split('/').find(|s| s.starts_with("bcb_level"))?;
     let parts: Vec<&str> = dir.split('_').collect();
-    let [_, level_str, date, ..] = parts.as_slice() else {
+    let [_, level_str, compact_ts, ..] = parts.as_slice() else {
         return None;
     };
     let level: u32 = level_str.strip_prefix("level")?.parse().ok()?;
-    Some(BackupEntry {
-        level,
-        date: date.to_string(),
-    })
+    let timestamp = compact_to_iso(compact_ts).ok()?;
+    Some(BackupEntry { level, timestamp })
 }
 
 pub async fn list_backups<R: RemoteBackend>(
@@ -36,7 +36,7 @@ pub async fn list_backups<R: RemoteBackend>(
         .filter_map(|k| parse_entry(k))
         .collect();
 
-    entries.sort_by(|a, b| a.date.cmp(&b.date).then(a.level.cmp(&b.level)));
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.level.cmp(&b.level)));
 
     if entries.is_empty() {
         return Err(anyhow!("no backups found for task '{}'", task.name));
