@@ -77,6 +77,12 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
     storage_class: StorageClass,
     mut reader: R,
 ) -> Result<()> {
+    // No explicit checksum_algorithm is set
+    // aws-sdk-s3's default RequestChecksumCalculation (WhenSupported) already attaches a per-part CRC32 that
+    // S3 validates before accepting each UploadPart, so transmission corruption is already rejected immediately.
+    // A full-object checksum (CRC64NVME) or stored BLAKE3 metadata wouldn't add coverage beyond that,
+    // since bcb's own BLAKE3 manifest hash already verifies the whole stream at restore time.
+
     let upload_id = client
         .create_multipart_upload()
         .bucket(bucket)

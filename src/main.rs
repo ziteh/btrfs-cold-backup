@@ -25,6 +25,13 @@ enum Commands {
     /// Validate config and connectivity
     Check,
 
+    /// Verify an age key pair can encrypt and decrypt together
+    TestKeys {
+        /// Path to the age private key file
+        #[arg(long)]
+        private_key: PathBuf,
+    },
+
     /// List backups stored on S3
     List {
         /// Limit to a single task by name (default: all enabled tasks)
@@ -104,6 +111,15 @@ async fn main() -> Result<()> {
             let remote = S3Backend::new(&config.s3).await?;
             btrfs_cold_backup::check::check(&config, &btrfs, &remote).await?;
             println!("OK");
+        }
+
+        Commands::TestKeys { private_key } => {
+            let config = Config::from_file(&cli.config)?;
+            let key_str = std::fs::read_to_string(&private_key)
+                .map_err(|e| anyhow!("failed to read private key {:?}: {e}", private_key))?;
+
+            btrfs_cold_backup::test_key_pair(&config.age_public_key, key_str.trim()).await?;
+            println!("OK: private key matches the configured public key");
         }
 
         Commands::List { task, level } => {

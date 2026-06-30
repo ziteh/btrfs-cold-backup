@@ -5,6 +5,8 @@ use std::io::Read;
 use std::path::Path;
 use tokio::task;
 
+use crate::util::now_unix;
+
 pub struct AgeKeyPair {
     pub public_key: String,
     pub private_key: SecretString,
@@ -85,6 +87,38 @@ pub async fn decrypt_file(input: &Path, output: &Path, private_key_str: &str) ->
         Ok(())
     })
     .await?
+}
+
+/// Verifies a public/private age key pair can encrypt and decrypt together,
+/// by round-tripping a throwaway test file through both.
+pub async fn test_key_pair(public_key_str: &str, private_key_str: &str) -> Result<()> {
+    let tmp_dir = std::env::temp_dir().join(format!("bcb_key_test_{}", std::process::id()));
+    tokio::fs::create_dir_all(&tmp_dir).await?;
+
+    let result: Result<()> = async {
+        let test_content = format!("bcb key pair test - {}", now_unix());
+        let test_file = tmp_dir.join("test.txt");
+        tokio::fs::write(&test_file, test_content.as_bytes()).await?;
+
+        let enc_file = tmp_dir.join("test.txt.age");
+        encrypt_file(&test_file, &enc_file, public_key_str).await?;
+
+        let dec_file = tmp_dir.join("test.txt.decrypted");
+        decrypt_file(&enc_file, &dec_file, private_key_str).await?;
+
+        let decrypted = tokio::fs::read_to_string(&dec_file).await?;
+        if decrypted != test_content {
+            return Err(anyhow!(
+                "content mismatch: decrypted content does not match original"
+            ));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    result
 }
 
 pub async fn blake3_file(path: &Path) -> Result<String> {
