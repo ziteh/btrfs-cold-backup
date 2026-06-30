@@ -16,6 +16,6 @@ pub use crypto::{
     AgeKeyPair, blake3_file, decrypt_file, encrypt_file, generate_key_pair, write_private_key,
 };
 pub use lock::PidLock;
-pub use manifest::{Backup, BackupState, CompletedPart, Last, PartInfo};
+pub use manifest::{Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo};
 pub use remote::{RemoteBackend, S3Backend};
 pub use util::*;

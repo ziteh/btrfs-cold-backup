@@ -65,12 +65,12 @@ pub fn s3_backup_key(
     sanitized_subvol: &str,
     level: u32,
     timestamp: &str,
-    part_number: u32,
+    index: &str,
 ) -> Result<String> {
     let dir_name = task_dir_name(level, timestamp)?;
     let key = format!(
         "{}backup-data/{}/{}/snapshot.part-{}.age",
-        prefix, sanitized_subvol, dir_name, part_number
+        prefix, sanitized_subvol, dir_name, index
     );
     Ok(key)
 }
@@ -199,20 +199,27 @@ mod tests {
 
     #[test]
     fn test_s3_backup_key() {
-        let key = s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", 1).unwrap();
+        let key =
+            s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", "000000").unwrap();
         assert_eq!(
             key,
-            "backups/backup-data/mnt_data/bcb_level0_202606021430/snapshot.part-1.age"
+            "backups/backup-data/mnt_data/bcb_level0_202606021430/snapshot.part-000000.age"
         );
     }
 
     #[test]
     fn test_s3_backup_key_multiple_parts() {
-        let key =
-            s3_backup_key("backups/", "mnt_data_movies", 1, "2026-06-02T15:00:00Z", 5).unwrap();
+        let key = s3_backup_key(
+            "backups/",
+            "mnt_data_movies",
+            1,
+            "2026-06-02T15:00:00Z",
+            "000004",
+        )
+        .unwrap();
         assert_eq!(
             key,
-            "backups/backup-data/mnt_data_movies/bcb_level1_202606021500/snapshot.part-5.age"
+            "backups/backup-data/mnt_data_movies/bcb_level1_202606021500/snapshot.part-000004.age"
         );
     }
 
@@ -252,7 +259,8 @@ mod tests {
 
     #[test]
     fn test_s3_keys_no_path_collision() {
-        let backup_key = s3_backup_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z", 1).unwrap();
+        let backup_key =
+            s3_backup_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z", "000000").unwrap();
         let manifest_key = s3_manifest_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z").unwrap();
         let last_key = s3_last_manifest_key("prefix/", "sub");
 

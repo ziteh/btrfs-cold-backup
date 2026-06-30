@@ -7,7 +7,7 @@ use crate::util::now_unix;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartInfo {
-    pub part_number: u32,
+    pub index: String,
     pub size_bytes: u64,
     pub blake3: String,
 }
@@ -24,11 +24,12 @@ pub struct Backup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Last {
+pub struct LastEntry {
     pub timestamp: String,
-    pub level: u32,
     pub snapshot_name: String,
 }
+
+pub type Last = HashMap<u32, LastEntry>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompletedPart {
@@ -47,7 +48,7 @@ pub struct BackupState {
     pub stream_hash: Option<String>,
     #[serde(default)]
     pub total_parts: Option<u32>,
-    pub parts_completed: HashMap<u32, CompletedPart>,
+    pub parts_completed: HashMap<String, CompletedPart>,
     pub manifest_uploaded: bool,
     pub last_updated: i64,
 }
@@ -55,7 +56,9 @@ pub struct BackupState {
 impl BackupState {
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.last_updated = now_unix();
-        std::fs::write(path, serde_yaml::to_string(self)?.as_bytes())?;
+        let tmp = path.with_extension("yaml.tmp");
+        std::fs::write(&tmp, serde_yaml::to_string(self)?.as_bytes())?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 }
@@ -76,7 +79,7 @@ mod tests {
     #[test]
     fn test_part_info_serialize_deserialize() {
         let part = PartInfo {
-            part_number: 1,
+            index: "000000".to_string(),
             size_bytes: 1024,
             blake3: "abc123".to_string(),
         };
@@ -96,12 +99,12 @@ mod tests {
             blake3: "def456".to_string(),
             parts: vec![
                 PartInfo {
-                    part_number: 1,
+                    index: "000000".to_string(),
                     size_bytes: 1024,
                     blake3: "part1".to_string(),
                 },
                 PartInfo {
-                    part_number: 2,
+                    index: "000001".to_string(),
                     size_bytes: 1024,
                     blake3: "part2".to_string(),
                 },
@@ -122,7 +125,7 @@ mod tests {
             total_size_bytes: 2048,
             blake3: "ghi789".to_string(),
             parts: vec![PartInfo {
-                part_number: 1,
+                index: "000000".to_string(),
                 size_bytes: 2048,
                 blake3: "incr_part1".to_string(),
             }],
@@ -138,11 +141,21 @@ mod tests {
 
     #[test]
     fn test_last_serialize_deserialize() {
-        let last = Last {
-            timestamp: "2026-06-02T14:30:00Z".to_string(),
-            level: 0,
-            snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
-        };
+        let mut last: Last = HashMap::new();
+        last.insert(
+            0,
+            LastEntry {
+                timestamp: "2026-06-02T14:30:00Z".to_string(),
+                snapshot_name: "bcb_level0_2026-06-02_14-30".to_string(),
+            },
+        );
+        last.insert(
+            1,
+            LastEntry {
+                timestamp: "2026-06-02T15:30:00Z".to_string(),
+                snapshot_name: "bcb_level1_2026-06-02_15-30".to_string(),
+            },
+        );
         let yaml = serde_yaml::to_string(&last).unwrap();
         let deserialized: Last = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(last, deserialized);
@@ -191,14 +204,14 @@ mod tests {
             last_updated: 1748872200,
         };
         state.parts_completed.insert(
-            1,
+            "000000".to_string(),
             CompletedPart {
                 size_bytes: 3221225472,
                 hash: "hash1".to_string(),
             },
         );
         state.parts_completed.insert(
-            2,
+            "000001".to_string(),
             CompletedPart {
                 size_bytes: 1073741824,
                 hash: "hash2".to_string(),

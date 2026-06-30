@@ -25,11 +25,11 @@ async fn download_and_decrypt_parts<R: RemoteBackend>(
             sanitized,
             backup.level,
             &backup.timestamp,
-            part.part_number,
+            &part.index,
         )?;
         let part_bytes = remote.download(&part_key).await?;
 
-        let enc_path = restore_dir.join(format!("part-{}.age", part.part_number));
+        let enc_path = restore_dir.join(format!("part-{}.age", part.index));
         tokio::fs::write(&enc_path, &part_bytes).await?;
 
         let actual_hash = blake3_file(&enc_path).await?;
@@ -37,13 +37,13 @@ async fn download_and_decrypt_parts<R: RemoteBackend>(
             let _ = tokio::fs::remove_file(&enc_path).await;
             return Err(anyhow!(
                 "BLAKE3 mismatch for part {}: expected {}, got {}",
-                part.part_number,
+                part.index,
                 part.blake3,
                 actual_hash
             ));
         }
 
-        let dec_path = restore_dir.join(format!("part-{}.btrfs", part.part_number));
+        let dec_path = restore_dir.join(format!("part-{}.btrfs", part.index));
         decrypt_file(&enc_path, &dec_path, private_key_str).await?;
         let _ = tokio::fs::remove_file(&enc_path).await;
         dec_paths.push(dec_path);
@@ -141,6 +141,19 @@ pub async fn restore_task<R: RemoteBackend>(
                 "stream BLAKE3 mismatch: expected {}, got {}",
                 backup.blake3,
                 stream_hash
+            ));
+        }
+
+        let snapshot_path = target_dir.join(&backup.snapshot_name);
+        let verify = tokio::process::Command::new("btrfs")
+            .args(["subvolume", "show"])
+            .arg(&snapshot_path)
+            .output()
+            .await?;
+        if !verify.status.success() {
+            return Err(anyhow!(
+                "snapshot '{}' not found after restore",
+                backup.snapshot_name
             ));
         }
 

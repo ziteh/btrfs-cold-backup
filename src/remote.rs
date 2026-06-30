@@ -3,10 +3,13 @@ use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::StorageClass;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 
 use crate::config::S3Config;
+
+const PART_SIZE: usize = 64 * 1024 * 1024;
 
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
@@ -67,42 +70,103 @@ fn parse_storage_class(s: &str) -> Result<StorageClass> {
     }
 }
 
-async fn build_rate_limited_body(path: &Path, bps: f64) -> Result<ByteStream> {
-    use async_speed_limit::Limiter;
-    use async_speed_limit::clock::StandardClock;
-    use aws_smithy_types::body::SdkBody;
-    use tokio::io::AsyncReadExt;
-    use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-
-    let file = tokio::fs::File::open(path)
+async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    storage_class: StorageClass,
+    mut reader: R,
+) -> Result<()> {
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .storage_class(storage_class)
+        .send()
         .await
-        .map_err(|e| anyhow!("failed to open file for upload: {e}"))?;
-    let (mut sender, hyper_body) = hyper::Body::channel();
-    tokio::spawn(async move {
-        let mut limited = Limiter::<StandardClock>::new(bps)
-            .limit(file.compat())
-            .compat();
-        let mut buf = vec![0u8; 256 * 1024];
+        .map_err(|e| anyhow!("create_multipart_upload failed: {e}"))?
+        .upload_id()
+        .ok_or_else(|| anyhow!("create_multipart_upload returned no upload_id"))?
+        .to_string();
+
+    let result: Result<Vec<CompletedPart>> = async {
+        let mut parts = Vec::new();
+        let mut part_buf = vec![0u8; PART_SIZE];
+        let mut part_number = 1i32;
+
         loop {
-            match limited.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if sender
-                        .send_data(bytes::Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    sender.abort();
+            let mut filled = 0;
+            while filled < PART_SIZE {
+                let n = reader.read(&mut part_buf[filled..]).await?;
+                if n == 0 {
                     break;
                 }
+                filled += n;
             }
+            if filled == 0 {
+                break;
+            }
+
+            let resp = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .content_length(filled as i64)
+                .body(ByteStream::from(bytes::Bytes::copy_from_slice(
+                    &part_buf[..filled],
+                )))
+                .send()
+                .await
+                .map_err(|e| anyhow!("upload_part {part_number} failed: {e}"))?;
+
+            let etag = resp
+                .e_tag()
+                .ok_or_else(|| anyhow!("upload_part {part_number} returned no ETag"))?
+                .to_string();
+
+            parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+            part_number += 1;
         }
-    });
-    Ok(ByteStream::new(SdkBody::from_body_0_4(hyper_body)))
+
+        Ok(parts)
+    }
+    .await;
+
+    match result {
+        Ok(parts) => {
+            client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| anyhow!("complete_multipart_upload failed: {e}"))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            Err(e)
+        }
+    }
 }
 
 impl RemoteBackend for S3Backend {
@@ -120,26 +184,23 @@ impl RemoteBackend for S3Backend {
     }
 
     async fn upload_file(&self, key: &str, path: &Path, storage_class: &str) -> Result<()> {
-        let metadata = tokio::fs::metadata(path).await?;
-        let body = match self.upload_speed_limit_bps {
-            Some(bps) => build_rate_limited_body(path, bps).await?,
-            None => ByteStream::from_path(path)
-                .await
-                .map_err(|e| anyhow!("failed to open file for upload: {e}"))?,
-        };
-
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .storage_class(parse_storage_class(storage_class)?)
-            .content_length(metadata.len() as i64)
-            .body(body)
-            .send()
+        let sc = parse_storage_class(storage_class)?;
+        let file = tokio::fs::File::open(path)
             .await
-            .map_err(|e| anyhow!("S3 put_object failed: {e}"))?;
+            .map_err(|e| anyhow!("failed to open file for upload: {e}"))?;
 
-        Ok(())
+        match self.upload_speed_limit_bps {
+            Some(bps) => {
+                use async_speed_limit::Limiter;
+                use async_speed_limit::clock::StandardClock;
+                use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+                let reader = Limiter::<StandardClock>::new(bps)
+                    .limit(file.compat())
+                    .compat();
+                multipart_upload(&self.client, &self.bucket, key, sc, reader).await
+            }
+            None => multipart_upload(&self.client, &self.bucket, key, sc, file).await,
+        }
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {

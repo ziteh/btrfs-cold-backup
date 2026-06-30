@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use btrfs_cold_backup::{
     BtrfsOps, Config, RemoteBackend, S3Config, S3RetryConfig, S3StorageClass, Task,
-    backup::backup_task, manifest::Last, restore::restore_task,
+    backup::backup_task,
+    manifest::{Last, LastEntry},
+    restore::restore_task,
 };
 use mockall::mock;
 #[cfg(target_os = "linux")]
@@ -71,11 +73,14 @@ fn fake_stream() -> Box<dyn AsyncRead + Send + Unpin> {
 }
 
 fn last_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
-    let last = Last {
-        timestamp: "2026-06-01T14:30:00Z".to_string(),
+    let mut last = Last::new();
+    last.insert(
         level,
-        snapshot_name: snapshot_name.to_string(),
-    };
+        LastEntry {
+            timestamp: "2026-06-01T14:30:00Z".to_string(),
+            snapshot_name: snapshot_name.to_string(),
+        },
+    );
     serde_yaml::to_string(&last).unwrap().into_bytes()
 }
 
@@ -273,7 +278,7 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
         total_size_bytes: encrypted_bytes.len() as u64,
         blake3: plaintext_hash,
         parts: vec![PartInfo {
-            part_number: 1,
+            index: "000000".to_string(),
             size_bytes: encrypted_bytes.len() as u64,
             blake3: encrypted_hash,
         }],
@@ -329,7 +334,7 @@ async fn restore_should_fail_on_blake3_mismatch() {
         total_size_bytes: 10,
         blake3: "wrong_hash_that_will_never_match".to_string(),
         parts: vec![PartInfo {
-            part_number: 1,
+            index: "000000".to_string(),
             size_bytes: 10,
             blake3: "wrong_hash_that_will_never_match".to_string(),
         }],

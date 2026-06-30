@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     BtrfsOps, Config, RemoteBackend, Task,
     crypto::{blake3_file, encrypt_file},
-    manifest::{Backup, BackupState, CompletedPart, Last, PartInfo, read_state},
+    manifest::{Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo, read_state},
     util::{
         backup_output_dir, s3_backup_key, s3_last_manifest_key, s3_manifest_key,
         sanitize_subvolume_path, state_path,
@@ -25,14 +25,6 @@ fn snapshot_timestamp(name: &str) -> Result<String> {
         _ => return Err(anyhow!("unrecognized date in snapshot name: {name}")),
     };
     Ok(format!("{}T{}:00Z", iso_date, time.replace('-', ":")))
-}
-
-// split outputs 0-based numeric suffixes; part numbers in state are 1-based.
-fn split_suffix_to_part_number(suffix: &str) -> Result<u32> {
-    suffix
-        .parse::<u32>()
-        .map(|n| n + 1)
-        .map_err(|_| anyhow!("invalid part suffix: {suffix}"))
 }
 
 struct PersistentState {
@@ -103,13 +95,20 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
         ));
     } else {
         let last: Last = serde_yaml::from_slice(&remote.download(&last_key).await?)?;
-        if !snapshots.contains(&last.snapshot_name) {
+        let parent_entry = last.get(&(level - 1)).ok_or_else(|| {
+            anyhow!(
+                "no level {} entry in last manifest; run a level {} backup first",
+                level - 1,
+                level - 1
+            )
+        })?;
+        if !snapshots.contains(&parent_entry.snapshot_name) {
             return Err(anyhow!(
                 "parent snapshot '{}' not found locally",
-                last.snapshot_name
+                parent_entry.snapshot_name
             ));
         }
-        Some(last.snapshot_name)
+        Some(parent_entry.snapshot_name.clone())
     };
     let od = backup_output_dir(&config.base_dir, &sanitized, level, &ts)?;
 
@@ -229,12 +228,11 @@ fn validate_part_coverage(part_suffixes: &BTreeSet<String>, state: &BackupState)
     let Some(total) = state.total_parts else {
         return Ok(());
     };
-    let disk_numbers: BTreeSet<u32> = part_suffixes
-        .iter()
-        .filter_map(|s| split_suffix_to_part_number(s).ok())
-        .collect();
-    let uploaded_numbers: BTreeSet<u32> = state.parts_completed.keys().copied().collect();
-    let found = disk_numbers.union(&uploaded_numbers).count();
+    let mut all: BTreeSet<&str> = part_suffixes.iter().map(String::as_str).collect();
+    for k in state.parts_completed.keys() {
+        all.insert(k.as_str());
+    }
+    let found = all.len();
     if found < total as usize {
         return Err(anyhow!(
             "expected {total} parts but only found {found} \
@@ -256,8 +254,6 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     timestamp: &str,
     config: &Config,
 ) -> Result<CompletedPart> {
-    let part_number = split_suffix_to_part_number(suffix)?;
-
     let raw_path = output_dir.join(format!("snapshot.part-{suffix}"));
     let enc_path = output_dir.join(format!("snapshot.part-{suffix}.age"));
 
@@ -280,7 +276,7 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
         .get(&level)
         .map(String::as_str)
         .unwrap_or("STANDARD");
-    let part_key = s3_backup_key(&config.s3.prefix, sanitized, level, timestamp, part_number)?;
+    let part_key = s3_backup_key(&config.s3.prefix, sanitized, level, timestamp, suffix)?;
     remote
         .upload_file(&part_key, &enc_path, storage_class)
         .await?;
@@ -334,8 +330,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     validate_part_coverage(&part_suffixes, &ps.inner)?;
 
     for suffix in &part_suffixes {
-        let part_number = split_suffix_to_part_number(suffix)?;
-        if ps.inner.parts_completed.contains_key(&part_number) {
+        if ps.inner.parts_completed.contains_key(suffix.as_str()) {
             continue;
         }
         let completed = encrypt_and_upload_part(
@@ -348,7 +343,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             config,
         )
         .await?;
-        ps.inner.parts_completed.insert(part_number, completed);
+        ps.inner.parts_completed.insert(suffix.clone(), completed);
         ps.save()?;
     }
 
@@ -356,13 +351,13 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         .inner
         .parts_completed
         .iter()
-        .map(|(&n, c)| PartInfo {
-            part_number: n,
+        .map(|(idx, c)| PartInfo {
+            index: idx.clone(),
             size_bytes: c.size_bytes,
             blake3: c.hash.clone(),
         })
         .collect();
-    parts_info.sort_by_key(|p| p.part_number);
+    parts_info.sort_by(|a, b| a.index.cmp(&b.index));
     let total_enc_size: u64 = parts_info.iter().map(|p| p.size_bytes).sum();
 
     let backup = Backup {
@@ -388,13 +383,19 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         ps.save()?;
     }
 
-    // always upload — authoritative pointer for future incremental parents
-    let last = Last {
-        timestamp: plan.timestamp,
-        level,
-        snapshot_name: plan.snapshot_name,
-    };
+    // Merge current level's entry into the per-level map and re-upload.
     let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
+    let mut last: Last = match remote.head(&last_key).await? {
+        Some(_) => serde_yaml::from_slice(&remote.download(&last_key).await?).unwrap_or_default(),
+        None => Last::default(),
+    };
+    last.insert(
+        level,
+        LastEntry {
+            timestamp: plan.timestamp,
+            snapshot_name: plan.snapshot_name,
+        },
+    );
     remote
         .upload_bytes(
             &last_key,
