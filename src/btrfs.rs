@@ -101,12 +101,16 @@ fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str> {
 }
 
 fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
-    let mut child = Command::new("btrfs")
-        .args(args)
+    let mut cmd = Command::new("btrfs");
+    cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(crate::util::die_with_parent);
+    }
+    let mut child = cmd.spawn()?;
 
     let stdout = child
         .stdout

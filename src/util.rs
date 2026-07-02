@@ -2,6 +2,16 @@ use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// SIGKILL bypasses Drop, so kill_on_drop alone can't stop a child (btrfs send / split)
+// from outliving a killed bcb process; PR_SET_PDEATHSIG asks the kernel to do it instead.
+#[cfg(target_os = "linux")]
+pub fn die_with_parent() -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

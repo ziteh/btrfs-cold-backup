@@ -128,6 +128,22 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     })
 }
 
+// Test-only pause point: parks here, with both the btrfs-send and split children already
+// spawned and alive, so the VM e2e suite can SIGKILL bcb at a deterministic point to exercise
+// orphaned-child-process handling (see util::die_with_parent) instead of racing on sleep timing.
+#[cfg(debug_assertions)]
+async fn test_pause_during_send() {
+    if std::env::var("BCB_TEST_PAUSE_DURING_SEND").is_ok() {
+        use std::io::Write;
+        eprintln!("BCB_TEST_PAUSE_REACHED:during_send");
+        let _ = std::io::stderr().flush();
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn test_pause_during_send() {}
+
 async fn send_and_split<B: BtrfsOps>(
     btrfs: &B,
     task: &Task,
@@ -160,11 +176,18 @@ async fn send_and_split<B: BtrfsOps>(
     let part_prefix_str = part_prefix
         .to_str()
         .ok_or_else(|| anyhow!("invalid part prefix path"))?;
-    let mut split_child = tokio::process::Command::new("split")
+    let mut split_cmd = tokio::process::Command::new("split");
+    split_cmd
         .args(["-b", "3G", "-d", "-a", "6", "-", part_prefix_str])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        split_cmd.pre_exec(crate::util::die_with_parent);
+    }
+    let mut split_child = split_cmd.spawn()?;
+    test_pause_during_send().await;
 
     let hash = {
         let mut split_stdin = split_child

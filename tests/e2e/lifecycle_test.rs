@@ -61,7 +61,13 @@ fn s3_config(env: &E2eEnv) -> S3Config {
         region: "us-east-1".to_string(),
         prefix: "e2e-test/".to_string(),
         endpoint: env.s3_endpoint.clone(),
-        storage_class: S3StorageClass::default(),
+        // S3StorageClass::default() is Rust's #[derive(Default)], which leaves `manifest`
+        // empty — the serde `#[serde(default = ...)]` only applies when deserializing a YAML
+        // file with the field absent, not to Default::default() called directly in Rust.
+        storage_class: S3StorageClass {
+            manifest: "STANDARD".to_string(),
+            backup_data: std::collections::HashMap::new(),
+        },
         retry: S3RetryConfig::default(),
         upload_speed_limit_kbps: 0,
     }

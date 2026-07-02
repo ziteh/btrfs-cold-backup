@@ -70,6 +70,77 @@ fn parse_storage_class(s: &str) -> Result<StorageClass> {
     }
 }
 
+// Test-only pause point: parks here right after a part upload succeeds (upload_id exists on S3
+// with at least one part already uploaded, nothing completed/aborted yet) so the VM e2e suite can
+// SIGKILL bcb at a deterministic point to exercise orphaned-multipart-upload cleanup (see
+// abort_existing_multipart_uploads) instead of racing on sleep timing.
+#[cfg(debug_assertions)]
+async fn test_pause_after_s3_part(part_number: i32) {
+    if let Ok(target) = std::env::var("BCB_TEST_PAUSE_AFTER_S3_PART_NUMBER")
+        && target.parse() == Ok(part_number)
+    {
+        use std::io::Write;
+        eprintln!("BCB_TEST_PAUSE_REACHED:s3_part:{part_number}");
+        let _ = std::io::stderr().flush();
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn test_pause_after_s3_part(_part_number: i32) {}
+
+async fn abort_existing_multipart_uploads(client: &Client, bucket: &str, key: &str) {
+    // Some S3-compatible servers don't reliably honor the `prefix` filter on
+    // ListMultipartUploads (observed against MinIO: a prefix that's a genuine string-prefix of
+    // an in-progress upload's key still comes back empty), so list unfiltered and rely entirely
+    // on the exact-key match below for correctness rather than trusting server-side filtering.
+    let mut key_marker: Option<String> = None;
+    let mut upload_id_marker: Option<String> = None;
+    loop {
+        let mut req = client.list_multipart_uploads().bucket(bucket);
+        if let Some(km) = &key_marker {
+            req = req.key_marker(km);
+        }
+        if let Some(uim) = &upload_id_marker {
+            req = req.upload_id_marker(uim);
+        }
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!("failed to list multipart uploads for {key}: {e}");
+                return;
+            }
+        };
+
+        for upload in resp.uploads.into_iter().flatten() {
+            if upload.key() != Some(key) {
+                continue;
+            }
+            let Some(upload_id) = upload.upload_id() else {
+                continue;
+            };
+            if let Err(e) = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+            {
+                tracing::warn!(
+                    "failed to abort orphaned multipart upload {upload_id} for {key}: {e}"
+                );
+            }
+        }
+
+        if !resp.is_truncated.unwrap_or(false) {
+            break;
+        }
+        key_marker = resp.next_key_marker;
+        upload_id_marker = resp.next_upload_id_marker;
+    }
+}
+
 async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
     client: &Client,
     bucket: &str,
@@ -82,6 +153,11 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
     // S3 validates before accepting each UploadPart, so transmission corruption is already rejected immediately.
     // A full-object checksum (CRC64NVME) or stored BLAKE3 metadata wouldn't add coverage beyond that,
     // since bcb's own BLAKE3 manifest hash already verifies the whole stream at restore time.
+
+    // The PID lock prevents concurrent bcb instances, so any incomplete upload already sitting
+    // under this key can only be an orphan from a prior run that was killed mid-upload; clean it
+    // up before starting a fresh session so it doesn't linger (and keep costing storage) forever.
+    abort_existing_multipart_uploads(client, bucket, key).await;
 
     let upload_id = client
         .create_multipart_upload()
@@ -138,6 +214,7 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
                     .e_tag(etag)
                     .build(),
             );
+            test_pause_after_s3_part(part_number).await;
             part_number += 1;
         }
 
