@@ -6,25 +6,50 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     BtrfsOps, Config, RemoteBackend, Task,
     crypto::{blake3_file, encrypt_file},
-    manifest::{Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo, read_state},
+    manifest::{
+        Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo, SystemInfo, read_state,
+    },
     util::{
         backup_output_dir, s3_backup_key, s3_last_manifest_key, s3_manifest_key,
         sanitize_subvolume_path, state_path,
     },
 };
 
-// parts: ["bcb", "level{N}", "{date}", "{time}"]
+// Snapshot names follow btrbk's naming: bcb_level<N>.<YYYYMMDD>T<hhmm>[_<n>], i.e. btrbk
+// configured with `snapshot_name bcb_level<N>` and `timestamp_format long` (the optional
+// trailing _<n> is btrbk's same-minute collision counter).
 fn snapshot_timestamp(name: &str) -> Result<String> {
-    let parts: Vec<&str> = name.split('_').collect();
-    let [_, _, date, time, ..] = parts.as_slice() else {
-        return Err(anyhow!("invalid snapshot name: {name}"));
+    let err = || {
+        anyhow!(
+            "invalid snapshot name '{name}': expected bcb_level<N>.<YYYYMMDD>T<hhmm> \
+             (btrbk snapshot_name bcb_level<N> with timestamp_format long)"
+        )
     };
-    let iso_date = match date.len() {
-        8 => format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8]), // YYYYMMDD
-        10 => date.to_string(),                                          // YYYY-MM-DD
-        _ => return Err(anyhow!("unrecognized date in snapshot name: {name}")),
-    };
-    Ok(format!("{}T{}:00Z", iso_date, time.replace('-', ":")))
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+
+    let (prefix, ts) = name.split_once('.').ok_or_else(err)?;
+    if !prefix.starts_with("bcb_level") {
+        return Err(err());
+    }
+    let (date, rest) = ts.split_once('T').ok_or_else(err)?;
+    let mut segments = rest.split('_');
+    let time = segments.next().ok_or_else(err)?;
+    if date.len() != 8
+        || !all_digits(date)
+        || time.len() != 4
+        || !all_digits(time)
+        || !segments.all(all_digits)
+    {
+        return Err(err());
+    }
+    Ok(format!(
+        "{}-{}-{}T{}:{}:00Z",
+        &date[0..4],
+        &date[4..6],
+        &date[6..8],
+        &time[0..2],
+        &time[2..4]
+    ))
 }
 
 struct PersistentState {
@@ -60,6 +85,7 @@ struct BackupPlan {
     output_dir: PathBuf,
 }
 
+/// Returns None when the newest matching snapshot is already backed up (skip).
 async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     config: &Config,
     task: &Task,
@@ -67,26 +93,36 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     btrfs: &B,
     remote: &R,
     ps: &mut PersistentState,
-) -> Result<BackupPlan> {
+) -> Result<Option<BackupPlan>> {
     if !ps.inner.snapshot_name.is_empty() {
-        return Ok(BackupPlan {
+        return Ok(Some(BackupPlan {
             snapshot_name: ps.inner.snapshot_name.clone(),
             timestamp: ps.inner.timestamp.clone(),
             parent_snapshot: ps.inner.parent_snapshot.clone(),
             output_dir: ps.inner.output_dir.clone(),
-        });
+        }));
     }
 
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
     let snapshots = btrfs.list_snapshots(&task.snapshot_dir).await?;
-    let level_prefix = format!("bcb_level{level}_");
+    let level_prefix = format!("bcb_level{level}.");
     let sn = snapshots
         .iter()
         .rfind(|s| s.starts_with(&level_prefix))
         .ok_or_else(|| anyhow!("no level {level} snapshot found in {:?}", task.snapshot_dir))?
         .clone();
     let ts = snapshot_timestamp(&sn)?;
+
+    // A manifest already on remote means this snapshot is fully backed up: skip rather than
+    // redo it — overwriting archived objects incurs minimum-storage-duration charges, and a
+    // skip keeps re-runs idempotent so one completed task never blocks the others.
+    let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &ts)?;
+    if remote.head(&manifest_key).await?.is_some() {
+        tracing::info!("snapshot '{sn}' is already backed up at level {level}, skipping");
+        return Ok(None);
+    }
+
     let par = if level == 0 {
         None
     } else if remote.head(&last_key).await?.is_none() {
@@ -108,6 +144,14 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
                 parent_entry.snapshot_name
             ));
         }
+        if ts <= parent_entry.timestamp {
+            return Err(anyhow!(
+                "snapshot '{sn}' ({ts}) is not newer than its parent '{}' ({}); \
+                 create a fresh level {level} snapshot before backing up",
+                parent_entry.snapshot_name,
+                parent_entry.timestamp
+            ));
+        }
         Some(parent_entry.snapshot_name.clone())
     };
     let od = backup_output_dir(&config.base_dir, &sanitized, level, &ts)?;
@@ -120,12 +164,12 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     ps.inner.output_dir = od.clone();
     ps.save()?;
 
-    Ok(BackupPlan {
+    Ok(Some(BackupPlan {
         snapshot_name: sn,
         timestamp: ts,
         parent_snapshot: par,
         output_dir: od,
-    })
+    }))
 }
 
 // Test-only pause point: parks here, with both the btrfs-send and split children already
@@ -143,6 +187,17 @@ async fn test_pause_during_send() {
 
 #[cfg(not(debug_assertions))]
 async fn test_pause_during_send() {}
+
+// Test-only override so multi-part backups can be exercised without multi-GiB fixtures.
+#[cfg(debug_assertions)]
+fn split_part_size() -> String {
+    std::env::var("BCB_TEST_SPLIT_SIZE").unwrap_or_else(|_| "3G".to_string())
+}
+
+#[cfg(not(debug_assertions))]
+fn split_part_size() -> String {
+    "3G".to_string()
+}
 
 async fn send_and_split<B: BtrfsOps>(
     btrfs: &B,
@@ -178,7 +233,15 @@ async fn send_and_split<B: BtrfsOps>(
         .ok_or_else(|| anyhow!("invalid part prefix path"))?;
     let mut split_cmd = tokio::process::Command::new("split");
     split_cmd
-        .args(["-b", "3G", "-d", "-a", "6", "-", part_prefix_str])
+        .args([
+            "-b",
+            &split_part_size(),
+            "-d",
+            "-a",
+            "6",
+            "-",
+            part_prefix_str,
+        ])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -296,12 +359,23 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
         .s3
         .storage_class
         .backup_data
-        .get(&level)
+        .get(level as usize)
         .map(String::as_str)
-        .unwrap_or("STANDARD");
+        .ok_or_else(|| {
+            anyhow!(
+                "no storage class configured for level {level} \
+                 (s3.storage_class.backup_data has {} entries)",
+                config.s3.storage_class.backup_data.len()
+            )
+        })?;
     let part_key = s3_backup_key(&config.s3.prefix, sanitized, level, timestamp, suffix)?;
     remote
-        .upload_file(&part_key, &enc_path, storage_class)
+        .upload_file(
+            &part_key,
+            &enc_path,
+            storage_class,
+            &format!("bcb-backup-level={level}"),
+        )
         .await?;
     let _ = tokio::fs::remove_file(&enc_path).await;
 
@@ -317,14 +391,16 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     level: u32,
     btrfs: &B,
     remote: &R,
-) -> Result<Backup> {
+) -> Result<Option<Backup>> {
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let sp = state_path(&config.base_dir, &sanitized);
     tokio::fs::create_dir_all(sp.parent().unwrap()).await?;
 
     let mut ps = PersistentState::load_or_init(sp, &task.name, level)?;
 
-    let plan = init_backup_plan(config, task, level, btrfs, remote, &mut ps).await?;
+    let Some(plan) = init_backup_plan(config, task, level, btrfs, remote, &mut ps).await? else {
+        return Ok(None);
+    };
 
     let stream_hash = send_and_split(
         btrfs,
@@ -385,9 +461,16 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
 
     let backup = Backup {
         timestamp: plan.timestamp.clone(),
+        created_at: crate::util::now_unix(),
         level,
         snapshot_name: plan.snapshot_name.clone(),
         parent_snapshot: plan.parent_snapshot.clone(),
+        system: SystemInfo {
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            btrfs_version: crate::btrfs::btrfs_version().await,
+            bcb_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        age_public_key: config.age_public_key.clone(),
         total_size_bytes: total_enc_size,
         blake3: stream_hash,
         parts: parts_info,
@@ -400,6 +483,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
                 &manifest_key,
                 serde_yaml::to_string(&backup)?.into_bytes(),
                 &config.s3.storage_class.manifest,
+                "bcb-backup-level=manifest",
             )
             .await?;
         ps.inner.manifest_uploaded = true;
@@ -409,7 +493,11 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     // Merge current level's entry into the per-level map and re-upload.
     let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
     let mut last: Last = match remote.head(&last_key).await? {
-        Some(_) => serde_yaml::from_slice(&remote.download(&last_key).await?).unwrap_or_default(),
+        // A corrupted last manifest must not be silently reset: dropping other levels'
+        // entries would break subsequent incremental backups without warning.
+        Some(_) => serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
+            anyhow!("failed to parse last manifest {last_key}: {e}; repair or delete it manually")
+        })?,
         None => Last::default(),
     };
     last.insert(
@@ -424,11 +512,74 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             &last_key,
             serde_yaml::to_string(&last)?.into_bytes(),
             &config.s3.storage_class.manifest,
+            "bcb-backup-level=manifest",
         )
         .await?;
 
     let _ = tokio::fs::remove_dir_all(&plan.output_dir).await;
     let _ = tokio::fs::remove_file(&ps.path).await;
 
-    Ok(backup)
+    Ok(Some(backup))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_timestamp_valid_name() {
+        let ts = snapshot_timestamp("bcb_level1.20260602T1430").unwrap();
+        assert_eq!(ts, "2026-06-02T14:30:00Z");
+    }
+
+    #[test]
+    fn test_snapshot_timestamp_collision_suffix() {
+        let ts = snapshot_timestamp("bcb_level0.20260602T1430_1").unwrap();
+        assert_eq!(ts, "2026-06-02T14:30:00Z");
+    }
+
+    #[test]
+    fn test_snapshot_timestamp_invalid_names() {
+        assert!(snapshot_timestamp("bcb_level0").is_err());
+        // btrbk timestamp_format short (date only) is not supported
+        assert!(snapshot_timestamp("bcb_level0.20260602").is_err());
+        // underscore instead of btrbk's T separator
+        assert!(snapshot_timestamp("bcb_level0.20260602_1430").is_err());
+        assert!(snapshot_timestamp("bcb_level0_2026-06-02_14-30").is_err());
+        assert!(snapshot_timestamp("bcb_level0.2026-06-02T1430").is_err());
+        assert!(snapshot_timestamp("bcb_level0.20260602T14x0").is_err());
+        assert!(snapshot_timestamp("unrelated.20260602T1430").is_err());
+    }
+
+    #[test]
+    fn test_validate_part_coverage_counts_disk_and_uploaded() {
+        let mut state = BackupState {
+            total_parts: Some(2),
+            ..Default::default()
+        };
+        state.parts_completed.insert(
+            "000000".to_string(),
+            crate::manifest::CompletedPart {
+                size_bytes: 1,
+                hash: String::new(),
+            },
+        );
+
+        let mut on_disk = BTreeSet::new();
+        assert!(validate_part_coverage(&on_disk, &state).is_err());
+
+        on_disk.insert("000001".to_string());
+        assert!(validate_part_coverage(&on_disk, &state).is_ok());
+
+        // a part both on disk and uploaded must not be double-counted
+        on_disk.insert("000000".to_string());
+        state.total_parts = Some(3);
+        assert!(validate_part_coverage(&on_disk, &state).is_err());
+    }
+
+    #[test]
+    fn test_validate_part_coverage_no_total_is_ok() {
+        let state = BackupState::default();
+        assert!(validate_part_coverage(&BTreeSet::new(), &state).is_ok());
+    }
 }

@@ -65,7 +65,22 @@ enum Commands {
         /// Path to the age private key file
         #[arg(long)]
         private_key: PathBuf,
+        /// Days the retrieved copy of archived objects stays downloadable
+        #[arg(long, default_value_t = 3)]
+        restore_days: i32,
+        /// Archive retrieval tier: Standard, Bulk, or Expedited
+        #[arg(long, default_value = "Standard")]
+        restore_tier: String,
     },
+}
+
+fn require_s3(config: &Config) -> Result<()> {
+    if !config.s3.enabled {
+        return Err(anyhow!(
+            "s3.enabled is false in config; this command needs S3"
+        ));
+    }
+    Ok(())
 }
 
 fn select_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
@@ -81,22 +96,54 @@ async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, Pid
         .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
 
     let lock_path = config.base_dir.join("bcb.lock");
-    PidLock::remove_stale(&lock_path)?;
-
     let lock = PidLock::acquire(&lock_path)?;
     let btrfs = BtrfsDriver;
     let remote = S3Backend::new(&config.s3).await?;
     Ok((btrfs, remote, lock))
 }
 
+// Stderr obeys RUST_LOG as before; backup/restore additionally append INFO+ to a daily
+// rolling file under base_dir so unattended cron runs leave a trail to debug from.
+fn init_logging(file_log_dir: Option<std::path::PathBuf>) {
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+
+    let file_layer = file_log_dir.and_then(|dir| {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("cannot create log directory {dir:?}: {e}; file logging disabled");
+            return None;
+        }
+        let appender = tracing_appender::rolling::daily(dir, "bcb.log");
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_writer(appender)
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        )
+    });
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Logging
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let file_log_dir = match &cli.command {
+        // Errors loading the config are swallowed here on purpose; the command arm reloads
+        // it and reports them properly.
+        Commands::Backup { .. } | Commands::Restore { .. } => Config::from_file(&cli.config)
+            .ok()
+            .map(|c| c.base_dir.join("log")),
+        _ => None,
+    };
+    init_logging(file_log_dir);
 
     match cli.command {
         Commands::Genkey { output } => {
@@ -107,6 +154,7 @@ async fn main() -> Result<()> {
 
         Commands::Check => {
             let config = Config::from_file(&cli.config)?;
+            btrfs_cold_backup::check::check_binaries()?;
             let btrfs = BtrfsDriver;
             let remote = S3Backend::new(&config.s3).await?;
             btrfs_cold_backup::check::check(&config, &btrfs, &remote).await?;
@@ -124,6 +172,7 @@ async fn main() -> Result<()> {
 
         Commands::List { task, level } => {
             let config = Config::from_file(&cli.config)?;
+            require_s3(&config)?;
             let remote = S3Backend::new(&config.s3).await?;
 
             for t in select_tasks(&config.tasks, task.as_deref()) {
@@ -142,6 +191,7 @@ async fn main() -> Result<()> {
 
         Commands::Backup { level, task } => {
             let config = Config::from_file(&cli.config)?;
+            require_s3(&config)?;
             let (btrfs, remote, _lock) = acquire_runtime(&config).await?;
 
             let tasks = select_tasks(&config.tasks, task.as_deref());
@@ -149,14 +199,34 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("no matching enabled tasks found"));
             }
 
+            // One failing task must not block the others; run them all and report at the end.
+            // Outcomes go to tracing as well so the daily log file records them.
+            let mut failed: Vec<String> = Vec::new();
             for t in tasks {
-                let backup =
-                    btrfs_cold_backup::backup::backup_task(&config, t, level, &btrfs, &remote)
-                        .await?;
-                println!(
-                    "{}: level {} backup completed ({})",
-                    t.name, backup.level, backup.timestamp
-                );
+                tracing::info!(task = %t.name, level, "backup started");
+                match btrfs_cold_backup::backup::backup_task(&config, t, level, &btrfs, &remote)
+                    .await
+                {
+                    Ok(Some(backup)) => {
+                        tracing::info!(task = %t.name, level, timestamp = %backup.timestamp, "backup completed");
+                        println!(
+                            "{}: level {} backup completed ({})",
+                            t.name, backup.level, backup.timestamp
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::info!(task = %t.name, level, "already backed up, skipped");
+                        println!("{}: level {level} already backed up, skipped", t.name);
+                    }
+                    Err(e) => {
+                        tracing::error!(task = %t.name, level, error = format!("{e:#}"), "backup failed");
+                        eprintln!("{}: level {level} backup failed: {e:#}", t.name);
+                        failed.push(t.name.clone());
+                    }
+                }
+            }
+            if !failed.is_empty() {
+                return Err(anyhow!("backup failed for task(s): {}", failed.join(", ")));
             }
         }
 
@@ -166,8 +236,11 @@ async fn main() -> Result<()> {
             date,
             target,
             private_key,
+            restore_days,
+            restore_tier,
         } => {
             let config = Config::from_file(&cli.config)?;
+            require_s3(&config)?;
             let (_btrfs, remote, _lock) = acquire_runtime(&config).await?;
 
             let t = config
@@ -179,16 +252,30 @@ async fn main() -> Result<()> {
             let key_str = std::fs::read_to_string(&private_key)
                 .map_err(|e| anyhow!("failed to read private key {:?}: {e}", private_key))?;
 
-            btrfs_cold_backup::restore::restore_task(
+            let retrieval = btrfs_cold_backup::restore::RetrievalOptions {
+                days: restore_days,
+                tier: restore_tier,
+            };
+
+            tracing::info!(task = %t.name, level, date, "restore started");
+            let result = btrfs_cold_backup::restore::restore_task(
                 &config,
                 t,
                 level,
                 &date,
                 &target,
                 key_str.trim(),
+                &retrieval,
                 &remote,
             )
-            .await?;
+            .await;
+            match &result {
+                Ok(()) => tracing::info!(task = %t.name, level, "restore completed"),
+                Err(e) => {
+                    tracing::error!(task = %t.name, level, error = format!("{e:#}"), "restore failed")
+                }
+            }
+            result?;
 
             println!("restore complete");
         }

@@ -152,6 +152,15 @@ fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
     }))
 }
 
+/// Reports the installed btrfs-progs version, or "unknown" — manifest provenance only,
+/// never a hard failure.
+pub async fn btrfs_version() -> String {
+    match Command::new("btrfs").arg("--version").output().await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 pub struct BtrfsDriver;
 
 impl BtrfsOps for BtrfsDriver {

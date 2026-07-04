@@ -3,7 +3,10 @@ use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, GlacierJobParameters, RestoreRequest, StorageClass,
+    Tier,
+};
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 
@@ -11,14 +14,45 @@ use crate::config::S3Config;
 
 const PART_SIZE: usize = 64 * 1024 * 1024;
 
+/// Whether an object can be downloaded right now, considering archive storage classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreStatus {
+    /// Downloadable now: not archived, or an archive retrieval has completed.
+    Ready,
+    /// An archive retrieval was requested and is still running.
+    InProgress,
+    /// Archived and no retrieval has been requested yet.
+    NotRequested,
+}
+
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
 pub trait RemoteBackend: Send + Sync {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>, storage_class: &str) -> Result<()>;
-    async fn upload_file(&self, key: &str, path: &Path, storage_class: &str) -> Result<()>;
+    /// `tags` is a URL-query-encoded tag set (e.g. "bcb-backup-level=0") stamped on the
+    /// object so S3 lifecycle rules can filter by it.
+    async fn upload_bytes(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        storage_class: &str,
+        tags: &str,
+    ) -> Result<()>;
+    async fn upload_file(
+        &self,
+        key: &str,
+        path: &Path,
+        storage_class: &str,
+        tags: &str,
+    ) -> Result<()>;
     /// Returns the object size in bytes, or None if the key does not exist.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
     async fn download(&self, key: &str) -> Result<Vec<u8>>;
+    /// Streams the object to a local file without buffering it in memory.
+    async fn download_to_file(&self, key: &str, path: &Path) -> Result<()>;
+    /// Reports whether the object is downloadable, in archive retrieval, or needs one.
+    async fn restore_status(&self, key: &str) -> Result<RestoreStatus>;
+    /// Initiates an archive retrieval so the object becomes downloadable for `days`.
+    async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
     async fn verify_credentials(&self) -> Result<()>;
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -26,6 +60,7 @@ pub trait RemoteBackend: Send + Sync {
 pub struct S3Backend {
     client: Client,
     bucket: String,
+    prefix: String,
     upload_speed_limit_bps: Option<f64>,
 }
 
@@ -51,12 +86,13 @@ impl S3Backend {
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: config.bucket.clone(),
+            prefix: config.prefix.clone(),
             upload_speed_limit_bps,
         })
     }
 }
 
-fn parse_storage_class(s: &str) -> Result<StorageClass> {
+pub(crate) fn parse_storage_class(s: &str) -> Result<StorageClass> {
     match s {
         "DEEP_ARCHIVE" => Ok(StorageClass::DeepArchive),
         "GLACIER" => Ok(StorageClass::Glacier),
@@ -146,6 +182,7 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
     bucket: &str,
     key: &str,
     storage_class: StorageClass,
+    tags: &str,
     mut reader: R,
 ) -> Result<()> {
     // No explicit checksum_algorithm is set
@@ -164,6 +201,7 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
         .bucket(bucket)
         .key(key)
         .storage_class(storage_class)
+        .tagging(tags)
         .send()
         .await
         .map_err(|e| anyhow!("create_multipart_upload failed: {e}"))?
@@ -253,12 +291,19 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
 }
 
 impl RemoteBackend for S3Backend {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>, storage_class: &str) -> Result<()> {
+    async fn upload_bytes(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        storage_class: &str,
+        tags: &str,
+    ) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .storage_class(parse_storage_class(storage_class)?)
+            .tagging(tags)
             .body(ByteStream::from(data))
             .send()
             .await
@@ -266,7 +311,13 @@ impl RemoteBackend for S3Backend {
         Ok(())
     }
 
-    async fn upload_file(&self, key: &str, path: &Path, storage_class: &str) -> Result<()> {
+    async fn upload_file(
+        &self,
+        key: &str,
+        path: &Path,
+        storage_class: &str,
+        tags: &str,
+    ) -> Result<()> {
         let sc = parse_storage_class(storage_class)?;
         let file = tokio::fs::File::open(path)
             .await
@@ -280,9 +331,9 @@ impl RemoteBackend for S3Backend {
                 let reader = Limiter::<StandardClock>::new(bps)
                     .limit(file.compat())
                     .compat();
-                multipart_upload(&self.client, &self.bucket, key, sc, reader).await
+                multipart_upload(&self.client, &self.bucket, key, sc, tags, reader).await
             }
-            None => multipart_upload(&self.client, &self.bucket, key, sc, file).await,
+            None => multipart_upload(&self.client, &self.bucket, key, sc, tags, file).await,
         }
     }
 
@@ -326,6 +377,90 @@ impl RemoteBackend for S3Backend {
         Ok(bytes.to_vec())
     }
 
+    async fn download_to_file(&self, key: &str, path: &Path) -> Result<()> {
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("S3 get_object failed: {e}"))?;
+
+        let mut body = resp.body.into_async_read();
+        let mut file = tokio::fs::File::create(path)
+            .await
+            .map_err(|e| anyhow!("failed to create {:?}: {e}", path))?;
+        tokio::io::copy(&mut body, &mut file)
+            .await
+            .map_err(|e| anyhow!("failed to write S3 object to {:?}: {e}", path))?;
+        Ok(())
+    }
+
+    async fn restore_status(&self, key: &str) -> Result<RestoreStatus> {
+        let resp = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("S3 head_object failed for {key}: {e}"))?;
+
+        // Only these classes require an explicit retrieval before GET; GLACIER_IR and the
+        // rest are directly readable.
+        let archived = matches!(
+            resp.storage_class(),
+            Some(StorageClass::DeepArchive) | Some(StorageClass::Glacier)
+        );
+        if !archived {
+            return Ok(RestoreStatus::Ready);
+        }
+
+        // x-amz-restore: absent = never requested; ongoing-request="true" = running;
+        // ongoing-request="false" = a restored copy is available until its expiry date.
+        match resp.restore() {
+            None => Ok(RestoreStatus::NotRequested),
+            Some(r) if r.contains("ongoing-request=\"true\"") => Ok(RestoreStatus::InProgress),
+            Some(_) => Ok(RestoreStatus::Ready),
+        }
+    }
+
+    async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()> {
+        let request = RestoreRequest::builder()
+            .days(days)
+            .glacier_job_parameters(
+                GlacierJobParameters::builder()
+                    .tier(Tier::from(tier))
+                    .build()
+                    .map_err(|e| anyhow!("invalid retrieval tier: {e}"))?,
+            )
+            .build();
+
+        match self
+            .client
+            .restore_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .restore_request(request)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                // A retrieval already running (or the object already readable) means the
+                // caller's goal is met; only one retrieval needs to be in flight.
+                match e.code() {
+                    Some("RestoreAlreadyInProgress") | Some("ObjectAlreadyInActiveTierError") => {
+                        Ok(())
+                    }
+                    _ => Err(anyhow!("S3 restore_object failed for {key}: {e}")),
+                }
+            }
+        }
+    }
+
     async fn verify_credentials(&self) -> Result<()> {
         self.client
             .head_bucket()
@@ -333,6 +468,25 @@ impl RemoteBackend for S3Backend {
             .send()
             .await
             .map_err(|e| anyhow!("cannot access S3 bucket: {e}"))?;
+
+        // head_bucket only proves read access; backups need write and delete, so probe with
+        // a throwaway object under the configured prefix.
+        let probe_key = format!("{}bcb_check_probe", self.prefix);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&probe_key)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .map_err(|e| anyhow!("cannot write to S3 bucket: {e}"))?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&probe_key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("cannot delete from S3 bucket: {e}"))?;
 
         Ok(())
     }

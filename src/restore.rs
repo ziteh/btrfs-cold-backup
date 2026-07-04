@@ -7,8 +7,46 @@ use crate::{
     Config, RemoteBackend, Task,
     crypto::{blake3_file, decrypt_file},
     manifest::Backup,
+    remote::RestoreStatus,
     util::{compact_to_iso, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
+
+/// Retrieval tier and lifetime for archived (Glacier / Deep Archive) objects.
+pub struct RetrievalOptions {
+    pub days: i32,
+    pub tier: String,
+}
+
+/// Ensures every key is downloadable, requesting archive retrievals where needed.
+///
+/// Archive retrievals take hours, so this does not wait: if any key is not yet ready it
+/// returns an error telling the operator to re-run once the retrievals complete.
+async fn ensure_retrievable<R: RemoteBackend>(
+    remote: &R,
+    keys: &[String],
+    opts: &RetrievalOptions,
+) -> Result<()> {
+    let mut requested = 0usize;
+    let mut in_progress = 0usize;
+    for key in keys {
+        match remote.restore_status(key).await? {
+            RestoreStatus::Ready => {}
+            RestoreStatus::InProgress => in_progress += 1,
+            RestoreStatus::NotRequested => {
+                remote.request_restore(key, opts.days, &opts.tier).await?;
+                requested += 1;
+            }
+        }
+    }
+    if requested > 0 || in_progress > 0 {
+        return Err(anyhow!(
+            "{requested} archive retrieval(s) initiated, {in_progress} still in progress; \
+             archived objects take hours to become downloadable — re-run this restore once \
+             the retrievals complete"
+        ));
+    }
+    Ok(())
+}
 
 async fn download_and_decrypt_parts<R: RemoteBackend>(
     backup: &Backup,
@@ -27,10 +65,9 @@ async fn download_and_decrypt_parts<R: RemoteBackend>(
             &backup.timestamp,
             &part.index,
         )?;
-        let part_bytes = remote.download(&part_key).await?;
 
         let enc_path = restore_dir.join(format!("part-{}.age", part.index));
-        tokio::fs::write(&enc_path, &part_bytes).await?;
+        remote.download_to_file(&part_key, &enc_path).await?;
 
         let actual_hash = blake3_file(&enc_path).await?;
         if actual_hash != part.blake3 {
@@ -51,10 +88,7 @@ async fn download_and_decrypt_parts<R: RemoteBackend>(
     Ok(dec_paths)
 }
 
-async fn pipe_to_btrfs_receive(
-    dec_paths: &[std::path::PathBuf],
-    target_dir: &Path,
-) -> Result<String> {
+async fn pipe_to_btrfs_receive(dec_paths: &[std::path::PathBuf], target_dir: &Path) -> Result<()> {
     tokio::fs::create_dir_all(target_dir).await?;
     let target_str = target_dir
         .to_str()
@@ -67,12 +101,11 @@ async fn pipe_to_btrfs_receive(
         .kill_on_drop(true)
         .spawn()?;
 
-    let stream_hash = {
+    {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| anyhow!("failed to open btrfs receive stdin"))?;
-        let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; 65536];
         for dec_path in dec_paths {
             let mut f = tokio::fs::File::open(dec_path).await?;
@@ -81,13 +114,11 @@ async fn pipe_to_btrfs_receive(
                 if n == 0 {
                     break;
                 }
-                hasher.update(&buf[..n]);
                 stdin.write_all(&buf[..n]).await?;
             }
             let _ = tokio::fs::remove_file(dec_path).await;
         }
-        hasher.finalize().to_hex().to_string()
-    };
+    }
 
     let output = child.wait_with_output().await?;
     if !output.status.success() {
@@ -95,9 +126,34 @@ async fn pipe_to_btrfs_receive(
         return Err(anyhow!("btrfs receive failed: {}", stderr.trim()));
     }
 
-    Ok(stream_hash)
+    Ok(())
 }
 
+/// Verifies the whole-stream BLAKE3 across the decrypted parts in order, BEFORE anything is
+/// piped to btrfs receive — a corrupt stream must never be written to the target.
+async fn verify_stream_hash(dec_paths: &[std::path::PathBuf], expected: &str) -> Result<()> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 65536];
+    for dec_path in dec_paths {
+        let mut f = tokio::fs::File::open(dec_path).await?;
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+    }
+    let actual = hasher.finalize().to_hex().to_string();
+    if actual != expected {
+        return Err(anyhow!(
+            "stream BLAKE3 mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn restore_task<R: RemoteBackend>(
     config: &Config,
     task: &Task,
@@ -105,13 +161,22 @@ pub async fn restore_task<R: RemoteBackend>(
     date: &str,
     target_dir: &Path,
     private_key_str: &str,
+    retrieval: &RetrievalOptions,
     remote: &R,
 ) -> Result<()> {
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let timestamp = compact_to_iso(date)?;
 
     let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp)?;
+    ensure_retrievable(remote, std::slice::from_ref(&manifest_key), retrieval).await?;
     let backup: Backup = serde_yaml::from_slice(&remote.download(&manifest_key).await?)?;
+
+    let part_keys = backup
+        .parts
+        .iter()
+        .map(|p| s3_backup_key(&config.s3.prefix, &sanitized, level, &timestamp, &p.index))
+        .collect::<Result<Vec<_>>>()?;
+    ensure_retrievable(remote, &part_keys, retrieval).await?;
 
     // Unique temp dir per invocation; prevents concurrent restores from colliding.
     let nonce = SystemTime::now()
@@ -134,15 +199,9 @@ pub async fn restore_task<R: RemoteBackend>(
         )
         .await?;
 
-        let stream_hash = pipe_to_btrfs_receive(&dec_paths, target_dir).await?;
+        verify_stream_hash(&dec_paths, &backup.blake3).await?;
 
-        if stream_hash != backup.blake3 {
-            return Err(anyhow!(
-                "stream BLAKE3 mismatch: expected {}, got {}",
-                backup.blake3,
-                stream_hash
-            ));
-        }
+        pipe_to_btrfs_receive(&dec_paths, target_dir).await?;
 
         let snapshot_path = target_dir.join(&backup.snapshot_name);
         let verify = tokio::process::Command::new("btrfs")

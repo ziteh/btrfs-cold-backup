@@ -86,7 +86,7 @@ async fn create_snapshot_should_create_readonly_snapshot() {
 
     let driver = BtrfsDriver;
     let snap = driver
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0_20260101_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260101T0000")
         .await
         .unwrap();
 
@@ -109,7 +109,7 @@ async fn delete_snapshot_should_remove_the_snapshot() {
 
     let driver = BtrfsDriver;
     let snap = driver
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0_20260101_00-00")
+        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260101T0000")
         .await
         .unwrap();
     assert!(snap.exists());
@@ -128,8 +128,8 @@ async fn list_snapshots_should_return_only_bcb_prefixed_dirs() {
     std::fs::create_dir_all(&snap_dir).unwrap();
 
     // Create bcb-prefixed snapshot dirs and one unrelated dir
-    std::fs::create_dir(snap_dir.join("bcb_level0_20260101_00-00")).unwrap();
-    std::fs::create_dir(snap_dir.join("bcb_level1_20260102_00-00")).unwrap();
+    std::fs::create_dir(snap_dir.join("bcb_level0.20260101T0000")).unwrap();
+    std::fs::create_dir(snap_dir.join("bcb_level1.20260102T0000")).unwrap();
     std::fs::create_dir(snap_dir.join("unrelated")).unwrap();
 
     let driver = BtrfsDriver;
@@ -137,7 +137,7 @@ async fn list_snapshots_should_return_only_bcb_prefixed_dirs() {
 
     assert_eq!(
         names,
-        vec!["bcb_level0_20260101_00-00", "bcb_level1_20260102_00-00"]
+        vec!["bcb_level0.20260101T0000", "bcb_level1.20260102T0000"]
     );
 }
 
@@ -151,7 +151,7 @@ async fn send_full_should_produce_non_empty_stream() {
     btrfs_subvolume_create(&subvol);
     std::fs::write(subvol.join("data.txt"), b"btrfs send test").unwrap();
 
-    let snap = snap_dir.join("bcb_level0_20260101_00-00");
+    let snap = snap_dir.join("bcb_level0.20260101T0000");
     btrfs_snapshot(&subvol, &snap);
 
     let driver = BtrfsDriver;
@@ -174,13 +174,13 @@ async fn send_incremental_should_produce_smaller_stream_than_full() {
     btrfs_subvolume_create(&subvol);
     std::fs::write(subvol.join("data.txt"), b"initial content").unwrap();
 
-    let snap0 = snap_dir.join("bcb_level0_20260101_00-00");
+    let snap0 = snap_dir.join("bcb_level0.20260101T0000");
     btrfs_snapshot(&subvol, &snap0);
 
     // Make the subvolume writable again by deleting and recreating
     // (btrfs snapshot -r is read-only; add data to parent subvol)
     std::fs::write(subvol.join("extra.txt"), b"added later").unwrap();
-    let snap1 = snap_dir.join("bcb_level1_20260102_00-00");
+    let snap1 = snap_dir.join("bcb_level1.20260102T0000");
     btrfs_snapshot(&subvol, &snap1);
 
     let driver = BtrfsDriver;

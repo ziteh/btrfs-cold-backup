@@ -8,15 +8,15 @@ use btrfs_cold_backup::{
     Config, S3Config, S3RetryConfig, S3StorageClass, Task, sanitize_subvolume_path,
 };
 
-struct VmEnv {
-    btrfs_mount: PathBuf,
-    s3_endpoint: String,
-    s3_bucket: String,
-    bin_path: PathBuf,
+pub(crate) struct VmEnv {
+    pub(crate) btrfs_mount: PathBuf,
+    pub(crate) s3_endpoint: String,
+    pub(crate) s3_bucket: String,
+    pub(crate) bin_path: PathBuf,
 }
 
 /// Returns the VM env from env vars, or None to skip the test.
-fn vm_env() -> Option<VmEnv> {
+pub(crate) fn vm_env() -> Option<VmEnv> {
     Some(VmEnv {
         btrfs_mount: std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from)?,
         s3_endpoint: std::env::var("BCB_S3_ENDPOINT").ok()?,
@@ -69,14 +69,14 @@ fn s3_config(env: &VmEnv) -> S3Config {
         // file with the field absent, not to Default::default() called directly in Rust.
         storage_class: S3StorageClass {
             manifest: "STANDARD".to_string(),
-            backup_data: std::collections::HashMap::new(),
+            backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],
         },
         retry: S3RetryConfig::default(),
         upload_speed_limit_kbps: 0,
     }
 }
 
-async fn raw_s3_client(env: &VmEnv) -> aws_sdk_s3::Client {
+pub(crate) async fn raw_s3_client(env: &VmEnv) -> aws_sdk_s3::Client {
     let region = aws_sdk_s3::config::Region::new("us-east-1");
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region)
@@ -201,20 +201,20 @@ fn wait_no_orphan_children(timeout: Duration) -> bool {
     }
 }
 
-struct Fixture {
-    config_path: PathBuf,
-    private_key_path: PathBuf,
-    subvol: PathBuf,
-    snap_dir: PathBuf,
-    work_dir: PathBuf,
-    restore_dir: PathBuf,
-    task_name: String,
+pub(crate) struct Fixture {
+    pub(crate) config_path: PathBuf,
+    pub(crate) private_key_path: PathBuf,
+    pub(crate) subvol: PathBuf,
+    pub(crate) snap_dir: PathBuf,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) restore_dir: PathBuf,
+    pub(crate) task_name: String,
     /// Root of this fixture's directories on the btrfs device (snap_dir, restore_dir live here).
-    btrfs_dir: PathBuf,
+    pub(crate) btrfs_dir: PathBuf,
 }
 
 /// Creates a subvolume + snapshot + on-disk config/key files for one interruption test.
-fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Path)) -> Fixture {
+pub(crate) fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Path)) -> Fixture {
     ensure_bucket(&env.s3_bucket);
 
     let btrfs_dir = test_dir(&env.btrfs_mount, name);
@@ -238,7 +238,7 @@ fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Path)) -> Fix
             "-r",
             subvol.to_str().unwrap(),
             btrfs_dir
-                .join("snapshots/bcb_level0_20260601_00-00")
+                .join("snapshots/bcb_level0.20260601T0000")
                 .to_str()
                 .unwrap(),
         ])
@@ -283,8 +283,8 @@ impl Drop for Fixture {
     // space into the next run.
     fn drop(&mut self) {
         // Delete any restored subvolume first (btrfs receive creates a subvolume under restore_dir).
-        btrfs_subvolume_delete(&self.restore_dir.join("bcb_level0_20260601_00-00"));
-        btrfs_subvolume_delete(&self.snap_dir.join("bcb_level0_20260601_00-00"));
+        btrfs_subvolume_delete(&self.restore_dir.join("bcb_level0.20260601T0000"));
+        btrfs_subvolume_delete(&self.snap_dir.join("bcb_level0.20260601T0000"));
         btrfs_subvolume_delete(&self.subvol);
         // Remove plain directories left on the btrfs device and the work dir in /var/tmp.
         let _ = std::fs::remove_dir_all(&self.btrfs_dir);
@@ -414,7 +414,7 @@ async fn kill_during_multipart_upload_then_resume_should_abort_orphan_and_succee
     let recovered = std::fs::read(
         fixture
             .restore_dir
-            .join("bcb_level0_20260601_00-00")
+            .join("bcb_level0.20260601T0000")
             .join("bigfile.bin"),
     )
     .unwrap();

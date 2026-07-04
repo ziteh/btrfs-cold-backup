@@ -36,8 +36,10 @@ pub struct S3Config {
 pub struct S3StorageClass {
     #[serde(default = "default_manifest_class")]
     pub manifest: String,
+    /// Indexed by backup level; a level without an entry is a hard error rather than a
+    /// silent default, since an unintended storage class directly changes storage cost.
     #[serde(default)]
-    pub backup_data: HashMap<u32, String>,
+    pub backup_data: Vec<String>,
 }
 
 fn default_manifest_class() -> String {
@@ -71,7 +73,9 @@ impl Config {
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).map_err(|e| anyhow!("failed to read config {:?}: {e}", path))?;
-        Ok(serde_yaml::from_slice(&bytes)?)
+        let config: Self = serde_yaml::from_slice(&bytes)?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -81,14 +85,18 @@ impl Config {
         if self.age_public_key.is_empty() {
             return Err(anyhow!("age_public_key cannot be empty"));
         }
-        if !self.age_public_key.starts_with("age1") {
-            return Err(anyhow!("age_public_key must start with 'age1'"));
+        if let Err(e) = self.age_public_key.parse::<age::x25519::Recipient>() {
+            return Err(anyhow!("age_public_key is not a valid age public key: {e}"));
         }
         if self.tasks.is_empty() {
             return Err(anyhow!("at least one task must be defined"));
         }
 
         let mut task_names = HashSet::new();
+        // Keyed by sanitized path because state files and S3 keys are too: distinct paths
+        // like /mnt/data/movies and /mnt/data_movies collide after sanitization and would
+        // silently overwrite each other's backups.
+        let mut sanitized_subvols: HashMap<String, &str> = HashMap::new();
         for task in &self.tasks {
             if !task_names.insert(&task.name) {
                 return Err(anyhow!("duplicate task name: {}", task.name));
@@ -105,6 +113,18 @@ impl Config {
                     task.name
                 ));
             }
+            if task.enabled {
+                let sanitized = crate::util::sanitize_subvolume_path(&task.subvolume)
+                    .map_err(|e| anyhow!("task '{}': {e}", task.name))?;
+                if let Some(other) = sanitized_subvols.insert(sanitized, &task.name) {
+                    return Err(anyhow!(
+                        "tasks '{}' and '{}' back up the same subvolume (identical after \
+                         path sanitization)",
+                        other,
+                        task.name
+                    ));
+                }
+            }
         }
 
         if self.s3.enabled {
@@ -116,6 +136,17 @@ impl Config {
             }
             if self.s3.retry.max_attempts == 0 {
                 return Err(anyhow!("s3.retry.max_attempts must be > 0"));
+            }
+            if self.s3.storage_class.backup_data.is_empty() {
+                return Err(anyhow!(
+                    "s3.storage_class.backup_data must define a storage class per backup level"
+                ));
+            }
+            crate::remote::parse_storage_class(&self.s3.storage_class.manifest)
+                .map_err(|e| anyhow!("s3.storage_class.manifest: {e}"))?;
+            for (level, class) in self.s3.storage_class.backup_data.iter().enumerate() {
+                crate::remote::parse_storage_class(class)
+                    .map_err(|e| anyhow!("s3.storage_class.backup_data[{level}]: {e}"))?;
             }
         }
 
@@ -131,16 +162,17 @@ mod tests {
     fn valid_config() -> Config {
         Config {
             base_dir: PathBuf::from("/var/lib/bcb"),
-            age_public_key:
-                "age1qypmyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpq"
-                    .to_string(),
+            age_public_key: age::x25519::Identity::generate().to_public().to_string(),
             s3: S3Config {
                 enabled: true,
                 bucket: "my-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 prefix: "backups/".to_string(),
                 endpoint: "".to_string(),
-                storage_class: S3StorageClass::default(),
+                storage_class: S3StorageClass {
+                    manifest: "STANDARD".to_string(),
+                    backup_data: vec!["DEEP_ARCHIVE".to_string()],
+                },
                 retry: S3RetryConfig::default(),
                 upload_speed_limit_kbps: 0,
             },
@@ -211,6 +243,36 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_subvolume_rejected() {
+        let mut config = valid_config();
+        let mut second = config.tasks[0].clone();
+        second.name = "other".to_string();
+        config.tasks.push(second);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_subvolume_sanitize_collision_rejected() {
+        let mut config = valid_config();
+        config.tasks[0].subvolume = PathBuf::from("/mnt/data/movies");
+        let mut second = config.tasks[0].clone();
+        second.name = "other".to_string();
+        second.subvolume = PathBuf::from("/mnt/data_movies");
+        config.tasks.push(second);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_disabled_task_does_not_collide_on_subvolume() {
+        let mut config = valid_config();
+        let mut second = config.tasks[0].clone();
+        second.name = "other".to_string();
+        second.enabled = false;
+        config.tasks.push(second);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_empty_task_name() {
         let mut config = valid_config();
         config.tasks[0].name = String::new();
@@ -252,6 +314,24 @@ mod tests {
         let mut config = valid_config();
         config.s3.enabled = true;
         config.s3.retry.max_attempts = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_s3_enabled_empty_backup_data_classes() {
+        let mut config = valid_config();
+        config.s3.storage_class.backup_data = vec![];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_storage_class_name() {
+        let mut config = valid_config();
+        config.s3.storage_class.backup_data = vec!["DEEP_FREEZE".to_string()];
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.s3.storage_class.manifest = "bogus".to_string();
         assert!(config.validate().is_err());
     }
 

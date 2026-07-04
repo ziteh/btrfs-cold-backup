@@ -141,3 +141,103 @@ pub async fn blake3_file(path: &Path) -> Result<String> {
     })
     .await?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use age::secrecy::ExposeSecret;
+
+    #[tokio::test]
+    async fn test_encrypt_decrypt_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let pair = generate_key_pair();
+
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&plain, b"round trip payload").unwrap();
+
+        let enc = dir.path().join("enc.age");
+        encrypt_file(&plain, &enc, &pair.public_key).await.unwrap();
+        assert_ne!(std::fs::read(&enc).unwrap(), b"round trip payload");
+
+        let dec = dir.path().join("dec.bin");
+        decrypt_file(&enc, &dec, pair.private_key.expose_secret())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dec).unwrap(), b"round trip payload");
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_with_wrong_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pair = generate_key_pair();
+        let other = generate_key_pair();
+
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&plain, b"secret").unwrap();
+        let enc = dir.path().join("enc.age");
+        encrypt_file(&plain, &enc, &pair.public_key).await.unwrap();
+
+        let dec = dir.path().join("dec.bin");
+        assert!(
+            decrypt_file(&enc, &dec, other.private_key.expose_secret())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_truncated_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pair = generate_key_pair();
+
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&plain, vec![7u8; 4096]).unwrap();
+        let enc = dir.path().join("enc.age");
+        encrypt_file(&plain, &enc, &pair.public_key).await.unwrap();
+
+        let bytes = std::fs::read(&enc).unwrap();
+        let truncated = dir.path().join("truncated.age");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+
+        let dec = dir.path().join("dec.bin");
+        assert!(
+            decrypt_file(&truncated, &dec, pair.private_key.expose_secret())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blake3_file_detects_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        let c = dir.path().join("c.bin");
+        std::fs::write(&a, b"same content").unwrap();
+        std::fs::write(&b, b"same content").unwrap();
+        std::fs::write(&c, b"other content").unwrap();
+
+        let ha = blake3_file(&a).await.unwrap();
+        let hb = blake3_file(&b).await.unwrap();
+        let hc = blake3_file(&c).await.unwrap();
+        assert_eq!(ha, hb);
+        assert_ne!(ha, hc);
+    }
+
+    #[tokio::test]
+    async fn test_key_pair_mismatch_fails() {
+        let pair = generate_key_pair();
+        let other = generate_key_pair();
+
+        assert!(
+            test_key_pair(&pair.public_key, other.private_key.expose_secret())
+                .await
+                .is_err()
+        );
+        assert!(
+            test_key_pair(&pair.public_key, pair.private_key.expose_secret())
+                .await
+                .is_ok()
+        );
+    }
+}

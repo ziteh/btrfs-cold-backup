@@ -1,61 +1,40 @@
 use anyhow::{Result, anyhow};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+// Held for the lifetime of the struct via flock; the kernel releases the lock when the
+// process exits (even on SIGKILL), so no stale-lock detection or cleanup is needed. The
+// lock file itself is left behind on purpose: deleting it by path would race with another
+// process that has already reopened it.
 pub struct PidLock {
-    path: PathBuf,
-    // Holds the flock for the duration of the lock's lifetime.
-    file: Option<File>,
+    _file: File,
 }
 
 impl PidLock {
     pub fn acquire(lock_path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(lock_path)
-            .map_err(|e| anyhow!("failed to create lock file: {}", e))?;
+            .map_err(|e| anyhow!("failed to open lock file: {e}"))?;
 
         if Self::try_lock(&file).is_err() {
-            return Err(anyhow!("failed to acquire lock on {}", lock_path.display()));
+            return Err(anyhow!(
+                "another instance is already running (lock held on {})",
+                lock_path.display()
+            ));
         }
 
-        let pid = std::process::id();
-        let mut file = file;
-        writeln!(file, "{}", pid)
-            .map_err(|e| anyhow!("failed to write PID to lock file: {}", e))?;
+        // Truncate only after the flock is ours, so a losing contender can't wipe the
+        // holder's PID. The PID is informational, for operators inspecting the file.
+        file.set_len(0)
+            .map_err(|e| anyhow!("failed to truncate lock file: {e}"))?;
+        writeln!(file, "{}", std::process::id())
+            .map_err(|e| anyhow!("failed to write PID to lock file: {e}"))?;
 
-        Ok(PidLock {
-            path: lock_path.to_path_buf(),
-            file: Some(file),
-        })
-    }
-
-    pub fn check_stale(lock_path: &Path) -> Result<bool> {
-        if !lock_path.exists() {
-            return Ok(false);
-        }
-
-        let content = std::fs::read_to_string(lock_path)
-            .map_err(|e| anyhow!("failed to read lock file: {}", e))?;
-
-        let pid: u32 = content
-            .trim()
-            .parse()
-            .map_err(|e| anyhow!("invalid PID in lock file: {}", e))?;
-
-        let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-        Ok(!is_alive)
-    }
-
-    pub fn remove_stale(lock_path: &Path) -> Result<()> {
-        if Self::check_stale(lock_path)? {
-            std::fs::remove_file(lock_path)
-                .map_err(|e| anyhow!("failed to remove stale lock file: {}", e))?;
-        }
-        Ok(())
+        Ok(PidLock { _file: file })
     }
 
     fn try_lock(file: &File) -> io::Result<()> {
@@ -71,18 +50,9 @@ impl PidLock {
     }
 }
 
-impl Drop for PidLock {
-    fn drop(&mut self) {
-        self.file = None;
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -93,73 +63,34 @@ mod tests {
         let lock = PidLock::acquire(&lock_path);
         assert!(lock.is_ok());
         assert!(lock_path.exists());
+    }
 
+    #[test]
+    fn test_second_acquire_fails_while_held() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("held.lock");
+
+        let _lock = PidLock::acquire(&lock_path).unwrap();
+        assert!(PidLock::acquire(&lock_path).is_err());
+    }
+
+    #[test]
+    fn test_reacquire_after_release() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("release.lock");
+
+        let lock = PidLock::acquire(&lock_path).unwrap();
         drop(lock);
-        assert!(!lock_path.exists());
+        assert!(PidLock::acquire(&lock_path).is_ok());
     }
 
     #[test]
-    fn test_check_stale_nonexistent() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("nonexistent.lock");
-
-        let is_stale = PidLock::check_stale(&lock_path).unwrap();
-        assert!(!is_stale);
-    }
-
-    #[test]
-    fn test_check_stale_current_process() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("current.lock");
-
-        let _lock = PidLock::acquire(&lock_path).unwrap();
-
-        let is_stale = PidLock::check_stale(&lock_path).unwrap();
-        assert!(!is_stale);
-    }
-
-    #[test]
-    fn test_lock_prevents_concurrent_access() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = Arc::new(temp_dir.path().join("concurrent.lock"));
-
-        let lock_path_clone = Arc::clone(&lock_path);
-        let result = Arc::new(Mutex::new(None));
-        let result_clone = Arc::clone(&result);
-
-        let handle = thread::spawn(move || {
-            let lock = PidLock::acquire(&lock_path_clone);
-            if let Ok(_lock) = lock {
-                thread::sleep(std::time::Duration::from_millis(100));
-            }
-        });
-
-        thread::sleep(std::time::Duration::from_millis(10));
-
-        let lock_attempt = PidLock::acquire(&lock_path);
-        *result_clone.lock().unwrap() = Some(lock_attempt.is_err());
-
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_remove_stale_does_nothing_for_active_lock() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("active.lock");
-
-        let _lock = PidLock::acquire(&lock_path).unwrap();
-
-        let result = PidLock::remove_stale(&lock_path);
-        assert!(result.is_ok());
-        assert!(lock_path.exists());
-    }
-
-    #[test]
-    fn test_lock_file_contains_pid() {
+    fn test_losing_contender_does_not_clobber_pid() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("pid.lock");
 
         let _lock = PidLock::acquire(&lock_path).unwrap();
+        let _ = PidLock::acquire(&lock_path);
 
         let content = std::fs::read_to_string(&lock_path).unwrap();
         let pid: u32 = content.trim().parse().unwrap();
