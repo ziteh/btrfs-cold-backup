@@ -10,14 +10,13 @@ use crate::{
         Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo, SystemInfo, read_state,
     },
     util::{
-        backup_output_dir, s3_backup_key, s3_last_manifest_key, s3_manifest_key,
-        sanitize_subvolume_path, state_path,
+        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, backup_output_dir, s3_backup_key, s3_last_manifest_key,
+        s3_manifest_key, sanitize_subvolume_path, state_path,
     },
 };
 
-// Snapshot names follow btrbk's naming: bcb_level<N>.<YYYYMMDD>T<hhmm>[_<n>], i.e. btrbk
-// configured with `snapshot_name bcb_level<N>` and `timestamp_format long` (the optional
-// trailing _<n> is btrbk's same-minute collision counter).
+// Parses btrbk's snapshot naming (the optional _<n> is btrbk's same-minute collision
+// counter); the expected format is spelled out in the error message below.
 fn snapshot_timestamp(name: &str) -> Result<String> {
     let err = || {
         anyhow!(
@@ -85,6 +84,49 @@ struct BackupPlan {
     output_dir: PathBuf,
 }
 
+/// Determines the incremental parent for a level > 0 backup from the last manifest;
+/// level 0 has none.
+async fn resolve_parent<R: RemoteBackend>(
+    remote: &R,
+    last_key: &str,
+    snapshots: &[String],
+    level: u32,
+    snapshot_name: &str,
+    timestamp: &str,
+) -> Result<Option<String>> {
+    if level == 0 {
+        return Ok(None);
+    }
+    if !remote.exists(last_key).await? {
+        return Err(anyhow!(
+            "no previous backup; level {level} requires a prior level 0 backup"
+        ));
+    }
+    let last: Last = serde_yaml::from_slice(&remote.download(last_key).await?)?;
+    let parent = last.get(&(level - 1)).ok_or_else(|| {
+        anyhow!(
+            "no level {} entry in last manifest; run a level {} backup first",
+            level - 1,
+            level - 1
+        )
+    })?;
+    if !snapshots.contains(&parent.snapshot_name) {
+        return Err(anyhow!(
+            "parent snapshot '{}' not found locally",
+            parent.snapshot_name
+        ));
+    }
+    if timestamp <= parent.timestamp.as_str() {
+        return Err(anyhow!(
+            "snapshot '{snapshot_name}' ({timestamp}) is not newer than its parent '{}' ({}); \
+             create a fresh level {level} snapshot before backing up",
+            parent.snapshot_name,
+            parent.timestamp
+        ));
+    }
+    Ok(Some(parent.snapshot_name.clone()))
+}
+
 /// Returns None when the newest matching snapshot is already backed up (skip).
 async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     config: &Config,
@@ -92,83 +134,63 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     level: u32,
     btrfs: &B,
     remote: &R,
-    ps: &mut PersistentState,
+    state: &mut PersistentState,
 ) -> Result<Option<BackupPlan>> {
-    if !ps.inner.snapshot_name.is_empty() {
+    if !state.inner.snapshot_name.is_empty() {
         return Ok(Some(BackupPlan {
-            snapshot_name: ps.inner.snapshot_name.clone(),
-            timestamp: ps.inner.timestamp.clone(),
-            parent_snapshot: ps.inner.parent_snapshot.clone(),
-            output_dir: ps.inner.output_dir.clone(),
+            snapshot_name: state.inner.snapshot_name.clone(),
+            timestamp: state.inner.timestamp.clone(),
+            parent_snapshot: state.inner.parent_snapshot.clone(),
+            output_dir: state.inner.output_dir.clone(),
         }));
     }
 
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
     let snapshots = btrfs.list_snapshots(&task.snapshot_dir).await?;
     let level_prefix = format!("bcb_level{level}.");
-    let sn = snapshots
+    let snapshot_name = snapshots
         .iter()
         .rfind(|s| s.starts_with(&level_prefix))
         .ok_or_else(|| anyhow!("no level {level} snapshot found in {:?}", task.snapshot_dir))?
         .clone();
-    let ts = snapshot_timestamp(&sn)?;
+    let timestamp = snapshot_timestamp(&snapshot_name)?;
 
     // A manifest already on remote means this snapshot is fully backed up: skip rather than
     // redo it — overwriting archived objects incurs minimum-storage-duration charges, and a
     // skip keeps re-runs idempotent so one completed task never blocks the others.
-    let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &ts)?;
-    if remote.head(&manifest_key).await?.is_some() {
-        tracing::info!("snapshot '{sn}' is already backed up at level {level}, skipping");
+    let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp)?;
+    if remote.exists(&manifest_key).await? {
+        tracing::info!(
+            "snapshot '{snapshot_name}' is already backed up at level {level}, skipping"
+        );
         return Ok(None);
     }
 
-    let par = if level == 0 {
-        None
-    } else if remote.head(&last_key).await?.is_none() {
-        return Err(anyhow!(
-            "no previous backup; level {level} requires a prior level 0 backup"
-        ));
-    } else {
-        let last: Last = serde_yaml::from_slice(&remote.download(&last_key).await?)?;
-        let parent_entry = last.get(&(level - 1)).ok_or_else(|| {
-            anyhow!(
-                "no level {} entry in last manifest; run a level {} backup first",
-                level - 1,
-                level - 1
-            )
-        })?;
-        if !snapshots.contains(&parent_entry.snapshot_name) {
-            return Err(anyhow!(
-                "parent snapshot '{}' not found locally",
-                parent_entry.snapshot_name
-            ));
-        }
-        if ts <= parent_entry.timestamp {
-            return Err(anyhow!(
-                "snapshot '{sn}' ({ts}) is not newer than its parent '{}' ({}); \
-                 create a fresh level {level} snapshot before backing up",
-                parent_entry.snapshot_name,
-                parent_entry.timestamp
-            ));
-        }
-        Some(parent_entry.snapshot_name.clone())
-    };
-    let od = backup_output_dir(&config.base_dir, &sanitized, level, &ts)?;
+    let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
+    let parent_snapshot = resolve_parent(
+        remote,
+        &last_key,
+        &snapshots,
+        level,
+        &snapshot_name,
+        &timestamp,
+    )
+    .await?;
+    let output_dir = backup_output_dir(&config.base_dir, &sanitized, level, &timestamp)?;
 
-    ps.inner.task_name = task.name.clone();
-    ps.inner.level = level;
-    ps.inner.snapshot_name = sn.clone();
-    ps.inner.parent_snapshot = par.clone();
-    ps.inner.timestamp = ts.clone();
-    ps.inner.output_dir = od.clone();
-    ps.save()?;
+    state.inner.task_name = task.name.clone();
+    state.inner.level = level;
+    state.inner.snapshot_name = snapshot_name.clone();
+    state.inner.parent_snapshot = parent_snapshot.clone();
+    state.inner.timestamp = timestamp.clone();
+    state.inner.output_dir = output_dir.clone();
+    state.save()?;
 
     Ok(Some(BackupPlan {
-        snapshot_name: sn,
-        timestamp: ts,
-        parent_snapshot: par,
-        output_dir: od,
+        snapshot_name,
+        timestamp,
+        parent_snapshot,
+        output_dir,
     }))
 }
 
@@ -205,9 +227,9 @@ async fn send_and_split<B: BtrfsOps>(
     snapshot_name: &str,
     parent: &Option<String>,
     output_dir: &Path,
-    ps: &mut PersistentState,
+    state: &mut PersistentState,
 ) -> Result<String> {
-    if let Some(ref h) = ps.inner.stream_hash {
+    if let Some(ref h) = state.inner.stream_hash {
         tracing::info!("btrfs send already done, skipping");
         return Ok(h.clone());
     }
@@ -227,7 +249,7 @@ async fn send_and_split<B: BtrfsOps>(
         None => btrfs.send_full(&snapshot_path).await?,
     };
 
-    let part_prefix = output_dir.join("snapshot.part-");
+    let part_prefix = output_dir.join(SNAPSHOT_PART_PREFIX);
     let part_prefix_str = part_prefix
         .to_str()
         .ok_or_else(|| anyhow!("invalid part prefix path"))?;
@@ -258,7 +280,7 @@ async fn send_and_split<B: BtrfsOps>(
             .take()
             .ok_or_else(|| anyhow!("failed to open split stdin"))?;
         let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; IO_BUF_SIZE];
         loop {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
@@ -278,18 +300,11 @@ async fn send_and_split<B: BtrfsOps>(
         ));
     }
 
-    let mut total_parts = 0u32;
-    let mut count_dir = tokio::fs::read_dir(output_dir).await?;
-    while let Some(entry) = count_dir.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("snapshot.part-") && !name.ends_with(".age") {
-            total_parts += 1;
-        }
-    }
+    let total_parts = collect_disk_parts(output_dir).await?.len() as u32;
 
-    ps.inner.total_parts = Some(total_parts);
-    ps.inner.stream_hash = Some(hash.clone());
-    ps.save()?;
+    state.inner.total_parts = Some(total_parts);
+    state.inner.stream_hash = Some(hash.clone());
+    state.save()?;
 
     Ok(hash)
 }
@@ -303,7 +318,7 @@ async fn collect_disk_parts(output_dir: &Path) -> Result<BTreeSet<String>> {
     while let Some(entry) = read_dir.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         let base = name.strip_suffix(".age").unwrap_or(name.as_str());
-        if let Some(suffix) = base.strip_prefix("snapshot.part-") {
+        if let Some(suffix) = base.strip_prefix(SNAPSHOT_PART_PREFIX) {
             part_suffixes.insert(suffix.to_string());
         }
     }
@@ -340,8 +355,8 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     timestamp: &str,
     config: &Config,
 ) -> Result<CompletedPart> {
-    let raw_path = output_dir.join(format!("snapshot.part-{suffix}"));
-    let enc_path = output_dir.join(format!("snapshot.part-{suffix}.age"));
+    let raw_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{suffix}"));
+    let enc_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{suffix}.age"));
 
     if enc_path.exists() && raw_path.exists() {
         // coexisting raw+enc means encryption was interrupted; enc may be truncated
@@ -349,7 +364,9 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     }
     if !enc_path.exists() {
         encrypt_file(&raw_path, &enc_path, &config.age_public_key).await?;
-        let _ = tokio::fs::remove_file(&raw_path).await;
+        if let Err(e) = tokio::fs::remove_file(&raw_path).await {
+            tracing::warn!("failed to remove raw part {:?}: {e}", raw_path);
+        }
     }
 
     let enc_size = tokio::fs::metadata(&enc_path).await?.len();
@@ -377,7 +394,9 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
             &format!("bcb-backup-level={level}"),
         )
         .await?;
-    let _ = tokio::fs::remove_file(&enc_path).await;
+    if let Err(e) = tokio::fs::remove_file(&enc_path).await {
+        tracing::warn!("failed to remove uploaded part {:?}: {e}", enc_path);
+    }
 
     Ok(CompletedPart {
         size_bytes: enc_size,
@@ -393,12 +412,12 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     remote: &R,
 ) -> Result<Option<Backup>> {
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let sp = state_path(&config.base_dir, &sanitized);
-    tokio::fs::create_dir_all(sp.parent().unwrap()).await?;
+    let state_file = state_path(&config.base_dir, &sanitized);
+    tokio::fs::create_dir_all(state_file.parent().unwrap()).await?;
 
-    let mut ps = PersistentState::load_or_init(sp, &task.name, level)?;
+    let mut state = PersistentState::load_or_init(state_file, &task.name, level)?;
 
-    let Some(plan) = init_backup_plan(config, task, level, btrfs, remote, &mut ps).await? else {
+    let Some(plan) = init_backup_plan(config, task, level, btrfs, remote, &mut state).await? else {
         return Ok(None);
     };
 
@@ -408,17 +427,17 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         &plan.snapshot_name,
         &plan.parent_snapshot,
         &plan.output_dir,
-        &mut ps,
+        &mut state,
     )
     .await?;
 
     let part_suffixes = collect_disk_parts(&plan.output_dir).await?;
 
-    if part_suffixes.is_empty() && ps.inner.parts_completed.is_empty() {
-        if ps.inner.stream_hash.is_some() {
-            ps.inner.stream_hash = None;
-            ps.inner.total_parts = None;
-            ps.save()?;
+    if part_suffixes.is_empty() && state.inner.parts_completed.is_empty() {
+        if state.inner.stream_hash.is_some() {
+            state.inner.stream_hash = None;
+            state.inner.total_parts = None;
+            state.save()?;
             return Err(anyhow!(
                 "output_dir vanished after split; state cleared — re-run to retry from split"
             ));
@@ -426,10 +445,10 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         return Err(anyhow!("no snapshot parts found in {:?}", plan.output_dir));
     }
 
-    validate_part_coverage(&part_suffixes, &ps.inner)?;
+    validate_part_coverage(&part_suffixes, &state.inner)?;
 
     for suffix in &part_suffixes {
-        if ps.inner.parts_completed.contains_key(suffix.as_str()) {
+        if state.inner.parts_completed.contains_key(suffix.as_str()) {
             continue;
         }
         let completed = encrypt_and_upload_part(
@@ -442,11 +461,14 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             config,
         )
         .await?;
-        ps.inner.parts_completed.insert(suffix.clone(), completed);
-        ps.save()?;
+        state
+            .inner
+            .parts_completed
+            .insert(suffix.clone(), completed);
+        state.save()?;
     }
 
-    let mut parts_info: Vec<PartInfo> = ps
+    let mut parts_info: Vec<PartInfo> = state
         .inner
         .parts_completed
         .iter()
@@ -476,7 +498,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         parts: parts_info,
     };
 
-    if !ps.inner.manifest_uploaded {
+    if !state.inner.manifest_uploaded {
         let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &plan.timestamp)?;
         remote
             .upload_bytes(
@@ -486,19 +508,20 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
                 "bcb-backup-level=manifest",
             )
             .await?;
-        ps.inner.manifest_uploaded = true;
-        ps.save()?;
+        state.inner.manifest_uploaded = true;
+        state.save()?;
     }
 
     // Merge current level's entry into the per-level map and re-upload.
     let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
-    let mut last: Last = match remote.head(&last_key).await? {
+    let mut last: Last = if remote.exists(&last_key).await? {
         // A corrupted last manifest must not be silently reset: dropping other levels'
         // entries would break subsequent incremental backups without warning.
-        Some(_) => serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
+        serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
             anyhow!("failed to parse last manifest {last_key}: {e}; repair or delete it manually")
-        })?,
-        None => Last::default(),
+        })?
+    } else {
+        Last::default()
     };
     last.insert(
         level,
@@ -516,8 +539,12 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         )
         .await?;
 
-    let _ = tokio::fs::remove_dir_all(&plan.output_dir).await;
-    let _ = tokio::fs::remove_file(&ps.path).await;
+    if let Err(e) = tokio::fs::remove_dir_all(&plan.output_dir).await {
+        tracing::warn!("failed to clean up output dir {:?}: {e}", plan.output_dir);
+    }
+    if let Err(e) = tokio::fs::remove_file(&state.path).await {
+        tracing::warn!("failed to remove state file {:?}: {e}", state.path);
+    }
 
     Ok(Some(backup))
 }

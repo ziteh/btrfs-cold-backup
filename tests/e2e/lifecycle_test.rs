@@ -3,8 +3,8 @@ use std::process::Command;
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    BtrfsDriver, BtrfsOps, Config, RetrievalOptions, S3Backend, S3Config, S3RetryConfig,
-    S3StorageClass, Task, backup::backup_task, restore::restore_task,
+    BtrfsDriver, Config, RetrievalOptions, S3Backend, S3Config, S3RetryConfig, S3StorageClass,
+    Task, backup::backup_task, restore::restore_task,
 };
 
 fn retrieval() -> RetrievalOptions {
@@ -54,6 +54,24 @@ fn btrfs_subvolume_delete(path: &Path) {
         .unwrap();
 }
 
+fn btrfs_snapshot(src: &Path, dst: &Path) {
+    let out = Command::new("btrfs")
+        .args([
+            "subvolume",
+            "snapshot",
+            "-r",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 async fn ensure_bucket(_endpoint: &str, bucket: &str) {
     Command::new("mc")
         .args(["mb", "--ignore-existing", &format!("local/{bucket}")])
@@ -63,14 +81,12 @@ async fn ensure_bucket(_endpoint: &str, bucket: &str) {
 
 fn s3_config(env: &E2eEnv) -> S3Config {
     S3Config {
-        enabled: true,
         bucket: env.s3_bucket.clone(),
         region: "us-east-1".to_string(),
         prefix: "e2e-test/".to_string(),
         endpoint: env.s3_endpoint.clone(),
-        // S3StorageClass::default() is Rust's #[derive(Default)], which leaves `manifest`
-        // empty — the serde `#[serde(default = ...)]` only applies when deserializing a YAML
-        // file with the field absent, not to Default::default() called directly in Rust.
+        // Explicit because S3StorageClass::default() leaves `manifest` empty (serde
+        // defaults only apply when deserializing).
         storage_class: S3StorageClass {
             manifest: "STANDARD".to_string(),
             backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],
@@ -98,12 +114,9 @@ async fn level0_backup_and_restore_should_round_trip() {
     btrfs_subvolume_create(&subvol);
     std::fs::write(subvol.join("hello.txt"), b"round-trip test").unwrap();
 
-    // Take a read-only snapshot manually (BtrfsDriver.create_snapshot creates one)
     let btrfs = BtrfsDriver;
-    let snap = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260601T0000")
-        .await
-        .unwrap();
+    let snap = snap_dir.join("bcb_level0.20260601T0000");
+    btrfs_snapshot(&subvol, &snap);
 
     let identity = age::x25519::Identity::generate();
     let config = Config {
@@ -171,16 +184,12 @@ async fn level1_incremental_backup_should_succeed_after_level0() {
     std::fs::write(subvol.join("base.txt"), b"base").unwrap();
 
     let btrfs = BtrfsDriver;
-    let snap0 = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260601T0000")
-        .await
-        .unwrap();
+    let snap0 = snap_dir.join("bcb_level0.20260601T0000");
+    btrfs_snapshot(&subvol, &snap0);
 
     std::fs::write(subvol.join("delta.txt"), b"delta").unwrap();
-    let snap1 = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcb_level1.20260602T0000")
-        .await
-        .unwrap();
+    let snap1 = snap_dir.join("bcb_level1.20260602T0000");
+    btrfs_snapshot(&subvol, &snap1);
 
     let identity = age::x25519::Identity::generate();
     let config = Config {
@@ -239,16 +248,12 @@ async fn incremental_chain_restore_should_recover_both_levels() {
     std::fs::write(subvol.join("base.txt"), b"base").unwrap();
 
     let btrfs = BtrfsDriver;
-    let snap0 = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260601T0000")
-        .await
-        .unwrap();
+    let snap0 = snap_dir.join("bcb_level0.20260601T0000");
+    btrfs_snapshot(&subvol, &snap0);
 
     std::fs::write(subvol.join("delta.txt"), b"delta").unwrap();
-    let snap1 = btrfs
-        .create_snapshot(&subvol, &snap_dir, "bcb_level1.20260602T0000")
-        .await
-        .unwrap();
+    let snap1 = snap_dir.join("bcb_level1.20260602T0000");
+    btrfs_snapshot(&subvol, &snap1);
 
     let identity = age::x25519::Identity::generate();
     let config = Config {

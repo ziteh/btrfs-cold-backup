@@ -2,6 +2,12 @@ use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Filename prefix of split stream parts, both locally and in S3 keys.
+pub const SNAPSHOT_PART_PREFIX: &str = "snapshot.part-";
+
+/// Buffer size for streaming file/pipe IO.
+pub const IO_BUF_SIZE: usize = 64 * 1024;
+
 // SIGKILL bypasses Drop, so kill_on_drop alone can't stop a child (btrfs send / split)
 // from outliving a killed bcb process; PR_SET_PDEATHSIG asks the kernel to do it instead.
 #[cfg(target_os = "linux")]
@@ -15,7 +21,7 @@ pub fn die_with_parent() -> std::io::Result<()> {
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is before the Unix epoch")
         .as_secs() as i64
 }
 
@@ -70,6 +76,17 @@ pub fn task_dir_name(level: u32, timestamp: &str) -> Result<String> {
     ))
 }
 
+/// Inverse of [`task_dir_name`]: extracts (level, ISO timestamp) from a task dir name.
+pub fn parse_task_dir_name(dir: &str) -> Option<(u32, String)> {
+    let parts: Vec<&str> = dir.split('_').collect();
+    let [_, level_str, compact_ts, ..] = parts.as_slice() else {
+        return None;
+    };
+    let level: u32 = level_str.strip_prefix("level")?.parse().ok()?;
+    let timestamp = compact_to_iso(compact_ts).ok()?;
+    Some((level, timestamp))
+}
+
 pub fn s3_backup_key(
     prefix: &str,
     sanitized_subvol: &str,
@@ -79,8 +96,7 @@ pub fn s3_backup_key(
 ) -> Result<String> {
     let dir_name = task_dir_name(level, timestamp)?;
     let key = format!(
-        "{}backup-data/{}/{}/snapshot.part-{}.age",
-        prefix, sanitized_subvol, dir_name, index
+        "{prefix}backup-data/{sanitized_subvol}/{dir_name}/{SNAPSHOT_PART_PREFIX}{index}.age"
     );
     Ok(key)
 }
@@ -193,6 +209,21 @@ mod tests {
         let a = task_dir_name(0, "2026-06-25T08:00:00Z").unwrap();
         let b = task_dir_name(0, "2026-06-25T20:00:00Z").unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_task_dir_name_parse_round_trip() {
+        let dir = task_dir_name(3, "2026-06-02T14:30:00Z").unwrap();
+        let (level, timestamp) = parse_task_dir_name(&dir).unwrap();
+        assert_eq!(level, 3);
+        assert_eq!(timestamp, "2026-06-02T14:30:00Z");
+    }
+
+    #[test]
+    fn test_parse_task_dir_name_invalid() {
+        assert!(parse_task_dir_name("bcb").is_none());
+        assert!(parse_task_dir_name("bcb_levelX_202606021430").is_none());
+        assert!(parse_task_dir_name("bcb_level0_notadate").is_none());
     }
 
     #[test]

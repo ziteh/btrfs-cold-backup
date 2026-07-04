@@ -59,14 +59,12 @@ fn ensure_bucket(bucket: &str) {
 
 fn s3_config(env: &VmEnv) -> S3Config {
     S3Config {
-        enabled: true,
         bucket: env.s3_bucket.clone(),
         region: "us-east-1".to_string(),
         prefix: "interrupt-test/".to_string(),
         endpoint: env.s3_endpoint.clone(),
-        // S3StorageClass::default() is Rust's #[derive(Default)], which leaves `manifest`
-        // empty — the serde `#[serde(default = ...)]` only applies when deserializing a YAML
-        // file with the field absent, not to Default::default() called directly in Rust.
+        // Explicit because S3StorageClass::default() leaves `manifest` empty (serde
+        // defaults only apply when deserializing).
         storage_class: S3StorageClass {
             manifest: "STANDARD".to_string(),
             backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],

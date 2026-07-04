@@ -74,15 +74,6 @@ enum Commands {
     },
 }
 
-fn require_s3(config: &Config) -> Result<()> {
-    if !config.s3.enabled {
-        return Err(anyhow!(
-            "s3.enabled is false in config; this command needs S3"
-        ));
-    }
-    Ok(())
-}
-
 fn select_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
     tasks
         .iter()
@@ -172,26 +163,36 @@ async fn main() -> Result<()> {
 
         Commands::List { task, level } => {
             let config = Config::from_file(&cli.config)?;
-            require_s3(&config)?;
             let remote = S3Backend::new(&config.s3).await?;
 
+            let mut failed: Vec<String> = Vec::new();
             for t in select_tasks(&config.tasks, task.as_deref()) {
                 match btrfs_cold_backup::list::list_backups(&config, t, &remote).await {
                     Ok(entries) => {
+                        let mut shown = 0usize;
                         for entry in entries {
                             if level.is_none_or(|l| l == entry.level) {
                                 println!("{}\tlevel{}\t{}", t.name, entry.level, entry.timestamp);
+                                shown += 1;
                             }
                         }
+                        if shown == 0 {
+                            println!("{}: no backups found", t.name);
+                        }
                     }
-                    Err(e) => tracing::warn!("{}: {e}", t.name),
+                    Err(e) => {
+                        eprintln!("{}: list failed: {e:#}", t.name);
+                        failed.push(t.name.clone());
+                    }
                 }
+            }
+            if !failed.is_empty() {
+                return Err(anyhow!("list failed for task(s): {}", failed.join(", ")));
             }
         }
 
         Commands::Backup { level, task } => {
             let config = Config::from_file(&cli.config)?;
-            require_s3(&config)?;
             let (btrfs, remote, _lock) = acquire_runtime(&config).await?;
 
             let tasks = select_tasks(&config.tasks, task.as_deref());
@@ -240,7 +241,6 @@ async fn main() -> Result<()> {
             restore_tier,
         } => {
             let config = Config::from_file(&cli.config)?;
-            require_s3(&config)?;
             let (_btrfs, remote, _lock) = acquire_runtime(&config).await?;
 
             let t = config

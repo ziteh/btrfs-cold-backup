@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::Path;
 use tokio::task;
 
-use crate::util::now_unix;
+use crate::util::{IO_BUF_SIZE, now_unix};
 
 pub struct AgeKeyPair {
     pub public_key: String,
@@ -127,7 +127,7 @@ pub async fn blake3_file(path: &Path) -> Result<String> {
     task::spawn_blocking(move || -> Result<String> {
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; IO_BUF_SIZE];
 
         loop {
             let n = file.read(&mut buf)?;

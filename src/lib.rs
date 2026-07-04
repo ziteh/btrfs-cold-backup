@@ -20,4 +20,4 @@ pub use lock::PidLock;
 pub use manifest::{Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo};
 pub use remote::{RemoteBackend, RestoreStatus, S3Backend};
 pub use restore::RetrievalOptions;
-pub use util::*;
+pub use util::{sanitize_subvolume_path, state_path};

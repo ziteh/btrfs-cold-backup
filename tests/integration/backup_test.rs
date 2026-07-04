@@ -21,8 +21,6 @@ mock! {
         async fn list_snapshots(&self, snapshot_dir: &Path) -> Result<Vec<String>>;
         async fn send_full(&self, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
         async fn send_incremental(&self, parent: &Path, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
-        async fn create_snapshot(&self, subvolume: &Path, snapshot_dir: &Path, name: &str) -> Result<PathBuf>;
-        async fn delete_snapshot(&self, snapshot: &Path) -> Result<()>;
         async fn subvolume_exists(&self, path: &Path) -> Result<bool>;
     }
 }
@@ -33,7 +31,7 @@ mock! {
     impl RemoteBackend for Remote {
         async fn upload_bytes(&self, key: &str, data: Vec<u8>, storage_class: &str, tags: &str) -> Result<()>;
         async fn upload_file(&self, key: &str, path: &Path, storage_class: &str, tags: &str) -> Result<()>;
-        async fn head(&self, key: &str) -> Result<Option<u64>>;
+        async fn exists(&self, key: &str) -> Result<bool>;
         async fn download(&self, key: &str) -> Result<Vec<u8>>;
         async fn download_to_file(&self, key: &str, path: &Path) -> Result<()>;
         async fn restore_status(&self, key: &str) -> Result<RestoreStatus>;
@@ -56,7 +54,6 @@ fn test_config(base_dir: &Path) -> Config {
         base_dir: base_dir.to_path_buf(),
         age_public_key: identity.to_public().to_string(),
         s3: S3Config {
-            enabled: true,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             prefix: "backups/".to_string(),
@@ -115,13 +112,13 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
     let mut remote = MockRemote::new();
     // no previous backup, and no manifest for this snapshot yet
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("task_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
     remote
         .expect_upload_file()
         .withf(|_, _, _, tags| tags == "bcb-backup-level=0")
@@ -179,13 +176,13 @@ async fn level1_incremental_should_use_level0_as_parent() {
     let manifest_bytes = last_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(Some(100)));
+        .returning(|_| Ok(true));
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("task_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
     remote
         .expect_download()
         .withf(|key| key.contains("last_backup_manifest"))
@@ -216,13 +213,13 @@ async fn level1_should_fail_when_no_remote_level0_exists() {
 
     let mut remote = MockRemote::new();
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(None)); // no level-0 backup
+        .returning(|_| Ok(false)); // no level-0 backup
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("task_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
 
     let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
     assert!(result.is_err(), "should fail without level 0 remote backup");
@@ -246,13 +243,13 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
     let manifest_bytes = last_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(Some(100)));
+        .returning(|_| Ok(true));
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("task_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
     remote
         .expect_download()
         .withf(|key| key.contains("last_backup_manifest"))
@@ -277,7 +274,6 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
         base_dir: work_dir.path().to_path_buf(),
         age_public_key: identity.to_public().to_string(),
         s3: S3Config {
-            enabled: true,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             prefix: "backups/".to_string(),
@@ -349,9 +345,6 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
             std::fs::write(path, &encrypted_bytes_clone)?;
             Ok(())
         });
-
-    let mut btrfs = MockBtrfs::new();
-    btrfs.expect_subvolume_exists().returning(|_| Ok(false));
 
     let private_key_secret = identity.to_string();
     let result = restore_task(
@@ -445,9 +438,9 @@ async fn backup_should_skip_already_completed_backup() {
 
     let mut remote = MockRemote::new();
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("task_manifest"))
-        .returning(|_| Ok(Some(1)));
+        .returning(|_| Ok(true));
 
     let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
     assert!(
@@ -475,13 +468,13 @@ async fn level1_should_fail_when_snapshot_not_newer_than_parent() {
     let manifest_bytes = last_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(Some(100)));
+        .returning(|_| Ok(true));
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("task_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
     remote
         .expect_download()
         .withf(|key| key.contains("last_backup_manifest"))
@@ -549,9 +542,9 @@ async fn resume_should_skip_already_uploaded_parts() {
         .returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
     remote
-        .expect_head()
+        .expect_exists()
         .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(None));
+        .returning(|_| Ok(false));
 
     let backup = backup_task(&config, &task, 0, &btrfs, &remote)
         .await

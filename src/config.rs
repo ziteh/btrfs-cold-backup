@@ -16,7 +16,6 @@ impl Default for S3RetryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct S3Config {
-    pub enabled: bool,
     pub bucket: String,
     pub region: String,
     pub prefix: String,
@@ -127,27 +126,25 @@ impl Config {
             }
         }
 
-        if self.s3.enabled {
-            if self.s3.bucket.is_empty() {
-                return Err(anyhow!("s3.bucket cannot be empty when s3 is enabled"));
-            }
-            if self.s3.region.is_empty() {
-                return Err(anyhow!("s3.region cannot be empty when s3 is enabled"));
-            }
-            if self.s3.retry.max_attempts == 0 {
-                return Err(anyhow!("s3.retry.max_attempts must be > 0"));
-            }
-            if self.s3.storage_class.backup_data.is_empty() {
-                return Err(anyhow!(
-                    "s3.storage_class.backup_data must define a storage class per backup level"
-                ));
-            }
-            crate::remote::parse_storage_class(&self.s3.storage_class.manifest)
-                .map_err(|e| anyhow!("s3.storage_class.manifest: {e}"))?;
-            for (level, class) in self.s3.storage_class.backup_data.iter().enumerate() {
-                crate::remote::parse_storage_class(class)
-                    .map_err(|e| anyhow!("s3.storage_class.backup_data[{level}]: {e}"))?;
-            }
+        if self.s3.bucket.is_empty() {
+            return Err(anyhow!("s3.bucket cannot be empty"));
+        }
+        if self.s3.region.is_empty() {
+            return Err(anyhow!("s3.region cannot be empty"));
+        }
+        if self.s3.retry.max_attempts == 0 {
+            return Err(anyhow!("s3.retry.max_attempts must be > 0"));
+        }
+        if self.s3.storage_class.backup_data.is_empty() {
+            return Err(anyhow!(
+                "s3.storage_class.backup_data must define a storage class per backup level"
+            ));
+        }
+        crate::remote::parse_storage_class(&self.s3.storage_class.manifest)
+            .map_err(|e| anyhow!("s3.storage_class.manifest: {e}"))?;
+        for (level, class) in self.s3.storage_class.backup_data.iter().enumerate() {
+            crate::remote::parse_storage_class(class)
+                .map_err(|e| anyhow!("s3.storage_class.backup_data[{level}]: {e}"))?;
         }
 
         Ok(())
@@ -164,7 +161,6 @@ mod tests {
             base_dir: PathBuf::from("/var/lib/bcb"),
             age_public_key: age::x25519::Identity::generate().to_public().to_string(),
             s3: S3Config {
-                enabled: true,
                 bucket: "my-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 prefix: "backups/".to_string(),
@@ -294,17 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn test_s3_enabled_empty_bucket() {
+    fn test_s3_empty_bucket() {
         let mut config = valid_config();
-        config.s3.enabled = true;
         config.s3.bucket = String::new();
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_s3_enabled_empty_region() {
+    fn test_s3_empty_region() {
         let mut config = valid_config();
-        config.s3.enabled = true;
         config.s3.region = String::new();
         assert!(config.validate().is_err());
     }
@@ -312,13 +306,12 @@ mod tests {
     #[test]
     fn test_s3_retry_max_attempts_zero() {
         let mut config = valid_config();
-        config.s3.enabled = true;
         config.s3.retry.max_attempts = 0;
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_s3_enabled_empty_backup_data_classes() {
+    fn test_s3_empty_backup_data_classes() {
         let mut config = valid_config();
         config.s3.storage_class.backup_data = vec![];
         assert!(config.validate().is_err());
@@ -333,15 +326,6 @@ mod tests {
         let mut config = valid_config();
         config.s3.storage_class.manifest = "bogus".to_string();
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_s3_disabled_no_validation() {
-        let mut config = valid_config();
-        config.s3.enabled = false;
-        config.s3.bucket = String::new();
-        config.s3.region = String::new();
-        assert!(config.validate().is_ok());
     }
 
     #[test]

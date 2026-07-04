@@ -64,9 +64,7 @@ pub async fn check<B: BtrfsOps, R: RemoteBackend>(
         }
     }
 
-    if config.s3.enabled {
-        remote.verify_credentials().await?;
-    }
+    remote.verify_credentials().await?;
 
     Ok(())
 }

@@ -16,6 +16,9 @@ Features:
 **Build:**
 
 ```bash
+cargo fmt && cargo clippy && cargo build && cargo test
+
+# release
 cargo build --release
 ```
 
@@ -33,7 +36,6 @@ cd target/release
 base_dir: /var/lib/bcb/
 age_public_key: age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 s3:
-  enabled: true
   bucket: my-backup-bucket
   prefix: btrfs-backups/
   endpoint: "" # Leave empty for AWS S3, or specify custom endpoint for S3-compatible services

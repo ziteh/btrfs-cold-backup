@@ -75,52 +75,6 @@ async fn subvolume_exists_should_return_false_for_missing_path() {
 }
 
 #[tokio::test]
-async fn create_snapshot_should_create_readonly_snapshot() {
-    let Some(mount) = btrfs_mount() else { return };
-    let dir = test_dir(&mount, "create-snap");
-    let subvol = dir.join("subvol");
-    let snap_dir = dir.join("snapshots");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    btrfs_subvolume_create(&subvol);
-    std::fs::write(subvol.join("file.txt"), b"hello").unwrap();
-
-    let driver = BtrfsDriver;
-    let snap = driver
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260101T0000")
-        .await
-        .unwrap();
-
-    assert!(snap.exists());
-    // snapshot should be read-only: writing must fail
-    assert!(std::fs::write(snap.join("file.txt"), b"x").is_err());
-
-    btrfs_subvolume_delete(&snap);
-    btrfs_subvolume_delete(&subvol);
-}
-
-#[tokio::test]
-async fn delete_snapshot_should_remove_the_snapshot() {
-    let Some(mount) = btrfs_mount() else { return };
-    let dir = test_dir(&mount, "delete-snap");
-    let subvol = dir.join("subvol");
-    let snap_dir = dir.join("snapshots");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    btrfs_subvolume_create(&subvol);
-
-    let driver = BtrfsDriver;
-    let snap = driver
-        .create_snapshot(&subvol, &snap_dir, "bcb_level0.20260101T0000")
-        .await
-        .unwrap();
-    assert!(snap.exists());
-
-    driver.delete_snapshot(&snap).await.unwrap();
-    assert!(!snap.exists());
-
-    btrfs_subvolume_delete(&subvol);
-}
-
-#[tokio::test]
 async fn list_snapshots_should_return_only_bcb_prefixed_dirs() {
     let Some(mount) = btrfs_mount() else { return };
     let dir = test_dir(&mount, "list-snaps");

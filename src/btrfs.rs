@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::task::{Context, Poll};
@@ -18,13 +18,6 @@ pub trait BtrfsOps: Send + Sync {
         parent: &Path,
         snapshot: &Path,
     ) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
-    async fn create_snapshot(
-        &self,
-        subvolume: &Path,
-        snapshot_dir: &Path,
-        name: &str,
-    ) -> Result<PathBuf>;
-    async fn delete_snapshot(&self, snapshot: &Path) -> Result<()>;
     async fn subvolume_exists(&self, path: &Path) -> Result<bool>;
 }
 
@@ -195,47 +188,6 @@ impl BtrfsOps for BtrfsDriver {
             path_to_str(parent, "parent")?,
             path_to_str(snapshot, "snapshot")?,
         ])
-    }
-
-    async fn create_snapshot(
-        &self,
-        subvolume: &Path,
-        snapshot_dir: &Path,
-        name: &str,
-    ) -> Result<PathBuf> {
-        let dest = snapshot_dir.join(name);
-
-        let output = Command::new("btrfs")
-            .args([
-                "subvolume",
-                "snapshot",
-                "-r",
-                path_to_str(subvolume, "subvolume")?,
-                path_to_str(&dest, "snapshot destination")?,
-            ])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("btrfs snapshot failed: {}", stderr.trim()));
-        }
-
-        Ok(dest)
-    }
-
-    async fn delete_snapshot(&self, snapshot: &Path) -> Result<()> {
-        let output = Command::new("btrfs")
-            .args(["subvolume", "delete", path_to_str(snapshot, "snapshot")?])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("btrfs subvolume delete failed: {}", stderr.trim()));
-        }
-
-        Ok(())
     }
 
     async fn subvolume_exists(&self, path: &Path) -> Result<bool> {

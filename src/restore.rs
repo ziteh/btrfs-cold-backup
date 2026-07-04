@@ -8,7 +8,7 @@ use crate::{
     crypto::{blake3_file, decrypt_file},
     manifest::Backup,
     remote::RestoreStatus,
-    util::{compact_to_iso, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
+    util::{IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
 
 /// Retrieval tier and lifetime for archived (Glacier / Deep Archive) objects.
@@ -106,7 +106,7 @@ async fn pipe_to_btrfs_receive(dec_paths: &[std::path::PathBuf], target_dir: &Pa
             .stdin
             .take()
             .ok_or_else(|| anyhow!("failed to open btrfs receive stdin"))?;
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; IO_BUF_SIZE];
         for dec_path in dec_paths {
             let mut f = tokio::fs::File::open(dec_path).await?;
             loop {
@@ -133,7 +133,7 @@ async fn pipe_to_btrfs_receive(dec_paths: &[std::path::PathBuf], target_dir: &Pa
 /// piped to btrfs receive — a corrupt stream must never be written to the target.
 async fn verify_stream_hash(dec_paths: &[std::path::PathBuf], expected: &str) -> Result<()> {
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; IO_BUF_SIZE];
     for dec_path in dec_paths {
         let mut f = tokio::fs::File::open(dec_path).await?;
         loop {
@@ -181,7 +181,7 @@ pub async fn restore_task<R: RemoteBackend>(
     // Unique temp dir per invocation; prevents concurrent restores from colliding.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is before the Unix epoch")
         .as_nanos();
     let restore_dir = config
         .base_dir
@@ -220,6 +220,8 @@ pub async fn restore_task<R: RemoteBackend>(
     }
     .await;
 
-    let _ = tokio::fs::remove_dir_all(&restore_dir).await;
+    if let Err(e) = tokio::fs::remove_dir_all(&restore_dir).await {
+        tracing::warn!("failed to clean up restore dir {:?}: {e}", restore_dir);
+    }
     result
 }

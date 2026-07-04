@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use crate::{
     Config, RemoteBackend, Task,
-    util::{compact_to_iso, sanitize_subvolume_path},
+    util::{parse_task_dir_name, sanitize_subvolume_path},
 };
 
 pub struct BackupEntry {
@@ -12,12 +12,7 @@ pub struct BackupEntry {
 
 fn parse_entry(key: &str) -> Option<BackupEntry> {
     let dir = key.split('/').find(|s| s.starts_with("bcb_level"))?;
-    let parts: Vec<&str> = dir.split('_').collect();
-    let [_, level_str, compact_ts, ..] = parts.as_slice() else {
-        return None;
-    };
-    let level: u32 = level_str.strip_prefix("level")?.parse().ok()?;
-    let timestamp = compact_to_iso(compact_ts).ok()?;
+    let (level, timestamp) = parse_task_dir_name(dir)?;
     Some(BackupEntry { level, timestamp })
 }
 
@@ -37,10 +32,6 @@ pub async fn list_backups<R: RemoteBackend>(
         .collect();
 
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.level.cmp(&b.level)));
-
-    if entries.is_empty() {
-        return Err(anyhow!("no backups found for task '{}'", task.name));
-    }
 
     Ok(entries)
 }
@@ -112,7 +103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_backups_empty_is_error() {
+    async fn test_list_backups_empty_is_ok() {
         let config = Config {
             base_dir: PathBuf::from("/tmp"),
             age_public_key: String::new(),
@@ -122,6 +113,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| Ok(vec![]));
 
-        assert!(list_backups(&config, &test_task(), &remote).await.is_err());
+        let entries = list_backups(&config, &test_task(), &remote).await.unwrap();
+        assert!(entries.is_empty());
     }
 }

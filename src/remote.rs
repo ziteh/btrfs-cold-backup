@@ -44,8 +44,7 @@ pub trait RemoteBackend: Send + Sync {
         storage_class: &str,
         tags: &str,
     ) -> Result<()>;
-    /// Returns the object size in bytes, or None if the key does not exist.
-    async fn head(&self, key: &str) -> Result<Option<u64>>;
+    async fn exists(&self, key: &str) -> Result<bool>;
     async fn download(&self, key: &str) -> Result<Vec<u8>>;
     /// Streams the object to a local file without buffering it in memory.
     async fn download_to_file(&self, key: &str, path: &Path) -> Result<()>;
@@ -185,11 +184,9 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
     tags: &str,
     mut reader: R,
 ) -> Result<()> {
-    // No explicit checksum_algorithm is set
-    // aws-sdk-s3's default RequestChecksumCalculation (WhenSupported) already attaches a per-part CRC32 that
-    // S3 validates before accepting each UploadPart, so transmission corruption is already rejected immediately.
-    // A full-object checksum (CRC64NVME) or stored BLAKE3 metadata wouldn't add coverage beyond that,
-    // since bcb's own BLAKE3 manifest hash already verifies the whole stream at restore time.
+    // No explicit checksum_algorithm: the SDK's default per-part CRC32 already rejects
+    // transmission corruption, and bcb's manifest BLAKE3 verifies the whole stream at
+    // restore time, so a full-object checksum would add no coverage.
 
     // The PID lock prevents concurrent bcb instances, so any incomplete upload already sitting
     // under this key can only be an orphan from a prior run that was killed mid-upload; clean it
@@ -337,7 +334,7 @@ impl RemoteBackend for S3Backend {
         }
     }
 
-    async fn head(&self, key: &str) -> Result<Option<u64>> {
+    async fn exists(&self, key: &str) -> Result<bool> {
         match self
             .client
             .head_object()
@@ -346,10 +343,10 @@ impl RemoteBackend for S3Backend {
             .send()
             .await
         {
-            Ok(resp) => Ok(resp.content_length().map(|n| n as u64)),
+            Ok(_) => Ok(true),
             Err(e) => {
                 if matches!(e.as_service_error(), Some(HeadObjectError::NotFound(_))) {
-                    Ok(None)
+                    Ok(false)
                 } else {
                     Err(anyhow!("S3 head_object failed: {e}"))
                 }
