@@ -3,8 +3,8 @@ use std::process::Command;
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    BtrfsDriver, Config, RetrievalOptions, S3Backend, S3Config, S3RetryConfig, S3StorageClass,
-    Task, backup::backup_task, restore::restore_task,
+    BtrfsDriver, Config, RestoreConfig, RetrievalOptions, S3Backend, S3Config, S3RetryConfig,
+    S3StorageClass, Task, backup::backup_task, restore::restore_task,
 };
 
 fn retrieval() -> RetrievalOptions {
@@ -93,6 +93,7 @@ fn s3_config(env: &E2eEnv) -> S3Config {
         },
         retry: S3RetryConfig::default(),
         upload_speed_limit_kbps: 0,
+        restore: RestoreConfig::default(),
     }
 }
 
@@ -155,6 +156,10 @@ async fn level0_backup_and_restore_should_round_trip() {
     .await;
     // btrfs receive succeeds only on a real btrfs target
     assert!(result.is_ok(), "restore failed: {result:?}");
+    assert!(
+        result.unwrap().completed,
+        "restore must complete in one run when nothing is archived"
+    );
 
     // Verify the restored data
     let restored_file = restore_dir
@@ -280,7 +285,7 @@ async fn incremental_chain_restore_should_recover_both_levels() {
         .unwrap();
 
     let private_key = identity.to_string();
-    restore_task(
+    let progress0 = restore_task(
         &config,
         &task,
         0,
@@ -292,8 +297,9 @@ async fn incremental_chain_restore_should_recover_both_levels() {
     )
     .await
     .expect("level 0 restore failed");
+    assert!(progress0.completed, "level 0 restore must complete");
 
-    restore_task(
+    let progress1 = restore_task(
         &config,
         &task,
         1,
@@ -305,6 +311,7 @@ async fn incremental_chain_restore_should_recover_both_levels() {
     )
     .await
     .expect("level 1 incremental restore failed");
+    assert!(progress1.completed, "level 1 restore must complete");
 
     let restored1 = restore_dir.join("bcb_level1.20260602T0000");
     assert_eq!(std::fs::read(restored1.join("base.txt")).unwrap(), b"base");

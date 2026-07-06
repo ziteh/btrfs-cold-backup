@@ -11,13 +11,16 @@ pub mod restore;
 pub mod util;
 
 pub use btrfs::{BtrfsDriver, BtrfsOps};
-pub use config::{Config, S3Config, S3RetryConfig, S3StorageClass, Task};
+pub use config::{Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task};
 pub use crypto::{
     AgeKeyPair, blake3_file, decrypt_file, encrypt_file, generate_key_pair, test_key_pair,
     write_private_key,
 };
 pub use lock::PidLock;
-pub use manifest::{Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo};
-pub use remote::{RemoteBackend, RestoreStatus, S3Backend};
+pub use manifest::{
+    Backup, BackupState, CompletedPart, Last, LastEntry, PartDownloadState, PartInfo,
+    RestorePartState, RestoreState,
+};
+pub use remote::{RemoteBackend, RestoreStatus, RestoreStatusDetail, S3Backend};
 pub use restore::RetrievalOptions;
 pub use util::{sanitize_subvolume_path, state_path};

@@ -172,10 +172,9 @@ Notes:
 
 ## Restoring
 
-Objects in S3 `GLACIER` (including `DEEP_ARCHIVE`) storage classes cannot be downloaded directly; they must be retrieved first, which takes hours. `bcb restore` handles this in two phases:
+Objects in S3 `GLACIER` (including `DEEP_ARCHIVE`) storage classes cannot be downloaded directly; they must be retrieved first, which takes hours. `bcb restore` works incrementally: each run downloads whatever parts are currently retrievable (resuming interrupted downloads from where they stopped), requests retrieval for the next batch, and exits. Re-run the same command until it prints `restore complete` — exit code 2 means "in progress, run again later", so a scheduler can just retry until exit 0.
 
-1. Initiates the retrievals and exits with a message.
-2. Re-run the same command once the retrievals complete to perform the actual restore. `--restore-tier` and `--restore-days` control the retrieval speed/cost and how long the retrieved copies stay downloadable.
+`--restore-tier` and `--restore-days` control the retrieval speed/cost and how long each retrieved copy stays downloadable. On slow connections, set `s3.restore.expected_download_kbps` in the config so retrievals are paced to what you can actually download before the copies expire (instead of requesting everything at once); `s3.restore.lead_days` overrides how much download-time worth of parts to keep retrievable ahead.
 
 To restore an incremental backup, restore each level in order onto the same target (level 0 first, then level 1, and so on); each incremental needs its parent present on the target.
 
@@ -211,7 +210,7 @@ bash scripts/run-vm-tests.sh
 - [ ] Parallel part encryption/upload (worker pool)
 - [ ] Protect parent snapshots of incremental chains from deletion (no btrfs equivalent of `zfs hold`; likely needs a check against btrbk retention)
 - [ ] `restore --dry-run` and a `--force` passthrough for `btrfs receive`
-- [ ] Resumable restore: keep downloaded parts across runs so an interrupted restore only fetches (and re-requests archive retrieval for) the missing parts
+- [x] Resumable restore: keep downloaded parts across runs so an interrupted restore only fetches (and re-requests archive retrieval for) the missing parts
 - [ ] Add btrbk to VM for E2E testing
 
 [s3-gda]: https://aws.amazon.com/s3/storage-classes/glacier/

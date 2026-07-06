@@ -25,6 +25,14 @@ pub enum RestoreStatus {
     NotRequested,
 }
 
+/// Detailed restore status with expiry information for Ready objects.
+#[derive(Debug, Clone)]
+pub struct RestoreStatusDetail {
+    pub status: RestoreStatus,
+    /// Unix timestamp when the restored copy expires (for Ready status).
+    pub expires_at: Option<i64>,
+}
+
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
 pub trait RemoteBackend: Send + Sync {
@@ -46,10 +54,18 @@ pub trait RemoteBackend: Send + Sync {
     ) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
     async fn download(&self, key: &str) -> Result<Vec<u8>>;
-    /// Streams the object to a local file without buffering it in memory.
-    async fn download_to_file(&self, key: &str, path: &Path) -> Result<()>;
-    /// Reports whether the object is downloadable, in archive retrieval, or needs one.
-    async fn restore_status(&self, key: &str) -> Result<RestoreStatus>;
+    /// Streams a byte range (inclusive) of the object to a local file: creating it when
+    /// `start` is 0, appending otherwise.
+    async fn download_range_to_file(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+        path: &Path,
+    ) -> Result<()>;
+    /// Reports whether the object is downloadable, in archive retrieval, or needs one,
+    /// with the retrieved copy's expiry when available.
+    async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
     /// Initiates an archive retrieval so the object becomes downloadable for `days`.
     async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
     async fn verify_credentials(&self) -> Result<()>;
@@ -103,6 +119,23 @@ pub(crate) fn parse_storage_class(s: &str) -> Result<StorageClass> {
         "STANDARD_IA" => Ok(StorageClass::StandardIa),
         other => Err(anyhow!("unknown S3 storage class: {other}")),
     }
+}
+
+/// Parses the expiry-date from x-amz-restore header.
+/// Format: ongoing-request="false", expiry-date="Fri, 21 Dec 2012 00:00:00 GMT"
+fn parse_expiry_date(restore_header: &str) -> Option<i64> {
+    if let Some(start) = restore_header.find("expiry-date=\"") {
+        let start = start + "expiry-date=\"".len();
+        if let Some(end) = restore_header[start..].find('"') {
+            let date_str = &restore_header[start..start + end];
+            return httpdate::parse_http_date(date_str).ok().map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            });
+        }
+    }
+    None
 }
 
 // Test-only pause point: parks here right after a part upload succeeds (upload_id exists on S3
@@ -374,27 +407,45 @@ impl RemoteBackend for S3Backend {
         Ok(bytes.to_vec())
     }
 
-    async fn download_to_file(&self, key: &str, path: &Path) -> Result<()> {
+    async fn download_range_to_file(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+        path: &Path,
+    ) -> Result<()> {
+        let range = format!("bytes={}-{}", start, end);
         let resp = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            .range(&range)
             .send()
             .await
-            .map_err(|e| anyhow!("S3 get_object failed: {e}"))?;
+            .map_err(|e| anyhow!("S3 get_object with range failed: {e}"))?;
 
         let mut body = resp.body.into_async_read();
-        let mut file = tokio::fs::File::create(path)
-            .await
-            .map_err(|e| anyhow!("failed to create {:?}: {e}", path))?;
+        let mut file = if start == 0 {
+            tokio::fs::File::create(path)
+                .await
+                .map_err(|e| anyhow!("failed to create {:?}: {e}", path))?
+        } else {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(false)
+                .open(path)
+                .await
+                .map_err(|e| anyhow!("failed to open {:?}: {e}", path))?
+        };
         tokio::io::copy(&mut body, &mut file)
             .await
-            .map_err(|e| anyhow!("failed to write S3 object to {:?}: {e}", path))?;
+            .map_err(|e| anyhow!("failed to write range to {:?}: {e}", path))?;
         Ok(())
     }
 
-    async fn restore_status(&self, key: &str) -> Result<RestoreStatus> {
+    async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail> {
         let resp = self
             .client
             .head_object()
@@ -404,23 +455,24 @@ impl RemoteBackend for S3Backend {
             .await
             .map_err(|e| anyhow!("S3 head_object failed for {key}: {e}"))?;
 
-        // Only these classes require an explicit retrieval before GET; GLACIER_IR and the
-        // rest are directly readable.
         let archived = matches!(
             resp.storage_class(),
             Some(StorageClass::DeepArchive) | Some(StorageClass::Glacier)
         );
         if !archived {
-            return Ok(RestoreStatus::Ready);
+            return Ok(RestoreStatusDetail {
+                status: RestoreStatus::Ready,
+                expires_at: None,
+            });
         }
 
-        // x-amz-restore: absent = never requested; ongoing-request="true" = running;
-        // ongoing-request="false" = a restored copy is available until its expiry date.
-        match resp.restore() {
-            None => Ok(RestoreStatus::NotRequested),
-            Some(r) if r.contains("ongoing-request=\"true\"") => Ok(RestoreStatus::InProgress),
-            Some(_) => Ok(RestoreStatus::Ready),
-        }
+        let (status, expires_at) = match resp.restore() {
+            None => (RestoreStatus::NotRequested, None),
+            Some(r) if r.contains("ongoing-request=\"true\"") => (RestoreStatus::InProgress, None),
+            Some(r) => (RestoreStatus::Ready, parse_expiry_date(r)),
+        };
+
+        Ok(RestoreStatusDetail { status, expires_at })
     }
 
     async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()> {

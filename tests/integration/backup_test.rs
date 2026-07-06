@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use btrfs_cold_backup::{
-    BtrfsOps, Config, RemoteBackend, RestoreStatus, RetrievalOptions, S3Config, S3RetryConfig,
-    S3StorageClass, Task,
+    BtrfsOps, Config, RemoteBackend, RestoreConfig, RestoreStatus, RestoreStatusDetail,
+    RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, Task,
     backup::backup_task,
     manifest::{Last, LastEntry},
     restore::restore_task,
@@ -33,8 +33,8 @@ mock! {
         async fn upload_file(&self, key: &str, path: &Path, storage_class: &str, tags: &str) -> Result<()>;
         async fn exists(&self, key: &str) -> Result<bool>;
         async fn download(&self, key: &str) -> Result<Vec<u8>>;
-        async fn download_to_file(&self, key: &str, path: &Path) -> Result<()>;
-        async fn restore_status(&self, key: &str) -> Result<RestoreStatus>;
+        async fn download_range_to_file(&self, key: &str, start: u64, end: u64, path: &Path) -> Result<()>;
+        async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
         async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
         async fn verify_credentials(&self) -> Result<()>;
         async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
@@ -64,6 +64,7 @@ fn test_config(base_dir: &Path) -> Config {
             },
             retry: S3RetryConfig::default(),
             upload_speed_limit_kbps: 0,
+            restore: RestoreConfig::default(),
         },
         tasks: vec![],
     }
@@ -332,9 +333,6 @@ async fn restore_should_download_and_pipe_to_btrfs_receive() {
     let encrypted_bytes_clone = encrypted_bytes.clone();
     let mut remote = MockRemote::new();
     remote
-        .expect_restore_status()
-        .returning(|_| Ok(RestoreStatus::Ready));
-    remote
         .expect_download()
         .withf(|key| key.contains("task_manifest"))
         .returning(move |_| Ok(manifest_yaml.clone()));
@@ -393,17 +391,19 @@ async fn restore_should_fail_on_blake3_mismatch() {
         .into_bytes();
 
     let mut remote = MockRemote::new();
-    remote
-        .expect_restore_status()
-        .returning(|_| Ok(RestoreStatus::Ready));
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::Ready,
+            expires_at: None,
+        })
+    });
     remote
         .expect_download()
         .withf(|key| key.contains("task_manifest"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
-        .expect_download_to_file()
-        .withf(|key, _| key.contains("snapshot.part"))
-        .returning(|_, path| {
+        .expect_download_range_to_file()
+        .returning(|_, _, _, path| {
             std::fs::write(path, b"some random bytes")?;
             Ok(())
         });
@@ -604,15 +604,45 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
 /// Archived parts must trigger a retrieval request and a retry-later error, not a download.
 #[tokio::test]
 async fn restore_should_request_retrieval_for_archived_objects() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
     let target_dir = work_dir.path().join("restore_target");
 
+    // Create a simple manifest with one part
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: 10,
+        blake3: "wrong_hash".to_string(),
+        parts: vec![PartInfo {
+            index: "000000".to_string(),
+            size_bytes: 10,
+            blake3: "wrong_hash".to_string(),
+        }],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
     let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::NotRequested,
+            expires_at: None,
+        })
+    });
     remote
-        .expect_restore_status()
-        .returning(|_| Ok(RestoreStatus::NotRequested));
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_request_restore()
         .times(1)
@@ -685,17 +715,19 @@ async fn restore_should_fail_before_receive_on_stream_mismatch() {
         .into_bytes();
 
     let mut remote = MockRemote::new();
-    remote
-        .expect_restore_status()
-        .returning(|_| Ok(RestoreStatus::Ready));
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::Ready,
+            expires_at: None,
+        })
+    });
     remote
         .expect_download()
         .withf(|key| key.contains("task_manifest"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
-        .expect_download_to_file()
-        .withf(|key, _| key.contains("snapshot.part"))
-        .returning(move |_, path| {
+        .expect_download_range_to_file()
+        .returning(move |_, _, _, path| {
             std::fs::write(path, &encrypted_bytes)?;
             Ok(())
         });
@@ -724,4 +756,380 @@ async fn restore_should_fail_before_receive_on_stream_mismatch() {
         !target_dir.exists(),
         "target_dir must not be created before verification"
     );
+}
+
+/// Regression test: with `expected_download_kbps` left at its default (0, "no pacing
+/// estimate"), the buffer target used to compute as 0 bytes, so `total_buffered <
+/// buffer_target` was never true and archived parts never had retrieval requested at all.
+/// Unset pacing must fall back to requesting every remaining part immediately.
+#[tokio::test]
+async fn default_config_should_still_request_retrieval_for_all_archived_parts() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: 20,
+        blake3: "irrelevant".to_string(),
+        parts: vec![
+            PartInfo {
+                index: "000000".to_string(),
+                size_bytes: 10,
+                blake3: "h0".to_string(),
+            },
+            PartInfo {
+                index: "000001".to_string(),
+                size_bytes: 10,
+                blake3: "h1".to_string(),
+            },
+        ],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|key| {
+        if key.contains("task_manifest") {
+            Ok(RestoreStatusDetail {
+                status: RestoreStatus::Ready,
+                expires_at: None,
+            })
+        } else {
+            Ok(RestoreStatusDetail {
+                status: RestoreStatus::NotRequested,
+                expires_at: None,
+            })
+        }
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    remote
+        .expect_request_restore()
+        .times(2)
+        .returning(|_, _, _| Ok(()));
+
+    let result = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        "AGE-SECRET-KEY-1FAKE",
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect("archived-but-not-yet-ready parts must report progress, not error");
+
+    assert!(!result.completed);
+    assert_eq!(result.parts_downloaded, 0);
+    assert_eq!(result.parts_total, 2);
+    assert_eq!(result.bytes_remaining, 20);
+}
+
+/// A manifest whose retrieval was already requested (still `InProgress`) must bail out with
+/// an actionable "re-run later" error, not fall through and attempt a `GetObject` against an
+/// archived-and-not-yet-restored object (which S3 would reject).
+#[tokio::test]
+async fn restore_should_bail_cleanly_when_manifest_retrieval_in_progress() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::InProgress,
+            expires_at: None,
+        })
+    });
+    // No expect_download / expect_request_restore registered: either being called at all
+    // is itself a test failure (mockall panics on an unmatched call).
+
+    let err = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        "AGE-SECRET-KEY-1FAKE",
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect_err("manifest retrieval in progress must bail, not attempt download");
+
+    assert!(
+        err.to_string().contains("in progress"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Regression test for the "false completion" bug: `stream_verified` and `receive_completed`
+/// must be tracked as two separate flags. If a run persists `stream_verified = true` but then
+/// fails (or is killed) before `btrfs receive` completes, a resumed run must actually retry
+/// the receive step — not silently return success because the hash was already verified.
+#[tokio::test]
+async fn resume_after_stream_verified_should_retry_receive_not_silently_succeed() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    use secrecy::ExposeSecret;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let identity = age::x25519::Identity::generate();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let plain_path = work_dir.path().join("plain.bin");
+    std::fs::write(&plain_path, b"stream payload").unwrap();
+    let stream_hash = btrfs_cold_backup::blake3_file(&plain_path).await.unwrap();
+
+    let encrypted_path = work_dir.path().join("part.age");
+    btrfs_cold_backup::encrypt_file(
+        &plain_path,
+        &encrypted_path,
+        &identity.to_public().to_string(),
+    )
+    .await
+    .unwrap();
+    let encrypted_bytes = std::fs::read(&encrypted_path).unwrap();
+    let encrypted_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
+        .await
+        .unwrap();
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: encrypted_bytes.len() as u64,
+        blake3: stream_hash,
+        parts: vec![PartInfo {
+            index: "000000".to_string(),
+            size_bytes: encrypted_bytes.len() as u64,
+            blake3: encrypted_hash,
+        }],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::Ready,
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    remote
+        .expect_download_range_to_file()
+        .returning(move |_, _, _, path| {
+            std::fs::write(path, &encrypted_bytes)?;
+            Ok(())
+        });
+
+    let private_key = identity.to_string();
+
+    // First run: downloads and verifies successfully, then fails while actually attempting
+    // btrfs receive (no real btrfs subvolume/binary in this test environment).
+    let first_err = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        private_key.expose_secret(),
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect_err("btrfs receive must fail in this non-btrfs test environment");
+
+    // Second run (simulating a re-run after the first crashed/failed): must retry the
+    // receive step again, not silently report success just because stream_verified was
+    // already persisted as true.
+    let second_err = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        private_key.expose_secret(),
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect_err("resumed run must retry receive, not silently succeed");
+
+    assert_eq!(
+        first_err.to_string(),
+        second_err.to_string(),
+        "both runs should fail identically by actually attempting receive"
+    );
+}
+
+/// Regression test: a part left half-downloaded by an interrupted run must be picked up
+/// again by the next run (resuming from the saved offset), not left stuck forever because
+/// no code path considered `PartiallyDownloaded` parts downloadable.
+#[tokio::test]
+async fn restore_should_resume_partially_downloaded_part() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    use btrfs_cold_backup::{PartDownloadState, RestorePartState, RestoreState};
+    use secrecy::ExposeSecret;
+    use std::collections::BTreeMap;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let identity = age::x25519::Identity::generate();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let plain_path = work_dir.path().join("plain.bin");
+    std::fs::write(&plain_path, b"stream payload").unwrap();
+    let stream_hash = btrfs_cold_backup::blake3_file(&plain_path).await.unwrap();
+
+    let encrypted_path = work_dir.path().join("part.age");
+    btrfs_cold_backup::encrypt_file(
+        &plain_path,
+        &encrypted_path,
+        &identity.to_public().to_string(),
+    )
+    .await
+    .unwrap();
+    let encrypted_bytes = std::fs::read(&encrypted_path).unwrap();
+    let encrypted_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
+        .await
+        .unwrap();
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: encrypted_bytes.len() as u64,
+        blake3: stream_hash.clone(),
+        parts: vec![PartInfo {
+            index: "000000".to_string(),
+            size_bytes: encrypted_bytes.len() as u64,
+            blake3: encrypted_hash.clone(),
+        }],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    // Pre-seed the deterministic restore work dir as an interrupted run would have left
+    // it: state says half the part is downloaded, and the on-disk file holds that half.
+    let half = encrypted_bytes.len() as u64 / 2;
+    let restore_dir = work_dir
+        .path()
+        .join("restore-movies-level0-2026-06-02T00:00:00Z");
+    std::fs::create_dir_all(&restore_dir).unwrap();
+    std::fs::write(
+        restore_dir.join("part-000000.age"),
+        &encrypted_bytes[..half as usize],
+    )
+    .unwrap();
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "000000".to_string(),
+        RestorePartState {
+            index: "000000".to_string(),
+            size_bytes: encrypted_bytes.len() as u64,
+            blake3: encrypted_hash,
+            download_state: PartDownloadState::PartiallyDownloaded {
+                downloaded_bytes: half,
+            },
+        },
+    );
+    let mut seeded = RestoreState {
+        task_name: task.name.clone(),
+        level: 0,
+        timestamp: "2026-06-02T00:00:00Z".to_string(),
+        snapshot_name: backup_manifest.snapshot_name.clone(),
+        manifest_blake3: stream_hash,
+        parts,
+        stream_verified: false,
+        receive_completed: false,
+        last_updated: 0,
+    };
+    seeded
+        .save(&restore_dir.join("restore-state.yaml"))
+        .unwrap();
+
+    let remaining: Vec<u8> = encrypted_bytes[half as usize..].to_vec();
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::Ready,
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    // Only the missing byte range may be fetched — exactly once, starting at the saved
+    // offset. Any request for start == 0 would mean the resume was lost.
+    remote
+        .expect_download_range_to_file()
+        .withf(move |_, start, _, _| *start == half)
+        .times(1)
+        .returning(move |_, _, _, path| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+            f.write_all(&remaining)?;
+            Ok(())
+        });
+
+    let private_key = identity.to_string();
+    // Fails only at the btrfs receive step (no btrfs in this test environment); by then
+    // the part must have been resumed, verified, and decrypted.
+    restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        private_key.expose_secret(),
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect_err("btrfs receive must fail in this non-btrfs test environment");
+
+    let state: RestoreState = serde_yaml::from_str(
+        &std::fs::read_to_string(restore_dir.join("restore-state.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.parts["000000"].download_state,
+        PartDownloadState::Downloaded,
+        "resumed part must reach Downloaded"
+    );
+    assert!(state.stream_verified, "stream must verify after resume");
 }

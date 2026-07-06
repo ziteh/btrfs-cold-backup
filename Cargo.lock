@@ -741,6 +741,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "httpdate",
  "libc",
  "mockall",
  "secrecy",

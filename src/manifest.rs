@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::util::now_unix;
@@ -73,6 +73,61 @@ impl BackupState {
         std::fs::write(&tmp, serde_yaml::to_string(self)?.as_bytes())?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+}
+
+/// Persisted download progress of one restore part. `Requested`/`Ready` are an
+/// informational cache for operators inspecting the state file — each run re-checks the
+/// live S3 retrieval status anyway. `PartiallyDownloaded`/`Downloaded` carry the real
+/// resume state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PartDownloadState {
+    NotRequested,
+    Requested { requested_at: i64 },
+    Ready { ready_since: i64, expires_at: i64 },
+    PartiallyDownloaded { downloaded_bytes: u64 },
+    Downloaded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestorePartState {
+    pub index: String,
+    pub size_bytes: u64,
+    pub blake3: String,
+    pub download_state: PartDownloadState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RestoreState {
+    pub task_name: String,
+    pub level: u32,
+    pub timestamp: String,
+    pub snapshot_name: String,
+    pub manifest_blake3: String,
+    pub parts: BTreeMap<String, RestorePartState>,
+    pub stream_verified: bool,
+    /// Whether `btrfs receive` has completed and the target subvolume was verified.
+    /// Tracked separately from `stream_verified` so a crash between the hash check and
+    /// the receive step doesn't cause a resumed run to silently skip re-attempting receive.
+    pub receive_completed: bool,
+    pub last_updated: i64,
+}
+
+impl RestoreState {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.last_updated = now_unix();
+        let tmp = path.with_extension("yaml.tmp");
+        std::fs::write(&tmp, serde_yaml::to_string(self)?.as_bytes())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+pub fn read_restore_state(path: &Path) -> Result<Option<RestoreState>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_yaml::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 

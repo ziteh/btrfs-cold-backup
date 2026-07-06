@@ -15,6 +15,28 @@ impl Default for S3RetryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RestoreConfig {
+    /// Expected download speed in KiB/s; used to calculate lead_days buffer.
+    /// Only for scheduling estimation, not for actual speed limiting.
+    /// 0 means no estimation (disable prefetch scheduling).
+    #[serde(default)]
+    pub expected_download_kbps: u64,
+
+    /// How many days' worth of download bandwidth to keep "ahead" in the retrieval queue.
+    /// If set, overrides the tier-based default calculation.
+    #[serde(default)]
+    pub lead_days: Option<f64>,
+
+    /// Max concurrent status checks for parts (does not affect download speed).
+    #[serde(default = "default_status_check_concurrency")]
+    pub status_check_concurrency: u32,
+}
+
+fn default_status_check_concurrency() -> u32 {
+    16
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
@@ -29,6 +51,9 @@ pub struct S3Config {
     /// KiB/s; 0 means unlimited.
     #[serde(default)]
     pub upload_speed_limit_kbps: u64,
+    /// Restore-specific configuration.
+    #[serde(default)]
+    pub restore: RestoreConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -171,6 +196,7 @@ mod tests {
                 },
                 retry: S3RetryConfig::default(),
                 upload_speed_limit_kbps: 0,
+                restore: RestoreConfig::default(),
             },
             tasks: vec![Task {
                 name: "test".to_string(),

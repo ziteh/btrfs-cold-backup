@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    Config, S3Config, S3RetryConfig, S3StorageClass, Task, sanitize_subvolume_path,
+    Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task, sanitize_subvolume_path,
 };
 
 pub(crate) struct VmEnv {
@@ -71,6 +71,7 @@ fn s3_config(env: &VmEnv) -> S3Config {
         },
         retry: S3RetryConfig::default(),
         upload_speed_limit_kbps: 0,
+        restore: RestoreConfig::default(),
     }
 }
 

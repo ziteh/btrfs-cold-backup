@@ -270,14 +270,36 @@ async fn main() -> Result<()> {
             )
             .await;
             match &result {
-                Ok(()) => tracing::info!(task = %t.name, level, "restore completed"),
+                Ok(p) if p.completed => {
+                    tracing::info!(task = %t.name, level, "restore completed")
+                }
+                Ok(p) => {
+                    tracing::info!(
+                        task = %t.name,
+                        level,
+                        parts_downloaded = p.parts_downloaded,
+                        parts_total = p.parts_total,
+                        bytes_remaining = p.bytes_remaining,
+                        "restore in progress"
+                    )
+                }
                 Err(e) => {
                     tracing::error!(task = %t.name, level, error = format!("{e:#}"), "restore failed")
                 }
             }
-            result?;
+            let progress = result?;
 
-            println!("restore complete");
+            if progress.completed {
+                println!("restore complete");
+            } else {
+                println!(
+                    "restore in progress: {}/{} parts downloaded, {} bytes remaining; re-run once further retrievals complete",
+                    progress.parts_downloaded, progress.parts_total, progress.bytes_remaining
+                );
+                // Distinct exit code so schedulers can tell "not done yet" from success (0)
+                // and failure (1).
+                std::process::exit(2);
+            }
         }
     }
 
