@@ -305,35 +305,81 @@ pub async fn restore_task<R: RemoteBackend>(
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let timestamp = compact_to_iso(date)?;
 
-    let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp)?;
-
-    // Check if manifest itself is archived before attempting download. Both NotRequested
-    // (needs a retrieval kicked off) and InProgress (already requested, not yet Ready) must
-    // bail out here — downloading an archived-and-not-yet-restored object fails at S3.
-    let manifest_status = remote.restore_status_detail(&manifest_key).await?;
-    match manifest_status.status {
-        RestoreStatus::Ready => {}
-        RestoreStatus::NotRequested => {
-            tracing::warn!("manifest is archived, requesting retrieval");
-            remote
-                .request_restore(&manifest_key, retrieval.days, &retrieval.tier)
-                .await?;
-            return Err(anyhow!(
-                "manifest archived, retrieval requested; re-run restore task once retrieval completes"
-            ));
-        }
-        RestoreStatus::InProgress => {
-            return Err(anyhow!(
-                "manifest retrieval already in progress; re-run restore task once it completes"
-            ));
-        }
+    let lead_days = config
+        .s3
+        .restore
+        .lead_days
+        .unwrap_or_else(|| calculate_lead_days(&retrieval.tier));
+    let daily_budget = calculate_daily_budget_bytes(config.s3.restore.expected_download_kbps);
+    // With pacing enabled, a wave of retrieved copies is drained over ~lead_days of
+    // downloading; a copy expiring before its turn wastes per-GB retrieval fees on a
+    // re-request. Checked before any S3 side effect so a misconfiguration is caught
+    // before retrievals are kicked off.
+    if daily_budget > 0 && (retrieval.days as f64) < lead_days + 1.0 {
+        return Err(anyhow!(
+            "retrieved copies would expire before the paced download reaches them: \
+             --restore-days is {} but pacing needs at least {} (lead_days {} plus one day \
+             of margin); raise --restore-days or lower restore.lead_days",
+            retrieval.days,
+            (lead_days + 1.0).ceil() as i64,
+            lead_days
+        ));
     }
-
-    let manifest_bytes = remote.download(&manifest_key).await?;
-    let backup: Backup = serde_yaml::from_slice(&manifest_bytes)?;
+    // expected_download_kbps == 0 means "no pacing estimate given" — fall back to requesting
+    // every remaining part immediately (the pre-pacing behavior), rather than a buffer_target
+    // of 0 bytes, which would never satisfy the budget gate and silently never request
+    // retrieval for anything.
+    let buffer_target = if daily_budget == 0 {
+        u64::MAX
+    } else {
+        (lead_days * daily_budget as f64) as u64
+    };
 
     let work_dir = restore_work_dir(&config.base_dir, &task.name, level, &timestamp);
     tokio::fs::create_dir_all(&work_dir).await?;
+
+    // The manifest is fetched from S3 once and cached in the work dir. A paced restore can
+    // span weeks while the manifest's retrieved copy only lives `--restore-days`; without
+    // the cache every expiry would stall the whole restore on a fresh manifest retrieval
+    // (hours to days on archive tiers) even when part copies are sitting ready.
+    let manifest_path = work_dir.join("manifest.yaml");
+    let backup: Backup = match tokio::fs::read(&manifest_path).await {
+        Ok(bytes) => serde_yaml::from_slice(&bytes)?,
+        Err(_) => {
+            let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp)?;
+
+            // Check if manifest itself is archived before attempting download. Both
+            // NotRequested (needs a retrieval kicked off) and InProgress (already requested,
+            // not yet Ready) must bail out here — downloading an archived-and-not-yet-restored
+            // object fails at S3.
+            let manifest_status = remote.restore_status_detail(&manifest_key).await?;
+            match manifest_status.status {
+                RestoreStatus::Ready => {}
+                RestoreStatus::NotRequested => {
+                    tracing::warn!("manifest is archived, requesting retrieval");
+                    remote
+                        .request_restore(&manifest_key, retrieval.days, &retrieval.tier)
+                        .await?;
+                    return Err(anyhow!(
+                        "manifest archived, retrieval requested; re-run restore task once retrieval completes"
+                    ));
+                }
+                RestoreStatus::InProgress => {
+                    return Err(anyhow!(
+                        "manifest retrieval already in progress; re-run restore task once it completes"
+                    ));
+                }
+            }
+
+            let manifest_bytes = remote.download(&manifest_key).await?;
+            // Parse before caching so a corrupt download is never persisted.
+            let backup: Backup = serde_yaml::from_slice(&manifest_bytes)?;
+            let tmp = manifest_path.with_extension("yaml.tmp");
+            tokio::fs::write(&tmp, &manifest_bytes).await?;
+            tokio::fs::rename(&tmp, &manifest_path).await?;
+            backup
+        }
+    };
 
     let state_path = restore_state_file(&work_dir);
     let mut state = match read_restore_state(&state_path)? {
@@ -373,22 +419,6 @@ pub async fn restore_task<R: RemoteBackend>(
         }
     };
 
-    let lead_days = config
-        .s3
-        .restore
-        .lead_days
-        .unwrap_or_else(|| calculate_lead_days(&retrieval.tier));
-    let daily_budget = calculate_daily_budget_bytes(config.s3.restore.expected_download_kbps);
-    // expected_download_kbps == 0 means "no pacing estimate given" — fall back to requesting
-    // every remaining part immediately (the pre-pacing behavior), rather than a buffer_target
-    // of 0 bytes, which would never satisfy `total_buffered < buffer_target` and silently
-    // never request retrieval for anything.
-    let buffer_target = if daily_budget == 0 {
-        u64::MAX
-    } else {
-        (lead_days * daily_budget as f64) as u64
-    };
-
     let part_keys: HashMap<String, String> = backup
         .parts
         .iter()
@@ -419,7 +449,54 @@ pub async fn restore_task<R: RemoteBackend>(
         };
         let ready_bytes = live_bytes(RestoreStatus::Ready);
         let in_progress_bytes = live_bytes(RestoreStatus::InProgress);
-        let total_buffered = ready_bytes + in_progress_bytes;
+
+        // Request retrievals BEFORE downloading: requests are instant while draining the
+        // ready wave below can take days, and AWS prepares the next wave in parallel —
+        // requesting afterwards would serialize each cycle into download-then-wait. Ready
+        // bytes are excluded from the budget gate because this run is about to drain them;
+        // what counts against the lead buffer is what will still be arriving after this
+        // run: in-progress retrievals plus the requests made here. Partially downloaded
+        // parts whose copy expired are re-requested unconditionally (their bytes are
+        // already invested; the resume offset stays valid since the object is immutable).
+        let mut bytes_requested = 0u64;
+        for part_info in &backup.parts {
+            let Some(detail) = live.get(&part_info.index) else {
+                continue;
+            };
+            if detail.status != RestoreStatus::NotRequested {
+                continue;
+            }
+            let Some(part) = state.parts.get_mut(&part_info.index) else {
+                continue;
+            };
+            if matches!(part.download_state, PartDownloadState::Downloaded) {
+                continue;
+            }
+            let partially_downloaded = matches!(
+                part.download_state,
+                PartDownloadState::PartiallyDownloaded { .. }
+            );
+            if !partially_downloaded
+                && in_progress_bytes + bytes_requested + part.size_bytes > buffer_target
+            {
+                continue;
+            }
+
+            let Some(key) = part_keys.get(&part_info.index) else {
+                continue;
+            };
+            tracing::info!("requesting retrieval for part {}", part.index);
+            remote
+                .request_restore(key, retrieval.days, &retrieval.tier)
+                .await?;
+            if !partially_downloaded {
+                part.download_state = PartDownloadState::Requested {
+                    requested_at: now_unix(),
+                };
+                bytes_requested += part.size_bytes;
+            }
+        }
+        state.save(&state_path)?;
 
         // Download everything whose retrieved copy is live right now — including parts
         // left half-downloaded by an interrupted run — earliest expiry first, so copies
@@ -439,6 +516,7 @@ pub async fn restore_task<R: RemoteBackend>(
             .collect();
         downloadable.sort_by_key(|(_, expires_at)| *expires_at);
 
+        let mut parts_failed = 0usize;
         for (part_idx, _) in downloadable {
             let expected_blake3 = match state.parts.get(&part_idx) {
                 Some(part) => part.blake3.clone(),
@@ -451,7 +529,12 @@ pub async fn restore_task<R: RemoteBackend>(
 
             let enc_path = work_dir.join(format!("part-{}.age", part_idx));
             tracing::info!("downloading part {}", part_idx);
-            download_part_with_resume(
+            // Draining a wave can take hours to days, so a copy that was Ready at the
+            // status check may expire before its turn, and transient network failures can
+            // hit any part. Neither should abandon the parts that are still downloadable;
+            // the failed part's progress is already persisted chunk-by-chunk and the next
+            // run picks it up again.
+            if let Err(e) = download_part_with_resume(
                 remote,
                 &key,
                 part_chunk_size() as u64,
@@ -460,7 +543,16 @@ pub async fn restore_task<R: RemoteBackend>(
                 &part_idx,
                 &state_path,
             )
-            .await?;
+            .await
+            {
+                tracing::warn!(
+                    "download of part {} failed, continuing with remaining parts: {}",
+                    part_idx,
+                    e
+                );
+                parts_failed += 1;
+                continue;
+            }
 
             let actual_hash = blake3_file(&enc_path).await?;
             if actual_hash != expected_blake3 {
@@ -483,50 +575,6 @@ pub async fn restore_task<R: RemoteBackend>(
             state.save(&state_path)?;
         }
 
-        // Request retrievals for parts whose live status is NotRequested: partially
-        // downloaded parts whose copy expired are re-requested unconditionally (their
-        // bytes are already invested; the resume offset stays valid since the object is
-        // immutable), the rest budget-gated to `buffer_target`.
-        let mut bytes_requested = 0u64;
-        for part_info in &backup.parts {
-            let Some(detail) = live.get(&part_info.index) else {
-                continue;
-            };
-            if detail.status != RestoreStatus::NotRequested {
-                continue;
-            }
-            let Some(part) = state.parts.get_mut(&part_info.index) else {
-                continue;
-            };
-            if matches!(part.download_state, PartDownloadState::Downloaded) {
-                continue;
-            }
-            let partially_downloaded = matches!(
-                part.download_state,
-                PartDownloadState::PartiallyDownloaded { .. }
-            );
-            if !partially_downloaded
-                && total_buffered + bytes_requested + part.size_bytes > buffer_target
-            {
-                continue;
-            }
-
-            let Some(key) = part_keys.get(&part_info.index) else {
-                continue;
-            };
-            tracing::info!("requesting retrieval for part {}", part.index);
-            remote
-                .request_restore(key, retrieval.days, &retrieval.tier)
-                .await?;
-            if !partially_downloaded {
-                part.download_state = PartDownloadState::Requested {
-                    requested_at: now_unix(),
-                };
-                bytes_requested += part.size_bytes;
-            }
-        }
-        state.save(&state_path)?;
-
         // Check if all parts are downloaded
         let parts_total = state.parts.len();
         let parts_downloaded = state
@@ -543,9 +591,10 @@ pub async fn restore_task<R: RemoteBackend>(
                 .map(|p| p.size_bytes)
                 .sum();
             tracing::info!(
-                "waiting for retrievals: {}/{} parts downloaded, {} bytes ready, {} bytes in progress",
+                "waiting for retrievals: {}/{} parts downloaded, {} download failures this run, {} bytes ready, {} bytes in progress",
                 parts_downloaded,
                 parts_total,
+                parts_failed,
                 ready_bytes,
                 in_progress_bytes,
             );

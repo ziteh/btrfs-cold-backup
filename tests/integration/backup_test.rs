@@ -10,8 +10,6 @@ use btrfs_cold_backup::{
     restore::restore_task,
 };
 use mockall::mock;
-#[cfg(target_os = "linux")]
-use secrecy::ExposeSecret;
 use tokio::io::AsyncRead;
 
 mock! {
@@ -261,102 +259,6 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
         result.is_err(),
         "should fail when parent snapshot missing locally"
     );
-}
-
-/// Restore flow: download, verify BLAKE3, decrypt, btrfs receive.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn restore_should_download_and_pipe_to_btrfs_receive() {
-    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
-
-    let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
-    let config = Config {
-        base_dir: work_dir.path().to_path_buf(),
-        age_public_key: identity.to_public().to_string(),
-        s3: S3Config {
-            bucket: "test-bucket".to_string(),
-            region: "us-east-1".to_string(),
-            prefix: "backups/".to_string(),
-            endpoint: String::new(),
-            storage_class: S3StorageClass {
-                manifest: "STANDARD".to_string(),
-                backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],
-            },
-            retry: S3RetryConfig::default(),
-            upload_speed_limit_kbps: 0,
-        },
-        tasks: vec![],
-    };
-    let task = movies_task();
-    let target_dir = work_dir.path().join("restore_target");
-
-    // build a real encrypted part so restore has something valid to download
-    let plaintext = b"btrfs receive payload";
-    let plain_path = work_dir.path().join("plain.bin");
-    std::fs::write(&plain_path, plaintext).unwrap();
-    let plaintext_hash = btrfs_cold_backup::blake3_file(&plain_path).await.unwrap();
-
-    let encrypted_path = work_dir.path().join("part-1.age");
-    btrfs_cold_backup::encrypt_file(
-        &plain_path,
-        &encrypted_path,
-        &identity.to_public().to_string(),
-    )
-    .await
-    .unwrap();
-    let encrypted_bytes = std::fs::read(&encrypted_path).unwrap();
-    let encrypted_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
-        .await
-        .unwrap();
-
-    let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
-        level: 0,
-        snapshot_name: "bcb_level0.20260602T1430".to_string(),
-        parent_snapshot: None,
-        created_at: 0,
-        system: SystemInfo::default(),
-        age_public_key: String::new(),
-        total_size_bytes: encrypted_bytes.len() as u64,
-        blake3: plaintext_hash,
-        parts: vec![PartInfo {
-            index: "000000".to_string(),
-            size_bytes: encrypted_bytes.len() as u64,
-            blake3: encrypted_hash,
-        }],
-    };
-    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
-        .unwrap()
-        .into_bytes();
-
-    let encrypted_bytes_clone = encrypted_bytes.clone();
-    let mut remote = MockRemote::new();
-    remote
-        .expect_download()
-        .withf(|key| key.contains("task_manifest"))
-        .returning(move |_| Ok(manifest_yaml.clone()));
-    remote
-        .expect_download_to_file()
-        .withf(|key, _| key.contains("snapshot.part"))
-        .returning(move |_, path| {
-            std::fs::write(path, &encrypted_bytes_clone)?;
-            Ok(())
-        });
-
-    let private_key_secret = identity.to_string();
-    let result = restore_task(
-        &config,
-        &task,
-        0,
-        "20260602",
-        &target_dir,
-        private_key_secret.expose_secret(),
-        &retrieval(),
-        &remote,
-    )
-    .await;
-    assert!(result.is_ok(), "restore should succeed: {result:?}");
 }
 
 /// Restore must abort early when BLAKE3 hash does not match.
@@ -938,9 +840,12 @@ async fn resume_after_stream_verified_should_retry_receive_not_silently_succeed(
             expires_at: None,
         })
     });
+    // Exactly once across both runs: the second run must reuse the manifest cached in the
+    // work dir instead of re-fetching it from S3 (whose retrieved copy may have expired).
     remote
         .expect_download()
         .withf(|key| key.contains("task_manifest"))
+        .times(1)
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_download_range_to_file()
@@ -1132,4 +1037,274 @@ async fn restore_should_resume_partially_downloaded_part() {
         "resumed part must reach Downloaded"
     );
     assert!(state.stream_verified, "stream must verify after resume");
+}
+
+/// Regression test for retrieval/download pipelining: the run that drains a ready wave
+/// must also request the next wave in the same run. Counting the ready (about-to-be-
+/// downloaded) bytes against the request budget used to leave the budget "full", so no
+/// new retrievals went out until a later run — serializing every cycle into
+/// download-then-wait instead of overlapping the two.
+#[tokio::test]
+async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    use secrecy::ExposeSecret;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let identity = age::x25519::Identity::generate();
+    let mut config = test_config(work_dir.path());
+    // 1 KiB/s expected download; lead_days chosen so the buffer target is 15 bytes —
+    // room for exactly one of the two 10-byte archived parts below.
+    config.s3.restore = RestoreConfig {
+        expected_download_kbps: 1,
+        lead_days: Some(15.0 / (1024.0 * 86400.0)),
+        ..RestoreConfig::default()
+    };
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    // Part 000000 is Ready with real content (this run downloads it); 000001 and 000002
+    // are still archived and compete for the 15-byte request budget.
+    let plain_path = work_dir.path().join("plain.bin");
+    std::fs::write(&plain_path, b"stream payload").unwrap();
+    let encrypted_path = work_dir.path().join("part.age");
+    btrfs_cold_backup::encrypt_file(
+        &plain_path,
+        &encrypted_path,
+        &identity.to_public().to_string(),
+    )
+    .await
+    .unwrap();
+    let encrypted_bytes = std::fs::read(&encrypted_path).unwrap();
+    let encrypted_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
+        .await
+        .unwrap();
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: encrypted_bytes.len() as u64 + 20,
+        blake3: "stream_hash_not_reached".to_string(),
+        parts: vec![
+            PartInfo {
+                index: "000000".to_string(),
+                size_bytes: encrypted_bytes.len() as u64,
+                blake3: encrypted_hash,
+            },
+            PartInfo {
+                index: "000001".to_string(),
+                size_bytes: 10,
+                blake3: "h1".to_string(),
+            },
+            PartInfo {
+                index: "000002".to_string(),
+                size_bytes: 10,
+                blake3: "h2".to_string(),
+            },
+        ],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|key| {
+        let status = if key.contains("task_manifest") || key.contains("000000") {
+            RestoreStatus::Ready
+        } else {
+            RestoreStatus::NotRequested
+        };
+        Ok(RestoreStatusDetail {
+            status,
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    remote
+        .expect_download_range_to_file()
+        .withf(|key, _, _, _| key.contains("000000"))
+        .returning(move |_, _, _, path| {
+            std::fs::write(path, &encrypted_bytes)?;
+            Ok(())
+        });
+    // Only 000001 fits the budget; requesting 000002 as well would blow past it, and
+    // requesting nothing would mean ready bytes were wrongly counted against the budget.
+    remote
+        .expect_request_restore()
+        .withf(|key, _, _| key.contains("000001"))
+        .times(1)
+        .returning(|_, _, _| Ok(()));
+
+    let private_key = identity.to_string();
+    let progress = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        private_key.expose_secret(),
+        &RetrievalOptions {
+            days: 2,
+            tier: "Standard".to_string(),
+        },
+        &remote,
+    )
+    .await
+    .expect("partial progress must not be an error");
+
+    assert!(!progress.completed);
+    assert_eq!(progress.parts_downloaded, 1);
+    assert_eq!(progress.parts_total, 3);
+}
+
+/// One part's download failing mid-run (expired copy, transient network error) must not
+/// abandon the parts that are still downloadable: the run keeps going, saves what it can,
+/// and reports in-progress so the scheduler retries — not exit-1 fatal.
+#[tokio::test]
+async fn part_download_failure_should_not_abort_remaining_parts() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    use secrecy::ExposeSecret;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let identity = age::x25519::Identity::generate();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let plain_path = work_dir.path().join("plain.bin");
+    std::fs::write(&plain_path, b"stream payload").unwrap();
+    let encrypted_path = work_dir.path().join("part.age");
+    btrfs_cold_backup::encrypt_file(
+        &plain_path,
+        &encrypted_path,
+        &identity.to_public().to_string(),
+    )
+    .await
+    .unwrap();
+    let encrypted_bytes = std::fs::read(&encrypted_path).unwrap();
+    let encrypted_hash = btrfs_cold_backup::blake3_file(&encrypted_path)
+        .await
+        .unwrap();
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: encrypted_bytes.len() as u64 + 10,
+        blake3: "stream_hash_not_reached".to_string(),
+        parts: vec![
+            PartInfo {
+                index: "000000".to_string(),
+                size_bytes: 10,
+                blake3: "h0".to_string(),
+            },
+            PartInfo {
+                index: "000001".to_string(),
+                size_bytes: encrypted_bytes.len() as u64,
+                blake3: encrypted_hash,
+            },
+        ],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|_| {
+        Ok(RestoreStatusDetail {
+            status: RestoreStatus::Ready,
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    remote
+        .expect_download_range_to_file()
+        .withf(|key, _, _, _| key.contains("000000"))
+        .returning(|_, _, _, _| Err(anyhow::anyhow!("connection lost")));
+    remote
+        .expect_download_range_to_file()
+        .withf(|key, _, _, _| key.contains("000001"))
+        .times(1)
+        .returning(move |_, _, _, path| {
+            std::fs::write(path, &encrypted_bytes)?;
+            Ok(())
+        });
+
+    let private_key = identity.to_string();
+    let progress = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        private_key.expose_secret(),
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect("one failed part must not fail the run");
+
+    assert!(!progress.completed);
+    assert_eq!(
+        progress.parts_downloaded, 1,
+        "the healthy part must still be downloaded"
+    );
+    assert_eq!(progress.parts_total, 2);
+}
+
+/// With pacing enabled, retrieved copies must live long enough for the paced download to
+/// reach them; otherwise every wave tail expires and gets re-requested at full per-GB
+/// retrieval cost. Such a configuration must be rejected before any S3 call is made.
+#[tokio::test]
+async fn restore_days_shorter_than_lead_window_should_be_rejected_before_any_s3_call() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(work_dir.path());
+    config.s3.restore = RestoreConfig {
+        expected_download_kbps: 1024,
+        lead_days: None,
+        ..RestoreConfig::default()
+    };
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    // No expectations registered: any S3 call at all is itself a test failure
+    // (mockall panics on an unmatched call).
+    let remote = MockRemote::new();
+
+    // Bulk tier defaults to a multi-day lead window; 3 days of copy lifetime cannot
+    // cover it.
+    let err = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        "AGE-SECRET-KEY-1FAKE",
+        &RetrievalOptions {
+            days: 3,
+            tier: "Bulk".to_string(),
+        },
+        &remote,
+    )
+    .await
+    .expect_err("insufficient restore-days must be rejected");
+
+    assert!(
+        err.to_string().contains("restore-days"),
+        "unexpected error: {err}"
+    );
 }
