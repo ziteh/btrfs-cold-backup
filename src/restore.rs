@@ -472,6 +472,9 @@ pub async fn restore_task<R: RemoteBackend>(
         // parts whose copy expired are re-requested unconditionally (their bytes are
         // already invested; the resume offset stays valid since the object is immutable).
         let mut bytes_requested = 0u64;
+        // Parts skipped purely because the budget was full, in case nothing else this run
+        // ends up ready, in progress, or requested (see the stall-avoidance fallback below).
+        let mut skipped_by_budget: Vec<String> = Vec::new();
         for part_info in &backup.parts {
             let Some(detail) = live.get(&part_info.index) else {
                 continue;
@@ -492,6 +495,7 @@ pub async fn restore_task<R: RemoteBackend>(
             if !partially_downloaded
                 && in_progress_bytes + bytes_requested + part.size_bytes > buffer_target
             {
+                skipped_by_budget.push(part_info.index.clone());
                 continue;
             }
 
@@ -507,6 +511,33 @@ pub async fn restore_task<R: RemoteBackend>(
                     requested_at: now_unix(),
                 };
                 bytes_requested += part.size_bytes;
+            }
+        }
+
+        // If the budget is smaller than every remaining part, the loop above skips all of
+        // them every run: nothing is ever ready, in progress, or requested, so the restore
+        // would report "in progress" forever without ever advancing. Force through the
+        // smallest skipped part regardless of budget so each run makes some progress.
+        if bytes_requested == 0 && ready_bytes == 0 && in_progress_bytes == 0 {
+            let smallest = skipped_by_budget
+                .iter()
+                .filter_map(|index| state.parts.get(index).map(|p| (index.clone(), p.size_bytes)))
+                .min_by_key(|(_, size)| *size);
+            if let Some((index, _)) = smallest
+                && let Some(key) = part_keys.get(&index)
+            {
+                tracing::warn!(
+                    "restore budget is smaller than any remaining part; forcing retrieval of \
+                     part {index} to avoid stalling forever"
+                );
+                remote
+                    .request_restore(key, retrieval.days, &retrieval.tier)
+                    .await?;
+                if let Some(part) = state.parts.get_mut(&index) {
+                    part.download_state = PartDownloadState::Requested {
+                        requested_at: now_unix(),
+                    };
+                }
             }
         }
         state.save(&state_path)?;

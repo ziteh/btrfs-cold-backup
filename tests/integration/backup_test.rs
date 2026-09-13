@@ -1221,6 +1221,92 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
     assert_eq!(progress.parts_total, 3);
 }
 
+/// Regression test for the "budget smaller than any part" stall: when the configured pacing
+/// budget can't cover even one remaining part, the plain budget gate would skip every part
+/// forever — nothing ready, nothing in progress, nothing requested — and the restore would
+/// report "in progress" on every run without ever advancing. The gate must force the
+/// smallest skipped part through regardless of budget so the run always makes progress.
+#[tokio::test]
+async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_of_stalling() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(work_dir.path());
+    // 1 KiB/s expected download with a tiny lead_days: buffer_target computes to about 1
+    // byte, far under the 10-byte part below, so the plain budget check skips it forever.
+    config.s3.restore = RestoreConfig {
+        expected_download_kbps: 1,
+        lead_days: Some(1.0 / (1024.0 * 86400.0)),
+        ..RestoreConfig::default()
+    };
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: 10,
+        blake3: "irrelevant".to_string(),
+        parts: vec![PartInfo {
+            index: "000000".to_string(),
+            size_bytes: 10,
+            blake3: "h0".to_string(),
+        }],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|key| {
+        let status = if key.contains("task_manifest") {
+            RestoreStatus::Ready
+        } else {
+            RestoreStatus::NotRequested
+        };
+        Ok(RestoreStatusDetail {
+            status,
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    // Despite the budget being far smaller than the part, exactly one request must go out —
+    // not zero (the stall) and not a loop requesting it repeatedly within the same run.
+    remote
+        .expect_request_restore()
+        .withf(|key, _, _| key.contains("000000"))
+        .times(1)
+        .returning(|_, _, _| Ok(()));
+
+    let progress = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        "AGE-SECRET-KEY-1FAKE",
+        &RetrievalOptions {
+            days: 2,
+            tier: "Standard".to_string(),
+        },
+        &remote,
+    )
+    .await
+    .expect("must report progress, not stall or error");
+
+    assert!(!progress.completed);
+    assert_eq!(progress.parts_downloaded, 0);
+    assert_eq!(progress.parts_total, 1);
+}
+
 /// One part's download failing mid-run (expired copy, transient network error) must not
 /// abandon the parts that are still downloadable: the run keeps going, saves what it can,
 /// and reports in-progress so the scheduler retries — not exit-1 fatal.
