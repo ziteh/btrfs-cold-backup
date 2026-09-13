@@ -132,10 +132,37 @@ On failure the script exits non-zero before pruning, and re-running is safe: an 
 ; /etc/systemd/system/bcb-backup@.service
 [Unit]
 Description=bcb backup level %i
+OnFailure=bcb-notify-failure@%n.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/bcb-run %i
+```
+
+`OnFailure=` only fires when the unit actually ran and failed — it can't catch a timer that
+never fired at all (disabled, machine off past `Persistent=true`'s catch-up window, or a full
+disk that keeps `bcb` from starting). A silently-stopped backup schedule reports no failure
+and no error, so also set up a positive liveness signal — e.g. a dead man's switch
+(`curl` a healthchecks.io-style URL at the end of a successful `bcb-run`) that alerts you
+when it *stops* hearing from the job, rather than only reacting to failures it's told about.
+
+```ini
+; /etc/systemd/system/bcb-notify-failure@.service
+[Unit]
+Description=Notify bcb failure for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bcb-notify %i
+```
+
+`/usr/local/sbin/bcb-notify` forwards the failed unit's recent log to wherever you want to
+hear about it (mail, ntfy, a webhook):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+journalctl -u "$1" -n 50 --no-pager | mail -s "bcb failure: $1" ops@example.com
 ```
 
 ```ini
@@ -162,7 +189,7 @@ WantedBy=timers.target
 sudo systemctl enable --now bcb-backup@0.timer bcb-backup@1.timer
 ```
 
-`Persistent=true` catches up on schedules missed while powered off. Runs are logged in `journalctl -u 'bcb-backup@*'` and in `<base_dir>/log/`.
+`Persistent=true` catches up on schedules missed while powered off. Runs are logged in `journalctl -u 'bcb-backup@*'` and in `<base_dir>/log/`; failure notifications land in `journalctl -u 'bcb-notify-failure@*'`.
 
 Notes:
 
@@ -173,6 +200,8 @@ Notes:
 ## Restoring
 
 Objects in S3 `GLACIER` (including `DEEP_ARCHIVE`) storage classes cannot be downloaded directly; they must be retrieved first, which takes hours. `bcb restore` works incrementally: each run requests retrieval for the next batch, then downloads whatever parts are currently retrievable (resuming interrupted downloads from where they stopped), and exits — AWS prepares the next batch while the current one downloads. Re-run the same command until it prints `restore complete` — exit code 2 means "in progress, run again later", so a scheduler can just retry until exit 0. A part whose download fails mid-run (expired copy, network drop) is logged and skipped rather than failing the run; the next run picks it up.
+
+If you wrap a periodic restore retry in a systemd timer/service the same way as the backup jobs above, add `SuccessExitStatus=2` to its `[Service]` section — otherwise systemd treats every still-in-progress run as a failure and `OnFailure=` fires on every single retry instead of only on a genuine error.
 
 `--restore-tier` and `--restore-days` control the retrieval speed/cost and how long each retrieved copy stays downloadable. On slow connections, set `s3.restore.expected_download_kbps` in the config so retrievals are paced to what you can actually download before the copies expire (instead of requesting everything at once); `s3.restore.lead_days` overrides how much download-time worth of parts to keep retrievable ahead. With pacing enabled, `--restore-days` must exceed the lead window by at least a day, or copies would expire before the download budget reaches them — `bcb` rejects such a configuration up front.
 
@@ -210,7 +239,7 @@ bash scripts/run-vm-tests.sh
 ## TODO
 
 - [x] CI (GitHub Actions: test, clippy, fmt)
-- [ ] Failure alerting (e.g. systemd OnFailure= notification unit)
+- [x] Failure alerting (e.g. systemd OnFailure= notification unit)
 - [ ] Release packaging
 - [ ] Parallel part encryption/upload (worker pool)
 - [ ] Protect parent snapshots of incremental chains from deletion (no btrfs equivalent of `zfs hold`; likely needs a check against btrbk retention)
