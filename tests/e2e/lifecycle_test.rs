@@ -20,12 +20,26 @@ struct E2eEnv {
     s3_bucket: String,
 }
 
-/// Returns the e2e env from env vars, or None to skip the test.
+/// Returns the e2e env from env vars, or None to skip the test. `cargo test` reports a
+/// skipped test identically to a real pass ("ok"); run with `-- --nocapture` to see this
+/// skip reason instead of silently trusting a green "N passed".
 fn e2e_env() -> Option<E2eEnv> {
+    let btrfs_mount = std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from);
+    let s3_endpoint = std::env::var("BCB_S3_ENDPOINT").ok();
+    let s3_bucket = std::env::var("BCB_S3_BUCKET").ok();
+    let (Some(btrfs_mount), Some(s3_endpoint), Some(s3_bucket)) =
+        (btrfs_mount, s3_endpoint, s3_bucket)
+    else {
+        eprintln!(
+            "skipping e2e test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET not set \
+             (run via scripts/run-vm-tests.sh)"
+        );
+        return None;
+    };
     Some(E2eEnv {
-        btrfs_mount: std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from)?,
-        s3_endpoint: std::env::var("BCB_S3_ENDPOINT").ok()?,
-        s3_bucket: std::env::var("BCB_S3_BUCKET").ok()?,
+        btrfs_mount,
+        s3_endpoint,
+        s3_bucket,
     })
 }
 

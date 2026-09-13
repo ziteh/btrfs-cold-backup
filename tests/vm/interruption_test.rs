@@ -15,13 +15,28 @@ pub(crate) struct VmEnv {
     pub(crate) bin_path: PathBuf,
 }
 
-/// Returns the VM env from env vars, or None to skip the test.
+/// Returns the VM env from env vars, or None to skip the test. `cargo test` reports a
+/// skipped test identically to a real pass ("ok"); run with `-- --nocapture` to see this
+/// skip reason instead of silently trusting a green "N passed".
 pub(crate) fn vm_env() -> Option<VmEnv> {
+    let btrfs_mount = std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from);
+    let s3_endpoint = std::env::var("BCB_S3_ENDPOINT").ok();
+    let s3_bucket = std::env::var("BCB_S3_BUCKET").ok();
+    let bin_path = std::env::var("BCB_BIN_PATH").ok().map(PathBuf::from);
+    let (Some(btrfs_mount), Some(s3_endpoint), Some(s3_bucket), Some(bin_path)) =
+        (btrfs_mount, s3_endpoint, s3_bucket, bin_path)
+    else {
+        eprintln!(
+            "skipping VM test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET / \
+             BCB_BIN_PATH not set (run via scripts/run-vm-tests.sh)"
+        );
+        return None;
+    };
     Some(VmEnv {
-        btrfs_mount: std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from)?,
-        s3_endpoint: std::env::var("BCB_S3_ENDPOINT").ok()?,
-        s3_bucket: std::env::var("BCB_S3_BUCKET").ok()?,
-        bin_path: std::env::var("BCB_BIN_PATH").ok().map(PathBuf::from)?,
+        btrfs_mount,
+        s3_endpoint,
+        s3_bucket,
+        bin_path,
     })
 }
 

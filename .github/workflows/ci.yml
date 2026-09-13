@@ -28,4 +28,6 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        # --nocapture so the e2e/vm suites' "skipping: BCB_BTRFS_MOUNT not set" messages show
+        # up in the CI log — otherwise a skipped test and a real pass both just print "ok".
+        run: cargo test -- --nocapture

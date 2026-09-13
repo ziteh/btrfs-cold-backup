@@ -194,6 +194,11 @@ Be careful that lifecycle rules must not expire a backup that later incremental 
 cargo test
 ```
 
+The e2e and VM suites below are compiled into this same `cargo test` run, but each test skips
+itself (reporting "ok" either way) when its required environment variables aren't set —
+run with `cargo test -- --nocapture` to see the "skipping: ..." messages that distinguish an
+actual pass from a skip.
+
 **E2E:**
 
 Requires Docker and [Multipass](https://multipass.run). The script creates and setup the VM on first run.

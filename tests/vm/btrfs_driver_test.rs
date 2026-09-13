@@ -4,9 +4,17 @@ use std::process::Command;
 use btrfs_cold_backup::{BtrfsDriver, BtrfsOps};
 use tokio::io::AsyncReadExt;
 
-/// Returns the btrfs test mount path from BCB_BTRFS_MOUNT, or None to skip.
+/// Returns the btrfs test mount path from BCB_BTRFS_MOUNT, or None to skip. `cargo test`
+/// reports a skipped test identically to a real pass ("ok"); run with `-- --nocapture` to
+/// see this skip reason instead of silently trusting a green "N passed".
 fn btrfs_mount() -> Option<PathBuf> {
-    std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from)
+    let mount = std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from);
+    if mount.is_none() {
+        eprintln!(
+            "skipping btrfs driver test: BCB_BTRFS_MOUNT not set (run via scripts/run-vm-tests.sh)"
+        );
+    }
+    mount
 }
 
 /// Creates a unique working directory under the btrfs mount for one test.
