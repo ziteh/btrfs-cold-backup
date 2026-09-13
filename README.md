@@ -66,7 +66,7 @@ Snapshots must follow btrbk's naming with `snapshot_name bcb_level<N>` and `time
 bcb_level<N>.<YYYYMMDD>T<hhmm>
 ```
 
-For example `bcb_level1.20261231T2359` (btrbk's same-minute collision suffix `_<n>` is also accepted).
+For example `bcb_level1.20261231T2359` (btrbk's same-minute collision suffix `_<n>` is also accepted, and gets its own S3 key distinct from the non-suffixed snapshot; to restore it, append the same suffix to `bcb restore --date`, e.g. `--date 202606021430_1`).
 
 For each level, `bcb backup --level N` picks the newest matching snapshot. A level-N (N > 0) backup requires the level-(N-1) parent snapshot recorded in the last backup to still exist locally, and the level-N snapshot must be newer than that parent.
 

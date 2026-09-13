@@ -56,6 +56,9 @@ pub struct BackupState {
     pub level: u32,
     pub snapshot_name: String,
     pub parent_snapshot: Option<String>,
+    /// btrbk's same-minute collision counter (e.g. "1" for `_1`), if the snapshot has one.
+    #[serde(default)]
+    pub collision_suffix: Option<String>,
     pub timestamp: String,
     pub output_dir: PathBuf,
     pub stream_hash: Option<String>,
@@ -272,6 +275,7 @@ mod tests {
             level: 0,
             snapshot_name: "bcb_level0.20260602T1430".to_string(),
             parent_snapshot: None,
+            collision_suffix: None,
             timestamp: "2026-06-02T14:30:00Z".to_string(),
             output_dir: PathBuf::from("/var/lib/bcb/task/mnt_data/bcb_level0_20260602"),
             stream_hash: Some("abc123".to_string()),
@@ -316,6 +320,7 @@ mod tests {
             level: 1,
             snapshot_name: "bcb_level1.20260602T1430".to_string(),
             parent_snapshot: Some("bcb_level0.20260601T1000".to_string()),
+            collision_suffix: None,
             timestamp: "2026-06-02T14:30:00Z".to_string(),
             output_dir: PathBuf::from("/tmp/bcb/task/mnt/bcb_level1_20260602"),
             stream_hash: Some("streamhash".to_string()),
