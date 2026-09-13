@@ -204,7 +204,7 @@ bash scripts/run-vm-tests.sh
 
 ## TODO
 
-- [ ] CI (GitHub Actions: test, clippy, fmt)
+- [x] CI (GitHub Actions: test, clippy, fmt)
 - [ ] Failure alerting (e.g. systemd OnFailure= notification unit)
 - [ ] Release packaging
 - [ ] Parallel part encryption/upload (worker pool)
