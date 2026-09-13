@@ -406,6 +406,103 @@ async fn collision_suffixed_snapshot_should_get_its_own_key_not_be_silently_skip
     assert_eq!(backup.snapshot_name, "bcb_level0.20260602T1430_1");
 }
 
+/// Regression test: completing a new level-0 backup must drop any deeper level's entry from
+/// the last-backup manifest. Those entries point at an incremental chain built on the
+/// snapshot this run just superseded; left in place, a later level-N (N > 0) backup could
+/// silently chain onto a stale parent instead of failing loudly and asking for a fresh one.
+#[tokio::test]
+async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_last_manifest() {
+    use std::sync::{Arc, Mutex};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+
+    let mut btrfs = MockBtrfs::new();
+    btrfs
+        .expect_list_snapshots()
+        .returning(|_| Ok(vec!["bcb_level0.20260701T0100".to_string()]));
+    btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
+
+    // Existing last manifest carries stale level 1 and level 2 entries from an older chain.
+    let mut stale_last = Last::new();
+    stale_last.insert(
+        0,
+        LastEntry {
+            timestamp: "2026-01-01T01:00:00Z".to_string(),
+            snapshot_name: "bcb_level0.20260101T0100".to_string(),
+        },
+    );
+    stale_last.insert(
+        1,
+        LastEntry {
+            timestamp: "2026-01-07T03:00:00Z".to_string(),
+            snapshot_name: "bcb_level1.20260107T0300".to_string(),
+        },
+    );
+    stale_last.insert(
+        2,
+        LastEntry {
+            timestamp: "2026-01-14T03:00:00Z".to_string(),
+            snapshot_name: "bcb_level2.20260114T0300".to_string(),
+        },
+    );
+    let stale_last_yaml = serde_yaml::to_string(&stale_last).unwrap().into_bytes();
+
+    let uploaded_last: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let uploaded_last_clone = uploaded_last.clone();
+
+    let mut remote = MockRemote::new();
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(|_| Ok(false));
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(|_| Ok(true));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(move |_| Ok(stale_last_yaml.clone()));
+    remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_upload_bytes()
+        .withf(|key, _, _, _| key.contains("task_manifest"))
+        .returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_upload_bytes()
+        .withf(|key, _, _, _| key.contains("last_backup_manifest"))
+        .returning(move |_, data, _, _| {
+            *uploaded_last_clone.lock().unwrap() = Some(data);
+            Ok(())
+        });
+
+    let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
+    result
+        .expect("level 0 backup should succeed")
+        .expect("must not be skipped");
+
+    let uploaded_bytes = uploaded_last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("last manifest must be re-uploaded");
+    let uploaded: Last = serde_yaml::from_slice(&uploaded_bytes).unwrap();
+    assert!(
+        uploaded.contains_key(&0),
+        "new level 0 entry must be present"
+    );
+    assert!(
+        !uploaded.contains_key(&1),
+        "stale level 1 entry must be pruned after a new level 0 backup"
+    );
+    assert!(
+        !uploaded.contains_key(&2),
+        "stale level 2 entry must be pruned after a new level 0 backup"
+    );
+}
+
 /// A level-N snapshot older than its recorded parent means the snapshot is stale; the
 /// incremental chain would be semantically wrong, so backup must refuse.
 #[tokio::test]

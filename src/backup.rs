@@ -560,6 +560,11 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     } else {
         Last::default()
     };
+    // A fresh level-N backup invalidates every deeper level's incremental chain (they were
+    // built on the level-N snapshot this run just superseded); drop them so the next run of
+    // a deeper level fails loudly asking for a fresh parent, instead of silently chaining
+    // onto a since-superseded snapshot that may no longer even be retained.
+    last.retain(|&existing_level, _| existing_level <= level);
     last.insert(
         level,
         LastEntry {
