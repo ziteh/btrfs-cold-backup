@@ -168,6 +168,41 @@ fn spawn_bcb_backup(
     cmd.spawn().expect("failed to spawn bcb")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_bcb_restore(
+    env: &VmEnv,
+    config_path: &Path,
+    task: &str,
+    level: u32,
+    date: &str,
+    target: &Path,
+    private_key_path: &Path,
+    extra_env: &[(&str, &str)],
+) -> Child {
+    let mut cmd = Command::new(&env.bin_path);
+    cmd.args([
+        "--config",
+        config_path.to_str().unwrap(),
+        "restore",
+        "--task",
+        task,
+        "--level",
+        &level.to_string(),
+        "--date",
+        date,
+        "--target",
+        target.to_str().unwrap(),
+        "--private-key",
+        private_key_path.to_str().unwrap(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("failed to spawn bcb")
+}
+
 pub(crate) fn run_bcb(env: &VmEnv, args: &[&str]) -> std::process::Output {
     Command::new(&env.bin_path)
         .args(args)
@@ -543,4 +578,139 @@ async fn kill_leaves_stale_lock_then_resume_should_not_error_on_lock_contention(
         "resumed backup should not fail on stale lock contention: {}",
         String::from_utf8_lossy(&resumed.stderr)
     );
+}
+
+/// Killing bcb mid-chunk-download during a restore must leave a resumable state: the next
+/// run resumes from the saved byte offset (verified directly from bcb's on-disk restore
+/// state) rather than re-downloading the part from scratch, and the restored content still
+/// matches the original exactly.
+#[tokio::test]
+async fn kill_during_restore_download_then_resume_should_recover_partial_download() {
+    let Some(env) = vm_env() else { return };
+    let fixture = setup_fixture(&env, "restore-kill", |subvol| {
+        // Large enough that a 1 MiB test chunk size leaves more than one chunk to fetch.
+        let status = Command::new("dd")
+            .args([
+                "if=/dev/urandom",
+                &format!("of={}", subvol.join("bigfile.bin").to_str().unwrap()),
+                "bs=1M",
+                "count=10",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    });
+
+    let backup = run_bcb(
+        &env,
+        &[
+            "--config",
+            fixture.config_path.to_str().unwrap(),
+            "backup",
+            "--level",
+            "0",
+            "--task",
+            &fixture.task_name,
+        ],
+    );
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    let chunk_size: u64 = 1024 * 1024;
+    let mut child = spawn_bcb_restore(
+        &env,
+        &fixture.config_path,
+        &fixture.task_name,
+        0,
+        "20260601",
+        &fixture.restore_dir,
+        &fixture.private_key_path,
+        &[
+            ("BCB_TEST_PART_CHUNK_SIZE", &chunk_size.to_string()),
+            (
+                "BCB_TEST_PAUSE_AFTER_DOWNLOADED_BYTES",
+                &chunk_size.to_string(),
+            ),
+        ],
+    );
+    assert!(
+        wait_for_marker(
+            &mut child,
+            &format!("BCB_TEST_PAUSE_REACHED:downloaded_bytes:{chunk_size}"),
+            Duration::from_secs(60)
+        ),
+        "bcb never reached the mid-download pause point"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    // bcb's restore work dir is named deterministically from task/level/timestamp; read its
+    // state directly (real file, no mocking involved) to confirm the kill actually landed
+    // mid-part rather than after it had already finished.
+    let restore_work_dir = fixture.work_dir.join(format!(
+        "restore-{}-level0-2026-06-01T00:00:00Z",
+        fixture.task_name
+    ));
+    let state: btrfs_cold_backup::RestoreState = serde_yaml::from_str(
+        &std::fs::read_to_string(restore_work_dir.join("restore-state.yaml")).unwrap(),
+    )
+    .unwrap();
+    let part_state = state
+        .parts
+        .values()
+        .next()
+        .expect("restore state must have at least one part");
+    assert_eq!(
+        part_state.download_state,
+        btrfs_cold_backup::PartDownloadState::PartiallyDownloaded {
+            downloaded_bytes: chunk_size
+        },
+        "state must reflect exactly one chunk downloaded when killed"
+    );
+
+    let resumed = run_bcb(
+        &env,
+        &[
+            "--config",
+            fixture.config_path.to_str().unwrap(),
+            "restore",
+            "--task",
+            &fixture.task_name,
+            "--level",
+            "0",
+            "--date",
+            "20260601",
+            "--target",
+            fixture.restore_dir.to_str().unwrap(),
+            "--private-key",
+            fixture.private_key_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        resumed.status.success(),
+        "resumed restore failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&resumed.stdout).contains("restore complete"),
+        "resumed restore must report completion: {}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+    assert!(
+        !restore_work_dir.exists(),
+        "restore work dir must be cleaned up after a completed restore"
+    );
+
+    let original = std::fs::read(fixture.subvol.join("bigfile.bin")).unwrap();
+    let recovered = std::fs::read(
+        fixture
+            .restore_dir
+            .join("bcb_level0.20260601T0000")
+            .join("bigfile.bin"),
+    )
+    .unwrap();
+    assert_eq!(original, recovered, "restored content must match source");
 }

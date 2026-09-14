@@ -29,6 +29,25 @@ fn part_chunk_size() -> usize {
     64 * 1024 * 1024
 }
 
+// Test-only pause point: parks here right after a chunk's progress is saved (so the on-disk
+// state and file both reflect exactly `downloaded` bytes) so the VM e2e suite can SIGKILL bcb
+// at a deterministic point to exercise resuming a partially-downloaded part, instead of
+// racing on sleep timing.
+#[cfg(debug_assertions)]
+async fn test_pause_after_downloaded_bytes(downloaded: u64) {
+    if let Ok(target) = std::env::var("BCB_TEST_PAUSE_AFTER_DOWNLOADED_BYTES")
+        && target.parse() == Ok(downloaded)
+    {
+        use std::io::Write;
+        eprintln!("BCB_TEST_PAUSE_REACHED:downloaded_bytes:{downloaded}");
+        let _ = std::io::stderr().flush();
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn test_pause_after_downloaded_bytes(_downloaded: u64) {}
+
 /// Retrieval tier and lifetime for archived (Glacier / Deep Archive) objects.
 pub struct RetrievalOptions {
     pub days: i32,
@@ -206,6 +225,7 @@ async fn download_part_with_resume<R: RemoteBackend>(
             };
         }
         state.save(state_path)?;
+        test_pause_after_downloaded_bytes(downloaded).await;
     }
 
     if let Some(part) = state.parts.get_mut(part_index) {
