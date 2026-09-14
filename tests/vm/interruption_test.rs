@@ -486,8 +486,9 @@ async fn kill_during_send_then_resume_should_leave_no_orphan_children() {
     );
 }
 
-/// Killing bcb leaves the PID lock file holding a now-dead PID; the next run must auto-recover
-/// via PidLock::remove_stale instead of erroring out on lock contention.
+/// Killing bcb leaves the PID lock file holding a now-dead PID, but the kernel releases the
+/// flock on process death (even SIGKILL) regardless — the next run must acquire it normally
+/// rather than erroring out on lock contention, with no explicit stale-lock recovery needed.
 #[tokio::test]
 async fn kill_leaves_stale_lock_then_resume_should_not_error_on_lock_contention() {
     let Some(env) = vm_env() else { return };
