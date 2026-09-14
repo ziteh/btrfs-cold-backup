@@ -196,6 +196,7 @@ Notes:
 - Each level 1 is the cumulative delta since the last level 0 and grows over the half year; if that gets large, add a monthly level 1 and weekly level 2 instead.
 - Set bucket lifecycle expirations filtered on the `bcb-backup-level` tag (see Retention below) to at least 13 months so the current and previous chains always survive.
 - Drill restores: `bcb list` regularly, and walk a full restore on a test machine at least yearly to prove the private key and procedure work.
+- Run `bcb verify` regularly (e.g. a monthly systemd timer, wired into the same `OnFailure=` alerting as the backup jobs): it audits every backup's incremental chain, part existence and size, and storage class against S3 via HeadObject/ListObjectsV2 only, so it never triggers an archive retrieval or its cost. Pass `--max-age-days` to also flag a task whose newest backup is older than expected — the one check that can catch a schedule that silently stopped running. It complements, not replaces, an actual restore drill: it cannot detect data corrupted in a way that preserves size, nor verify the private key still works.
 
 ## Restoring
 
@@ -245,6 +246,8 @@ bash scripts/run-vm-tests.sh
 - [ ] Protect parent snapshots of incremental chains from deletion (no btrfs equivalent of `zfs hold`; likely needs a check against btrbk retention)
 - [ ] `restore --dry-run` and a `--force` passthrough for `btrfs receive`
 - [x] Resumable restore: keep downloaded parts across runs so an interrupted restore only fetches (and re-requests archive retrieval for) the missing parts
+- [x] `bcb verify`: audit chain completeness, part existence/size, storage class, and freshness without triggering an archive retrieval
+- [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents (retrieval cost/latency, so off by default; for periodic drills)
 - [ ] Add btrbk to VM for E2E testing
 
 [s3-gda]: https://aws.amazon.com/s3/storage-classes/glacier/

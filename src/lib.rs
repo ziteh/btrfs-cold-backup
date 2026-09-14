@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod remote;
 pub mod restore;
 pub mod util;
+pub mod verify;
 
 pub use btrfs::{BtrfsDriver, BtrfsOps};
 pub use config::{Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task};
@@ -21,6 +22,6 @@ pub use manifest::{
     Backup, BackupState, CompletedPart, Last, LastEntry, PartDownloadState, PartInfo,
     RestorePartState, RestoreState,
 };
-pub use remote::{RemoteBackend, RestoreStatus, RestoreStatusDetail, S3Backend};
+pub use remote::{ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, S3Backend};
 pub use restore::RetrievalOptions;
 pub use util::{sanitize_subvolume_path, state_path};

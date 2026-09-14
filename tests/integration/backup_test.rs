@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use btrfs_cold_backup::{
-    BtrfsOps, Config, RemoteBackend, RestoreConfig, RestoreStatus, RestoreStatusDetail,
-    RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, Task,
+    BtrfsOps, Config, ObjectMetadata, RemoteBackend, RestoreConfig, RestoreStatus,
+    RestoreStatusDetail, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, Task,
     backup::backup_task,
     manifest::{Last, LastEntry},
     restore::restore_task,
@@ -34,6 +34,7 @@ mock! {
         async fn download_range_to_file(&self, key: &str, start: u64, end: u64, path: &Path) -> Result<()>;
         async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
         async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
+        async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata>;
         async fn verify_credentials(&self) -> Result<()>;
         async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
     }

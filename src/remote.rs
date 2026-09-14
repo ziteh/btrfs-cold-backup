@@ -33,6 +33,14 @@ pub struct RestoreStatusDetail {
     pub expires_at: Option<i64>,
 }
 
+/// Object size and storage class, for `bcb verify`'s audit checks. A plain HeadObject with
+/// no archive-retrieval interpretation, unlike `restore_status_detail`.
+#[derive(Debug, Clone)]
+pub struct ObjectMetadata {
+    pub size_bytes: u64,
+    pub storage_class: String,
+}
+
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
 pub trait RemoteBackend: Send + Sync {
@@ -68,6 +76,9 @@ pub trait RemoteBackend: Send + Sync {
     async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
     /// Initiates an archive retrieval so the object becomes downloadable for `days`.
     async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
+    /// Returns the object's size and storage class via HeadObject, without requesting or
+    /// waiting on any archive retrieval — used by `bcb verify` to audit stored backups.
+    async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata>;
     async fn verify_credentials(&self) -> Result<()>;
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -473,6 +484,29 @@ impl RemoteBackend for S3Backend {
         };
 
         Ok(RestoreStatusDetail { status, expires_at })
+    }
+
+    async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata> {
+        let resp = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("S3 head_object failed for {key}: {e}"))?;
+
+        let size_bytes = resp.content_length().unwrap_or(0).max(0) as u64;
+        // HeadObject omits x-amz-storage-class entirely for the default STANDARD class.
+        let storage_class = resp
+            .storage_class()
+            .map(|sc| sc.as_str().to_string())
+            .unwrap_or_else(|| "STANDARD".to_string());
+
+        Ok(ObjectMetadata {
+            size_bytes,
+            storage_class,
+        })
     }
 
     async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()> {

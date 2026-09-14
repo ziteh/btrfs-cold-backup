@@ -42,6 +42,17 @@ enum Commands {
         level: Option<u32>,
     },
 
+    /// Audit backups on S3: chain completeness, part existence/size, storage class, and
+    /// (optionally) freshness. Read-only and never triggers an archive retrieval.
+    Verify {
+        /// Limit to a single task by name (default: all enabled tasks)
+        #[arg(long)]
+        task: Option<String>,
+        /// Flag the task if its newest backup is older than this many days
+        #[arg(long)]
+        max_age_days: Option<u64>,
+    },
+
     /// Run a backup
     Backup {
         #[arg(long)]
@@ -203,6 +214,38 @@ async fn main() -> Result<()> {
             }
             if !failed.is_empty() {
                 return Err(anyhow!("list failed for task(s): {}", failed.join(", ")));
+            }
+        }
+
+        Commands::Verify { task, max_age_days } => {
+            let config = Config::from_file(&cli.config)?;
+            let remote = S3Backend::new(&config.s3).await?;
+
+            let mut failed: Vec<String> = Vec::new();
+            for t in select_tasks(&config.tasks, task.as_deref()) {
+                match btrfs_cold_backup::verify::verify_task(&config, t, &remote, max_age_days)
+                    .await
+                {
+                    Ok(issues) if issues.is_empty() => {
+                        println!("{}: OK", t.name);
+                    }
+                    Ok(issues) => {
+                        for issue in &issues {
+                            println!("{}: level {}: {}", t.name, issue.level, issue.description);
+                        }
+                        failed.push(t.name.clone());
+                    }
+                    Err(e) => {
+                        eprintln!("{}: verify failed: {e:#}", t.name);
+                        failed.push(t.name.clone());
+                    }
+                }
+            }
+            if !failed.is_empty() {
+                return Err(anyhow!(
+                    "verify found issues for task(s): {}",
+                    failed.join(", ")
+                ));
             }
         }
 
