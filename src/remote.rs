@@ -621,3 +621,51 @@ impl RemoteBackend for S3Backend {
         Ok(keys)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_expiry_date_valid() {
+        let header = r#"ongoing-request="false", expiry-date="Fri, 21 Dec 2012 00:00:00 GMT""#;
+        assert_eq!(parse_expiry_date(header), Some(1356048000));
+    }
+
+    #[test]
+    fn test_parse_expiry_date_missing_field_is_none() {
+        assert!(parse_expiry_date(r#"ongoing-request="true""#).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_date_unterminated_quote_is_none() {
+        assert!(parse_expiry_date(r#"expiry-date="Fri, 21 Dec 2012"#).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_date_malformed_date_is_none() {
+        assert!(parse_expiry_date(r#"expiry-date="not a date""#).is_none());
+    }
+
+    #[test]
+    fn test_parse_expiry_date_empty_header_is_none() {
+        assert!(parse_expiry_date("").is_none());
+    }
+
+    #[test]
+    fn test_parse_storage_class_known_values() {
+        assert!(parse_storage_class("STANDARD").is_ok());
+        assert!(parse_storage_class("DEEP_ARCHIVE").is_ok());
+        assert!(parse_storage_class("GLACIER").is_ok());
+        assert!(parse_storage_class("GLACIER_IR").is_ok());
+        assert!(parse_storage_class("INTELLIGENT_TIERING").is_ok());
+        assert!(parse_storage_class("ONEZONE_IA").is_ok());
+        assert!(parse_storage_class("REDUCED_REDUNDANCY").is_ok());
+        assert!(parse_storage_class("STANDARD_IA").is_ok());
+    }
+
+    #[test]
+    fn test_parse_storage_class_unknown_is_err() {
+        assert!(parse_storage_class("BOGUS").is_err());
+    }
+}
