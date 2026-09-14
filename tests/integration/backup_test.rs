@@ -155,6 +155,47 @@ async fn backup_should_fail_when_no_matching_snapshot() {
     assert!(result.is_err(), "should fail with no matching snapshot");
 }
 
+/// A corrupted last-backup manifest must fail loudly rather than being silently reset to
+/// empty — a silent reset would drop other levels' entries and break their incremental
+/// chains without warning.
+#[tokio::test]
+async fn backup_should_fail_when_last_manifest_is_corrupt() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let snap = "bcb_level0.20260602T1430";
+
+    let mut btrfs = MockBtrfs::new();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![snap.to_string()]));
+    btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
+
+    let mut remote = MockRemote::new();
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(|_| Ok(true));
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(|_| Ok(false));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(|_| Ok(b"[not, a, valid, last-manifest, mapping]".to_vec()));
+    remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("failed to parse last manifest"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Level-1 incremental backup: read parent from last manifest, use send_incremental.
 #[tokio::test]
 async fn level1_incremental_should_use_level0_as_parent() {
@@ -197,6 +238,107 @@ async fn level1_incremental_should_use_level0_as_parent() {
         .expect("must not be skipped");
     assert_eq!(backup.level, 1);
     assert_eq!(backup.parent_snapshot.as_deref(), Some(parent));
+}
+
+/// Level-2 incremental backup: the chain logic must not be special-cased to just level 0/1 —
+/// a level-2 backup reads its parent from the last manifest's level-1 entry the same way a
+/// level-1 backup reads its level-0 entry.
+#[tokio::test]
+async fn level2_incremental_should_use_level1_as_parent() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(work_dir.path());
+    config
+        .s3
+        .storage_class
+        .backup_data
+        .push("GLACIER".to_string());
+    let task = movies_task();
+    let parent = "bcb_level1.20260601T1430";
+    let snap = "bcb_level2.20260602T1430";
+
+    let mut btrfs = MockBtrfs::new();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
+    btrfs
+        .expect_send_incremental()
+        .withf(move |p, _| p.ends_with(parent))
+        .returning(|_, _| Ok(fake_stream()));
+
+    let manifest_bytes = last_manifest_yaml(parent, 1);
+    let mut remote = MockRemote::new();
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(|_| Ok(true));
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(|_| Ok(false));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(move |_| Ok(manifest_bytes.clone()));
+    remote
+        .expect_upload_file()
+        .withf(|_, _, _, tags| tags == "bcb-backup-level=2")
+        .returning(|_, _, _, _| Ok(()));
+    remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+
+    let result = backup_task(&config, &task, 2, &btrfs, &remote).await;
+
+    let backup = result
+        .expect("level 2 backup should succeed")
+        .expect("must not be skipped");
+    assert_eq!(backup.level, 2);
+    assert_eq!(backup.parent_snapshot.as_deref(), Some(parent));
+}
+
+/// A level whose storage class isn't configured must fail loudly before ever uploading,
+/// rather than silently falling back to some default storage class.
+#[tokio::test]
+async fn backup_should_fail_when_no_storage_class_configured_for_level() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(work_dir.path());
+    // Only level 0 has a configured storage class.
+    config.s3.storage_class.backup_data = vec!["STANDARD".to_string()];
+    let task = movies_task();
+    let parent = "bcb_level0.20260601T1430";
+    let snap = "bcb_level1.20260602T1430";
+
+    let mut btrfs = MockBtrfs::new();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
+    btrfs
+        .expect_send_incremental()
+        .returning(|_, _| Ok(fake_stream()));
+
+    let manifest_bytes = last_manifest_yaml(parent, 0);
+    let mut remote = MockRemote::new();
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(|_| Ok(true));
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(|_| Ok(false));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(move |_| Ok(manifest_bytes.clone()));
+    // No upload_file/upload_bytes expectations: the storage-class lookup must fail before
+    // ever calling upload_file (any such call would itself be a test failure).
+
+    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no storage class configured for level 1"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Level-1 backup must be rejected when no last manifest exists on remote (level 0 never ran).
@@ -608,6 +750,106 @@ async fn resume_should_skip_already_uploaded_parts() {
         .expect("resume must not be skipped");
     assert_eq!(backup.parts.len(), 2);
     assert_eq!(backup.blake3, "streamhash");
+}
+
+/// A part left with both its raw file and a `.age` file (encryption was interrupted mid-run
+/// on a previous attempt, so the `.age` may be truncated) must have the existing `.age`
+/// discarded and freshly re-encrypted from the raw file — not uploaded as whatever partial
+/// bytes were left behind.
+#[tokio::test]
+async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run() {
+    use btrfs_cold_backup::{BackupState, state_path};
+    use secrecy::ExposeSecret;
+    use std::sync::{Arc, Mutex};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let identity = age::x25519::Identity::generate();
+    let mut config = test_config(work_dir.path());
+    config.age_public_key = identity.to_public().to_string();
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let output_dir = work_dir
+        .path()
+        .join("task")
+        .join(sanitized)
+        .join("bcb_level0_202606021430");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let raw_content = b"the real snapshot data for this part".to_vec();
+    std::fs::write(output_dir.join("snapshot.part-000000"), &raw_content).unwrap();
+    // Simulates a run killed mid-encryption in a previous attempt: a truncated/garbage .age
+    // file sitting alongside the still-present raw part.
+    std::fs::write(
+        output_dir.join("snapshot.part-000000.age"),
+        b"truncated garbage",
+    )
+    .unwrap();
+
+    let mut state = BackupState {
+        task_name: task.name.clone(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        collision_suffix: None,
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        output_dir: output_dir.clone(),
+        stream_hash: Some("streamhash".to_string()),
+        total_parts: Some(1),
+        parts_completed: std::collections::HashMap::new(),
+        manifest_uploaded: false,
+        last_updated: 0,
+    };
+    let sp = state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    state.save(&sp).unwrap();
+
+    // resume path: no btrfs calls at all
+    let btrfs = MockBtrfs::new();
+
+    // upload_file() only gets the path; production code deletes that file right after a
+    // successful upload, so the bytes must be captured here, before that happens.
+    let uploaded_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let uploaded_bytes_clone = uploaded_bytes.clone();
+
+    let mut remote = MockRemote::new();
+    remote
+        .expect_upload_file()
+        .withf(|key, _, _, _| key.contains("part-000000"))
+        .times(1)
+        .returning(move |_, path, _, _| {
+            *uploaded_bytes_clone.lock().unwrap() = Some(std::fs::read(path)?);
+            Ok(())
+        });
+    remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("last_backup_manifest"))
+        .returning(|_| Ok(false));
+
+    let backup = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect("resumed backup should succeed")
+        .expect("resume must not be skipped");
+    assert_eq!(backup.parts.len(), 1);
+
+    // Decrypt what was actually uploaded and confirm it's the real content — proving the
+    // truncated .age was discarded and freshly re-encrypted, not uploaded as-is.
+    let uploaded_bytes = uploaded_bytes
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("part must have been uploaded");
+    let uploaded_copy_path = work_dir.path().join("uploaded_copy.age");
+    std::fs::write(&uploaded_copy_path, &uploaded_bytes).unwrap();
+    let decrypted_path = work_dir.path().join("decrypted");
+    btrfs_cold_backup::decrypt_file(
+        &uploaded_copy_path,
+        &decrypted_path,
+        identity.to_string().expose_secret(),
+    )
+    .await
+    .expect("uploaded part must decrypt with the real key, not be leftover garbage");
+    assert_eq!(std::fs::read(&decrypted_path).unwrap(), raw_content);
 }
 
 /// If parts recorded in the state are gone from disk and not uploaded, the resumed backup
