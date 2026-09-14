@@ -88,7 +88,7 @@ bcb genkey --output ./bcb_private.key
 sudo bcb check
 ```
 
-AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy needs `PutObject`, `GetObject`, `HeadObject`, `ListBucket`, `ListBucketMultipartUploads`, `AbortMultipartUpload`, `DeleteObject`, `RestoreObject`, and `HeadBucket` on the bucket.
+AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy needs `PutObject`, `PutObjectTagging`, `GetObject`, `HeadObject`, `ListBucket`, `ListBucketMultipartUploads`, `AbortMultipartUpload`, `DeleteObject`, `RestoreObject`, and `HeadBucket` on the bucket. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
 
 Snapshots come from btrbk, one [config][btrbk-conf] per level so each can be created and pruned independently. `/etc/btrbk/bcb-level0.conf` (level 1 is identical except `snapshot_name bcb_level1`):
 

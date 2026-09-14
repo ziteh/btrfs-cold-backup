@@ -518,14 +518,18 @@ impl RemoteBackend for S3Backend {
             .await
             .map_err(|e| anyhow!("cannot access S3 bucket: {e}"))?;
 
-        // head_bucket only proves read access; backups need write and delete, so probe with
-        // a throwaway object under the configured prefix.
+        // head_bucket only proves read access; backups need write, delete, and tagging, so
+        // probe with a throwaway object under the configured prefix, tagged the same way a
+        // real backup part is. Tagging via PutObject's x-amz-tagging header is checked by AWS
+        // against s3:PutObjectTagging separately from s3:PutObject, so a probe without a tag
+        // would pass even when the real uploads' tagging call is missing that permission.
         let probe_key = format!("{}bcb_check_probe", self.prefix);
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(&probe_key)
             .body(ByteStream::from_static(b""))
+            .tagging("bcb-backup-level=check")
             .send()
             .await
             .map_err(|e| anyhow!("cannot write to S3 bucket: {e}"))?;
