@@ -5,7 +5,7 @@ use crate::{BtrfsOps, Config, RemoteBackend};
 
 /// Verifies the external executables bcb shells out to are present on PATH.
 pub fn check_binaries() -> Result<()> {
-    for bin in ["btrfs", "split"] {
+    for bin in ["btrfs", "split", "du"] {
         if !on_path(bin) {
             return Err(anyhow!("required executable '{bin}' not found on PATH"));
         }

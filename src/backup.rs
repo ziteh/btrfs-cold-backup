@@ -10,8 +10,8 @@ use crate::{
         Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo, SystemInfo, read_state,
     },
     util::{
-        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, backup_output_dir, s3_backup_key, s3_last_manifest_key,
-        s3_manifest_key, sanitize_subvolume_path, state_path,
+        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, s3_backup_key,
+        s3_last_manifest_key, s3_manifest_key, sanitize_subvolume_path, state_path,
     },
 };
 
@@ -242,6 +242,67 @@ fn split_part_size() -> String {
     "3G".to_string()
 }
 
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Estimates a snapshot's on-disk size via `du`, as an upper bound for the space a `btrfs
+/// send` of it (full or incremental) could require locally: exactly right for a full send,
+/// and a safe overestimate for an incremental one.
+async fn snapshot_size_bytes(path: &Path) -> Result<u64> {
+    let output = tokio::process::Command::new("du")
+        .args(["-sb"])
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| anyhow!("failed to run du on {:?}: {e}", path))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "du failed for {:?}: {}",
+            path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let size_str = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("unexpected du output for {:?}: {stdout:?}", path))?;
+    size_str
+        .parse::<u64>()
+        .map_err(|e| anyhow!("failed to parse du output '{size_str}' for {:?}: {e}", path))
+}
+
+fn ensure_enough_space(available: u64, required: u64, snapshot_path: &Path) -> Result<()> {
+    if available < required {
+        return Err(anyhow!(
+            "insufficient free space for base_dir: {:.1} GiB available, ~{:.1} GiB needed \
+             (estimated from the size of {:?}); free up space or point base_dir at a larger \
+             filesystem before retrying",
+            available as f64 / GIB,
+            required as f64 / GIB,
+            snapshot_path,
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses to start a potentially hours-long send/upload when base_dir clearly doesn't have
+/// room for it, rather than failing partway through with ENOSPC. The size estimate is a
+/// best-effort heuristic (`du` can fail for reasons unrelated to disk space, e.g. permissions
+/// or an unsupported flag on a non-Linux `du`), so a failure to estimate only skips the
+/// check — it must never block a backup that might otherwise have succeeded.
+async fn check_available_space(snapshot_path: &Path, output_dir: &Path) -> Result<()> {
+    let required = match snapshot_size_bytes(snapshot_path).await {
+        Ok(size) => size,
+        Err(e) => {
+            tracing::warn!("could not estimate snapshot size, skipping free-space check: {e}");
+            return Ok(());
+        }
+    };
+    // output_dir was just created under base_dir, so it's on the same filesystem.
+    let available = available_space_bytes(output_dir)?;
+    ensure_enough_space(available, required, snapshot_path)
+}
+
 async fn send_and_split<B: BtrfsOps>(
     btrfs: &B,
     task: &Task,
@@ -261,6 +322,8 @@ async fn send_and_split<B: BtrfsOps>(
     tokio::fs::create_dir_all(output_dir).await?;
 
     let snapshot_path = task.snapshot_dir.join(snapshot_name);
+    check_available_space(&snapshot_path, output_dir).await?;
+
     let mut stream = match parent {
         Some(p) => {
             btrfs
@@ -652,5 +715,21 @@ mod tests {
     fn test_validate_part_coverage_no_total_is_ok() {
         let state = BackupState::default();
         assert!(validate_part_coverage(&BTreeSet::new(), &state).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_enough_space_sufficient_is_ok() {
+        assert!(ensure_enough_space(100, 50, Path::new("/snap")).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_enough_space_exactly_equal_is_ok() {
+        assert!(ensure_enough_space(50, 50, Path::new("/snap")).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_enough_space_insufficient_is_err() {
+        let err = ensure_enough_space(10, 50, Path::new("/snap")).unwrap_err();
+        assert!(err.to_string().contains("insufficient free space"));
     }
 }

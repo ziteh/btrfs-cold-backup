@@ -18,6 +18,27 @@ pub fn die_with_parent() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns the free space available to unprivileged users on the filesystem containing
+/// `path`, in bytes.
+pub fn available_space_bytes(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| anyhow!("path {:?} is not a valid C string: {e}", path))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid, NUL-terminated C string for its lifetime, and `stat` is a
+    // plain-old-data struct that statvfs(3) fully initializes on success.
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return Err(anyhow!(
+            "statvfs failed for {:?}: {}",
+            path,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -370,5 +391,17 @@ mod tests {
         assert!(backup_key.contains("backup-data"));
         assert!(manifest_key.contains("manifests"));
         assert!(last_key.contains("manifests"));
+    }
+
+    #[test]
+    fn test_available_space_bytes_returns_plausible_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let available = available_space_bytes(dir.path()).unwrap();
+        assert!(available > 0);
+    }
+
+    #[test]
+    fn test_available_space_bytes_missing_path_is_err() {
+        assert!(available_space_bytes(Path::new("/nonexistent/path/for/bcb/test")).is_err());
     }
 }
