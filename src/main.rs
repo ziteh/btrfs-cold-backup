@@ -94,6 +94,18 @@ fn select_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
         .collect()
 }
 
+/// Turns the list of task names a command failed for into its aggregate error, or `Ok(())`
+/// if none did. Shared by List/Verify/Backup, which each run every selected task to
+/// completion and collect failures here rather than stopping at the first one — one failing
+/// task must never prevent the others from being attempted.
+fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("{verb} failed for task(s): {}", failed.join(", ")))
+    }
+}
+
 async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, PidLock)> {
     std::fs::create_dir_all(&config.base_dir)
         .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
@@ -212,9 +224,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            if !failed.is_empty() {
-                return Err(anyhow!("list failed for task(s): {}", failed.join(", ")));
-            }
+            aggregate_failures("list", &failed)?;
         }
 
         Commands::Verify { task, max_age_days } => {
@@ -241,12 +251,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            if !failed.is_empty() {
-                return Err(anyhow!(
-                    "verify found issues for task(s): {}",
-                    failed.join(", ")
-                ));
-            }
+            aggregate_failures("verify", &failed)?;
         }
 
         Commands::Backup { level, task } => {
@@ -284,9 +289,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            if !failed.is_empty() {
-                return Err(anyhow!("backup failed for task(s): {}", failed.join(", ")));
-            }
+            aggregate_failures("backup", &failed)?;
         }
 
         Commands::Restore {
@@ -362,4 +365,55 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn task(name: &str, enabled: bool) -> Task {
+        Task {
+            name: name.to_string(),
+            description: String::new(),
+            subvolume: PathBuf::from(format!("/mnt/{name}")),
+            snapshot_dir: PathBuf::from(format!("/mnt/.snapshots/{name}")),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn test_select_tasks_no_filter_returns_all_enabled() {
+        let tasks = vec![task("a", true), task("b", true), task("c", false)];
+        let selected = select_tasks(&tasks, None);
+        assert_eq!(
+            selected.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn test_select_tasks_by_name_ignores_disabled() {
+        let tasks = vec![task("a", true), task("b", false)];
+        assert!(select_tasks(&tasks, Some("b")).is_empty());
+        assert_eq!(select_tasks(&tasks, Some("a")).len(), 1);
+    }
+
+    #[test]
+    fn test_select_tasks_unknown_name_is_empty() {
+        let tasks = vec![task("a", true)];
+        assert!(select_tasks(&tasks, Some("nonexistent")).is_empty());
+    }
+
+    #[test]
+    fn test_aggregate_failures_empty_is_ok() {
+        assert!(aggregate_failures("backup", &[]).is_ok());
+    }
+
+    #[test]
+    fn test_aggregate_failures_names_every_failed_task() {
+        let failed = vec!["a".to_string(), "b".to_string()];
+        let err = aggregate_failures("backup", &failed).unwrap_err();
+        assert_eq!(err.to_string(), "backup failed for task(s): a, b");
+    }
 }

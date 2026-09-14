@@ -40,13 +40,13 @@ pub(crate) fn vm_env() -> Option<VmEnv> {
     })
 }
 
-fn test_dir(mount: &Path, name: &str) -> PathBuf {
+pub(crate) fn test_dir(mount: &Path, name: &str) -> PathBuf {
     let dir = mount.join(format!("interrupt-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-fn btrfs_subvolume_create(path: &Path) {
+pub(crate) fn btrfs_subvolume_create(path: &Path) {
     let out = Command::new("btrfs")
         .args(["subvolume", "create", path.to_str().unwrap()])
         .output()
@@ -58,21 +58,21 @@ fn btrfs_subvolume_create(path: &Path) {
     );
 }
 
-fn btrfs_subvolume_delete(path: &Path) {
+pub(crate) fn btrfs_subvolume_delete(path: &Path) {
     Command::new("btrfs")
         .args(["subvolume", "delete", path.to_str().unwrap()])
         .output()
         .unwrap();
 }
 
-fn ensure_bucket(bucket: &str) {
+pub(crate) fn ensure_bucket(bucket: &str) {
     Command::new("mc")
         .args(["mb", "--ignore-existing", &format!("local/{bucket}")])
         .output()
         .unwrap();
 }
 
-fn s3_config(env: &VmEnv) -> S3Config {
+pub(crate) fn s3_config(env: &VmEnv) -> S3Config {
     S3Config {
         bucket: env.s3_bucket.clone(),
         region: "us-east-1".to_string(),
@@ -168,7 +168,7 @@ fn spawn_bcb_backup(
     cmd.spawn().expect("failed to spawn bcb")
 }
 
-fn run_bcb(env: &VmEnv, args: &[&str]) -> std::process::Output {
+pub(crate) fn run_bcb(env: &VmEnv, args: &[&str]) -> std::process::Output {
     Command::new(&env.bin_path)
         .args(args)
         .output()
