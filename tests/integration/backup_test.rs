@@ -1436,6 +1436,136 @@ async fn restore_should_resume_partially_downloaded_part() {
     assert!(state.stream_verified, "stream must verify after resume");
 }
 
+/// A partially-downloaded part whose retrieved copy expired (live status falls back to
+/// NotRequested) must be re-requested unconditionally, bypassing the pacing budget entirely
+/// — its bytes are already invested and the resume offset stays valid since the underlying
+/// object is immutable, so waiting for budget room would just strand it.
+#[tokio::test]
+async fn restore_should_reissue_retrieval_for_expired_partial_download_regardless_of_budget() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    use btrfs_cold_backup::{PartDownloadState, RestorePartState, RestoreState};
+    use std::collections::BTreeMap;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(work_dir.path());
+    // Budget far smaller than the part: proves the re-request bypasses the budget gate
+    // rather than merely fitting within it by coincidence.
+    config.s3.restore = RestoreConfig {
+        expected_download_kbps: 1,
+        lead_days: Some(1.0 / (1024.0 * 86400.0)),
+        ..RestoreConfig::default()
+    };
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let backup_manifest = Backup {
+        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: 100,
+        blake3: "irrelevant".to_string(),
+        parts: vec![PartInfo {
+            index: "000000".to_string(),
+            size_bytes: 100,
+            blake3: "parthash".to_string(),
+        }],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    // Pre-seed the restore work dir as an interrupted run would have left it: half the
+    // part downloaded, but its retrieved copy has since expired on S3 (live status below
+    // reports NotRequested for it, not Ready).
+    let restore_dir = work_dir
+        .path()
+        .join("restore-movies-level0-2026-06-02T00:00:00Z");
+    std::fs::create_dir_all(&restore_dir).unwrap();
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "000000".to_string(),
+        RestorePartState {
+            index: "000000".to_string(),
+            size_bytes: 100,
+            blake3: "parthash".to_string(),
+            download_state: PartDownloadState::PartiallyDownloaded {
+                downloaded_bytes: 50,
+            },
+        },
+    );
+    let mut seeded = RestoreState {
+        task_name: task.name.clone(),
+        level: 0,
+        timestamp: "2026-06-02T00:00:00Z".to_string(),
+        snapshot_name: backup_manifest.snapshot_name.clone(),
+        manifest_blake3: "irrelevant".to_string(),
+        parts,
+        stream_verified: false,
+        receive_completed: false,
+        last_updated: 0,
+    };
+    seeded
+        .save(&restore_dir.join("restore-state.yaml"))
+        .unwrap();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|key| {
+        let status = if key.contains("task_manifest") {
+            RestoreStatus::Ready
+        } else {
+            RestoreStatus::NotRequested
+        };
+        Ok(RestoreStatusDetail {
+            status,
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .withf(|key| key.contains("task_manifest"))
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    // The request must go out despite the budget being far smaller than the part.
+    remote
+        .expect_request_restore()
+        .withf(|key, _, _| key.contains("000000"))
+        .times(1)
+        .returning(|_, _, _| Ok(()));
+
+    let progress = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        "AGE-SECRET-KEY-1FAKE",
+        &RetrievalOptions {
+            days: 2,
+            tier: "Standard".to_string(),
+        },
+        &remote,
+    )
+    .await
+    .expect("must report progress, not error");
+    assert!(!progress.completed);
+
+    // The resume offset must be preserved, not reset to a fresh Requested state.
+    let state: RestoreState = serde_yaml::from_str(
+        &std::fs::read_to_string(restore_dir.join("restore-state.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.parts["000000"].download_state,
+        PartDownloadState::PartiallyDownloaded {
+            downloaded_bytes: 50
+        },
+        "resume offset must survive the re-request"
+    );
+}
+
 /// Regression test for retrieval/download pipelining: the run that drains a ready wave
 /// must also request the next wave in the same run. Counting the ready (about-to-be-
 /// downloaded) bytes against the request budget used to leave the budget "full", so no
