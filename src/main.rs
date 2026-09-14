@@ -108,7 +108,21 @@ fn init_logging(file_log_dir: Option<std::path::PathBuf>) {
             eprintln!("cannot create log directory {dir:?}: {e}; file logging disabled");
             return None;
         }
-        let appender = tracing_appender::rolling::daily(dir, "bcb.log");
+        // Capped so unattended cron runs don't let the log directory grow forever; 30 daily
+        // files covers a month, comfortably past the longest gap between scheduled backups
+        // described in the README (level 0 twice a year, level 1 weekly).
+        let appender = match tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("bcb.log")
+            .max_log_files(30)
+            .build(&dir)
+        {
+            Ok(appender) => appender,
+            Err(e) => {
+                eprintln!("cannot create log appender in {dir:?}: {e}; file logging disabled");
+                return None;
+            }
+        };
         Some(
             tracing_subscriber::fmt::layer()
                 .with_writer(appender)

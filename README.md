@@ -189,7 +189,7 @@ WantedBy=timers.target
 sudo systemctl enable --now bcb-backup@0.timer bcb-backup@1.timer
 ```
 
-`Persistent=true` catches up on schedules missed while powered off. Runs are logged in `journalctl -u 'bcb-backup@*'` and in `<base_dir>/log/`; failure notifications land in `journalctl -u 'bcb-notify-failure@*'`.
+`Persistent=true` catches up on schedules missed while powered off. Runs are logged in `journalctl -u 'bcb-backup@*'` and in `<base_dir>/log/` (kept to the last 30 daily files); failure notifications land in `journalctl -u 'bcb-notify-failure@*'`.
 
 Notes:
 
