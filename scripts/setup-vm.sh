@@ -50,9 +50,14 @@ esac
 
 # SeaweedFS server (S3-compatible; replaces MinIO, whose OSS project was archived)
 if [ ! -f "$SEAWEEDFS_BIN" ]; then
-    version=$(curl -fsSL https://api.github.com/repos/seaweedfs/seaweedfs/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+    # Piping curl straight into `grep -m1` risks curl seeing SIGPIPE (exit 23) when grep
+    # quits after its first match, so capture the full response before grepping it.
+    release_json=$(curl -fsSL https://api.github.com/repos/seaweedfs/seaweedfs/releases/latest)
+    version=$(grep -m1 '"tag_name"' <<<"$release_json" | cut -d'"' -f4)
     curl -fsSL "https://github.com/seaweedfs/seaweedfs/releases/download/${version}/linux_${ARCH}.tar.gz" \
-        | tar -xz -C "$(dirname "$SEAWEEDFS_BIN")" weed
+        -o /tmp/weed.tar.gz
+    tar -xzf /tmp/weed.tar.gz -C "$(dirname "$SEAWEEDFS_BIN")" weed
+    rm -f /tmp/weed.tar.gz
     chmod +x "$SEAWEEDFS_BIN"
 fi
 
