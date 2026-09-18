@@ -1,6 +1,8 @@
 name: Btrfs loopback probe
 
 on:
+  push:
+    branches: [ci/btrfs-loopback-probe]
   workflow_dispatch:
 
 jobs:
