@@ -1,0 +1,26 @@
+name: Btrfs loopback probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install btrfs-progs
+        run: sudo apt-get update -q && sudo apt-get install -y btrfs-progs
+
+      - name: Create loopback btrfs filesystem and mount it
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/bcb-test
+          sudo dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=1024 status=none
+          sudo mkfs.btrfs -q /tmp/btrfs.img
+          sudo mount -o loop /tmp/btrfs.img /mnt/bcb-test
+          mountpoint -q /mnt/bcb-test && echo "mount ok"
+
+      - name: Create and list a subvolume
+        run: |
+          set -euo pipefail
+          sudo btrfs subvolume create /mnt/bcb-test/sub1
+          sudo btrfs subvolume list /mnt/bcb-test
