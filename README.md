@@ -195,7 +195,7 @@ Notes:
 
 - Each level 1 is the cumulative delta since the last level 0 and grows over the half year; if that gets large, add a monthly level 1 and weekly level 2 instead.
 - Set bucket lifecycle expirations filtered on the `bcb-backup-level` tag (see Retention below) to at least 13 months so the current and previous chains always survive.
-- Drill restores: `bcb list` regularly, and walk a full restore on a test machine at least yearly to prove the private key and procedure work.
+- Drill restores: `bcb list` regularly, and walk a full restore on a test machine at least yearly to prove the private key and procedure work. See [docs/restore-drill-runbook.md](docs/restore-drill-runbook.md) for a runbook that exercises the real Glacier retrieval path (which no automated test does).
 - Run `bcb verify` regularly (e.g. a monthly systemd timer, wired into the same `OnFailure=` alerting as the backup jobs): it audits every backup's incremental chain, part existence and size, and storage class against S3 via HeadObject/ListObjectsV2 only, so it never triggers an archive retrieval or its cost. Pass `--max-age-days` to also flag a task whose newest backup is older than expected — the one check that can catch a schedule that silently stopped running. It complements, not replaces, an actual restore drill: it cannot detect data corrupted in a way that preserves size, nor verify the private key still works.
 
 ## Restoring
