@@ -16,7 +16,21 @@ S3_PASS=minioadmin
 chronyc makestep 2>/dev/null || true
 
 apt-get update -q
-apt-get install -y btrfs-progs curl awscli
+apt-get install -y btrfs-progs curl unzip
+
+# AWS CLI v2 (used only to create the test bucket below). Not installed via apt: Ubuntu
+# noble dropped the `awscli` package, and GitHub-hosted runners already have v2 preinstalled
+# anyway, so this only triggers on a fresh local VM.
+if ! command -v aws &>/dev/null; then
+    case "$(uname -m)" in
+        aarch64|arm64) awscli_arch=aarch64 ;;
+        *)             awscli_arch=x86_64 ;;
+    esac
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip
+    unzip -q -o /tmp/awscliv2.zip -d /tmp
+    /tmp/aws/install
+    rm -rf /tmp/awscliv2.zip /tmp/aws
+fi
 
 # btrfs loop device
 mkdir -p "$(dirname "$LOOP_IMG")" "$BTRFS_MOUNT"
