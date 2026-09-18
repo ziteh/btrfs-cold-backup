@@ -5,24 +5,58 @@ on:
     branches: [ci/btrfs-loopback-probe]
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+  BCB_BTRFS_MOUNT: /mnt/bcb-test
+  BCB_S3_ENDPOINT: http://localhost:9000
+  BCB_S3_BUCKET: bcb-test
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_DEFAULT_REGION: us-east-1
+
 jobs:
-  probe:
+  e2e:
     runs-on: ubuntu-latest
     steps:
-      - name: Install btrfs-progs
-        run: sudo apt-get update -q && sudo apt-get install -y btrfs-progs
+      - uses: actions/checkout@v4
 
-      - name: Create loopback btrfs filesystem and mount it
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up btrfs loopback mount and MinIO
+        run: sudo bash scripts/setup-vm.sh
+
+      - name: Build bcb binary (dev profile, keeps BCB_TEST_PAUSE_* hooks compiled in)
+        run: cargo build --bin bcb
+
+      - name: Build e2e/vm test binaries
+        run: cargo test --test e2e --test vm --no-run
+
+      - name: Run vm tests
         run: |
           set -euo pipefail
-          sudo mkdir -p /mnt/bcb-test
-          sudo dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=1024 status=none
-          sudo mkfs.btrfs -q /tmp/btrfs.img
-          sudo mount -o loop /tmp/btrfs.img /mnt/bcb-test
-          mountpoint -q /mnt/bcb-test && echo "mount ok"
+          bin=$(ls -t target/debug/deps/vm-* | grep -v '\.d$' | head -1)
+          sudo env \
+            "BCB_BTRFS_MOUNT=$BCB_BTRFS_MOUNT" \
+            "BCB_S3_ENDPOINT=$BCB_S3_ENDPOINT" \
+            "BCB_S3_BUCKET=$BCB_S3_BUCKET" \
+            "BCB_BIN_PATH=$PWD/target/debug/bcb" \
+            "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
+            "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
+            "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \
+            "$bin" --nocapture
 
-      - name: Create and list a subvolume
+      - name: Run e2e tests
         run: |
           set -euo pipefail
-          sudo btrfs subvolume create /mnt/bcb-test/sub1
-          sudo btrfs subvolume list /mnt/bcb-test
+          bin=$(ls -t target/debug/deps/e2e-* | grep -v '\.d$' | head -1)
+          sudo env \
+            "BCB_BTRFS_MOUNT=$BCB_BTRFS_MOUNT" \
+            "BCB_S3_ENDPOINT=$BCB_S3_ENDPOINT" \
+            "BCB_S3_BUCKET=$BCB_S3_BUCKET" \
+            "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
+            "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
+            "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \
+            "$bin" --nocapture
