@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, ci/coverage-probe]
+    branches: [main, develop]
   pull_request:
 
 env:
