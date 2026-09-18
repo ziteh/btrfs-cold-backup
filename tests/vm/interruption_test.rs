@@ -65,9 +65,11 @@ pub(crate) fn btrfs_subvolume_delete(path: &Path) {
         .unwrap();
 }
 
-pub(crate) fn ensure_bucket(bucket: &str) {
-    Command::new("mc")
-        .args(["mb", "--ignore-existing", &format!("local/{bucket}")])
+pub(crate) fn ensure_bucket(endpoint: &str, bucket: &str) {
+    // Ignore the exit status: this races other test binaries creating the same bucket, and
+    // "already exists" is the expected outcome most of the time.
+    Command::new("aws")
+        .args(["--endpoint-url", endpoint, "s3", "mb", &format!("s3://{bucket}")])
         .output()
         .unwrap();
 }
@@ -264,7 +266,7 @@ pub(crate) struct Fixture {
 
 /// Creates a subvolume + snapshot + on-disk config/key files for one interruption test.
 pub(crate) fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Path)) -> Fixture {
-    ensure_bucket(&env.s3_bucket);
+    ensure_bucket(&env.s3_endpoint, &env.s3_bucket);
 
     let btrfs_dir = test_dir(&env.btrfs_mount, name);
     let subvol = btrfs_dir.join("subvol");

@@ -86,9 +86,11 @@ fn btrfs_snapshot(src: &Path, dst: &Path) {
     );
 }
 
-async fn ensure_bucket(_endpoint: &str, bucket: &str) {
-    Command::new("mc")
-        .args(["mb", "--ignore-existing", &format!("local/{bucket}")])
+async fn ensure_bucket(endpoint: &str, bucket: &str) {
+    // Ignore the exit status: this races other test binaries creating the same bucket, and
+    // "already exists" is the expected outcome most of the time.
+    Command::new("aws")
+        .args(["--endpoint-url", endpoint, "s3", "mb", &format!("s3://{bucket}")])
         .output()
         .unwrap();
 }

@@ -12,7 +12,7 @@ use crate::interruption_test::{
 #[tokio::test]
 async fn one_failing_task_should_not_block_the_others() {
     let Some(env) = vm_env() else { return };
-    ensure_bucket(&env.s3_bucket);
+    ensure_bucket(&env.s3_endpoint, &env.s3_bucket);
 
     let dir = test_dir(&env.btrfs_mount, "multi-task");
     let good_subvol = dir.join("good-subvol");
