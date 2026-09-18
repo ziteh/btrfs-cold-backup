@@ -9,8 +9,8 @@ S3_BUCKET=bcb-test
 S3_PORT=8333
 # Dummy credentials: SeaweedFS's S3 gateway runs anonymous (no -s3.config) and doesn't
 # validate them, but the AWS SDK still requires some value to sign requests with.
-S3_USER=minioadmin
-S3_PASS=minioadmin
+S3_USER=s3testcreds
+S3_PASS=s3testcreds
 
 # Sync clock before apt
 chronyc makestep 2>/dev/null || true

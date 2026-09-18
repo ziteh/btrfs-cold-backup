@@ -6,8 +6,8 @@ VM=bcb-dev
 BTRFS_MOUNT=/mnt/bcb-test
 S3_ENDPOINT=http://localhost:8333
 S3_BUCKET=bcb-test
-S3_USER=minioadmin
-S3_PASS=minioadmin
+S3_USER=s3testcreds
+S3_PASS=s3testcreds
 TARGET=aarch64-unknown-linux-gnu
 
 # VM setup

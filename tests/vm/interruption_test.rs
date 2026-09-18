@@ -26,10 +26,12 @@ pub(crate) fn vm_env() -> Option<VmEnv> {
     let (Some(btrfs_mount), Some(s3_endpoint), Some(s3_bucket), Some(bin_path)) =
         (btrfs_mount, s3_endpoint, s3_bucket, bin_path)
     else {
-        eprintln!(
-            "skipping VM test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET / \
-             BCB_BIN_PATH not set (run via scripts/run-vm-tests.sh)"
-        );
+        let msg = "skipping VM test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET / \
+             BCB_BIN_PATH not set (run via scripts/run-vm-tests.sh)";
+        // A skipped test and a real pass both print "ok", so a misconfigured CI env would
+        // otherwise go unnoticed as a green run. In CI this must fail loudly instead.
+        assert!(std::env::var("CI").is_err(), "{msg}, but CI=true");
+        eprintln!("{msg}");
         return None;
     };
     Some(VmEnv {
@@ -69,7 +71,13 @@ pub(crate) fn ensure_bucket(endpoint: &str, bucket: &str) {
     // Ignore the exit status: this races other test binaries creating the same bucket, and
     // "already exists" is the expected outcome most of the time.
     Command::new("aws")
-        .args(["--endpoint-url", endpoint, "s3", "mb", &format!("s3://{bucket}")])
+        .args([
+            "--endpoint-url",
+            endpoint,
+            "s3",
+            "mb",
+            &format!("s3://{bucket}"),
+        ])
         .output()
         .unwrap();
 }
@@ -104,9 +112,9 @@ pub(crate) async fn raw_s3_client(env: &VmEnv) -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(builder.build())
 }
 
-// ListMultipartUploads' `prefix` filter isn't reliable against this MinIO server (observed: a
-// genuine string-prefix of an in-progress upload's key still came back empty), so list
-// unfiltered and filter client-side instead of trusting server-side prefix matching.
+// ListMultipartUploads' `prefix` filter isn't reliable against this S3-compatible test server
+// (observed: a genuine string-prefix of an in-progress upload's key still came back empty), so
+// list unfiltered and filter client-side instead of trusting server-side prefix matching.
 async fn incomplete_upload_keys(
     client: &aws_sdk_s3::Client,
     bucket: &str,

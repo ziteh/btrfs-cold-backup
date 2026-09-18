@@ -30,10 +30,12 @@ fn e2e_env() -> Option<E2eEnv> {
     let (Some(btrfs_mount), Some(s3_endpoint), Some(s3_bucket)) =
         (btrfs_mount, s3_endpoint, s3_bucket)
     else {
-        eprintln!(
-            "skipping e2e test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET not set \
-             (run via scripts/run-vm-tests.sh)"
-        );
+        let msg = "skipping e2e test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET not set \
+             (run via scripts/run-vm-tests.sh)";
+        // A skipped test and a real pass both print "ok", so a misconfigured CI env would
+        // otherwise go unnoticed as a green run. In CI this must fail loudly instead.
+        assert!(std::env::var("CI").is_err(), "{msg}, but CI=true");
+        eprintln!("{msg}");
         return None;
     };
     Some(E2eEnv {
@@ -90,7 +92,13 @@ async fn ensure_bucket(endpoint: &str, bucket: &str) {
     // Ignore the exit status: this races other test binaries creating the same bucket, and
     // "already exists" is the expected outcome most of the time.
     Command::new("aws")
-        .args(["--endpoint-url", endpoint, "s3", "mb", &format!("s3://{bucket}")])
+        .args([
+            "--endpoint-url",
+            endpoint,
+            "s3",
+            "mb",
+            &format!("s3://{bucket}"),
+        ])
         .output()
         .unwrap();
 }

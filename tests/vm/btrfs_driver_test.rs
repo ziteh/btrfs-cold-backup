@@ -10,9 +10,12 @@ use tokio::io::AsyncReadExt;
 fn btrfs_mount() -> Option<PathBuf> {
     let mount = std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from);
     if mount.is_none() {
-        eprintln!(
-            "skipping btrfs driver test: BCB_BTRFS_MOUNT not set (run via scripts/run-vm-tests.sh)"
-        );
+        let msg =
+            "skipping btrfs driver test: BCB_BTRFS_MOUNT not set (run via scripts/run-vm-tests.sh)";
+        // A skipped test and a real pass both print "ok", so a misconfigured CI env would
+        // otherwise go unnoticed as a green run. In CI this must fail loudly instead.
+        assert!(std::env::var("CI").is_err(), "{msg}, but CI=true");
+        eprintln!("{msg}");
     }
     mount
 }

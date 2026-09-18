@@ -30,4 +30,63 @@ jobs:
       - name: Test
         # --nocapture so the e2e/vm suites' "skipping: BCB_BTRFS_MOUNT not set" messages show
         # up in the CI log — otherwise a skipped test and a real pass both just print "ok".
+        # (The e2e/vm job below sets those env vars so this run exercises them for real; here
+        # they're expected to skip.)
         run: cargo test -- --nocapture
+
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      # CI=true is already set by GitHub Actions for every job; the e2e/vm test binaries key
+      # off it to fail loudly instead of silently skipping when the env vars below are wrong.
+      BCB_BTRFS_MOUNT: /mnt/bcb-test
+      BCB_S3_ENDPOINT: http://localhost:8333
+      BCB_S3_BUCKET: bcb-test
+      AWS_ACCESS_KEY_ID: s3testcreds
+      AWS_SECRET_ACCESS_KEY: s3testcreds
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up btrfs loopback mount and S3-compatible test server
+        run: sudo bash scripts/setup-vm.sh
+
+      - name: Build bcb binary (dev profile, keeps BCB_TEST_PAUSE_* hooks compiled in)
+        run: cargo build --bin bcb
+
+      - name: Build e2e/vm test binaries
+        run: cargo test --test e2e --test vm --no-run
+
+      - name: Run vm tests
+        run: |
+          set -euo pipefail
+          bin=$(ls -t target/debug/deps/vm-* | grep -v '\.d$' | head -1)
+          sudo env \
+            "BCB_BTRFS_MOUNT=$BCB_BTRFS_MOUNT" \
+            "BCB_S3_ENDPOINT=$BCB_S3_ENDPOINT" \
+            "BCB_S3_BUCKET=$BCB_S3_BUCKET" \
+            "BCB_BIN_PATH=$PWD/target/debug/bcb" \
+            "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
+            "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
+            "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \
+            "CI=$CI" \
+            "$bin" --nocapture
+
+      - name: Run e2e tests
+        run: |
+          set -euo pipefail
+          bin=$(ls -t target/debug/deps/e2e-* | grep -v '\.d$' | head -1)
+          sudo env \
+            "BCB_BTRFS_MOUNT=$BCB_BTRFS_MOUNT" \
+            "BCB_S3_ENDPOINT=$BCB_S3_ENDPOINT" \
+            "BCB_S3_BUCKET=$BCB_S3_BUCKET" \
+            "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
+            "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
+            "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \
+            "CI=$CI" \
+            "$bin" --nocapture
