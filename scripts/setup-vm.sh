@@ -3,10 +3,12 @@ set -euo pipefail
 
 LOOP_IMG=/var/lib/bcb-test/btrfs.img
 BTRFS_MOUNT=/mnt/bcb-test
-MINIO_DATA=/var/lib/minio
-MINIO_BIN=/usr/local/bin/minio
-MC_BIN=/usr/local/bin/mc
+SEAWEEDFS_DATA=/var/lib/seaweedfs
+SEAWEEDFS_BIN=/usr/local/bin/weed
 S3_BUCKET=bcb-test
+S3_PORT=8333
+# Dummy credentials: SeaweedFS's S3 gateway runs anonymous (no -s3.config) and doesn't
+# validate them, but the AWS SDK still requires some value to sign requests with.
 S3_USER=minioadmin
 S3_PASS=minioadmin
 
@@ -14,7 +16,7 @@ S3_PASS=minioadmin
 chronyc makestep 2>/dev/null || true
 
 apt-get update -q
-apt-get install -y btrfs-progs curl
+apt-get install -y btrfs-progs curl awscli
 
 # btrfs loop device
 mkdir -p "$(dirname "$LOOP_IMG")" "$BTRFS_MOUNT"
@@ -26,33 +28,34 @@ if ! mountpoint -q "$BTRFS_MOUNT"; then
     mount -o loop "$LOOP_IMG" "$BTRFS_MOUNT"
 fi
 
-# Detect architecture for MinIO downloads
+# Detect architecture for SeaweedFS downloads
 case "$(uname -m)" in
     aarch64|arm64) ARCH=arm64 ;;
     *)             ARCH=amd64 ;;
 esac
 
-# MinIO server
-if [ ! -f "$MINIO_BIN" ] || ! file "$MINIO_BIN" | grep -q "$(uname -m)"; then
-    curl -fsSL "https://dl.min.io/server/minio/release/linux-${ARCH}/minio" -o "$MINIO_BIN"
-    chmod +x "$MINIO_BIN"
+# SeaweedFS server (S3-compatible; replaces MinIO, whose OSS project was archived)
+if [ ! -f "$SEAWEEDFS_BIN" ]; then
+    version=$(curl -fsSL https://api.github.com/repos/seaweedfs/seaweedfs/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+    curl -fsSL "https://github.com/seaweedfs/seaweedfs/releases/download/${version}/linux_${ARCH}.tar.gz" \
+        | tar -xz -C "$(dirname "$SEAWEEDFS_BIN")" weed
+    chmod +x "$SEAWEEDFS_BIN"
 fi
 
-if ! pgrep -x minio &>/dev/null; then
-    mkdir -p "$MINIO_DATA"
-    MINIO_ROOT_USER=$S3_USER MINIO_ROOT_PASSWORD=$S3_PASS \
-        nohup "$MINIO_BIN" server "$MINIO_DATA" --address :9000 &>/var/log/minio.log &
-    sleep 2
+if ! pgrep -x weed &>/dev/null; then
+    mkdir -p "$SEAWEEDFS_DATA"
+    nohup "$SEAWEEDFS_BIN" server -dir="$SEAWEEDFS_DATA" -s3 -s3.port="$S3_PORT" \
+        -master.port=9333 -volume.port=8080 -filer.port=8888 -ip=localhost \
+        &>/var/log/seaweedfs.log &
+    for _ in $(seq 1 30); do
+        curl -fsS "http://localhost:$S3_PORT" &>/dev/null && break
+        sleep 1
+    done
 fi
 
-# MinIO client + bucket
-if [ ! -f "$MC_BIN" ] || ! file "$MC_BIN" | grep -q "$(uname -m)"; then
-    curl -fsSL "https://dl.min.io/client/mc/release/linux-${ARCH}/mc" -o "$MC_BIN"
-    chmod +x "$MC_BIN"
-fi
-"$MC_BIN" alias set local http://localhost:9000 "$S3_USER" "$S3_PASS" &>/dev/null
-"$MC_BIN" mb --ignore-existing "local/$S3_BUCKET"
+AWS_ACCESS_KEY_ID=$S3_USER AWS_SECRET_ACCESS_KEY=$S3_PASS AWS_DEFAULT_REGION=us-east-1 \
+    aws --endpoint-url "http://localhost:$S3_PORT" s3 mb "s3://$S3_BUCKET" 2>/dev/null || true
 
 echo "VM ready."
-echo "btrfs mount : $BTRFS_MOUNT"
-echo "MinIO bucket: $S3_BUCKET @ http://localhost:9000"
+echo "btrfs mount      : $BTRFS_MOUNT"
+echo "S3 (SeaweedFS) bucket: $S3_BUCKET @ http://localhost:$S3_PORT"

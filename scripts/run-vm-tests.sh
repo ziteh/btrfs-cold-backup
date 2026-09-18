@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VM=bcb-dev
 BTRFS_MOUNT=/mnt/bcb-test
-S3_ENDPOINT=http://localhost:9000
+S3_ENDPOINT=http://localhost:8333
 S3_BUCKET=bcb-test
 S3_USER=minioadmin
 S3_PASS=minioadmin
@@ -17,7 +17,7 @@ if ! multipass info "$VM" &>/dev/null; then
     multipass launch --name "$VM" --disk 10G
 fi
 
-if ! multipass exec "$VM" -- bash -c "mountpoint -q '$BTRFS_MOUNT' && pgrep -x minio > /dev/null" 2>/dev/null; then
+if ! multipass exec "$VM" -- bash -c "mountpoint -q '$BTRFS_MOUNT' && pgrep -x weed > /dev/null" 2>/dev/null; then
     echo "==> Running VM setup..."
     multipass transfer "$SCRIPT_DIR/setup-vm.sh" "$VM:setup-vm.sh"
     multipass exec "$VM" -- sudo bash setup-vm.sh

@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   BCB_BTRFS_MOUNT: /mnt/bcb-test
-  BCB_S3_ENDPOINT: http://localhost:9000
+  BCB_S3_ENDPOINT: http://localhost:8333
   BCB_S3_BUCKET: bcb-test
   AWS_ACCESS_KEY_ID: minioadmin
   AWS_SECRET_ACCESS_KEY: minioadmin
@@ -25,7 +25,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Set up btrfs loopback mount and MinIO
+      - name: Set up btrfs loopback mount and S3-compatible test server
         run: sudo bash scripts/setup-vm.sh
 
       - name: Build bcb binary (dev profile, keeps BCB_TEST_PAUSE_* hooks compiled in)
