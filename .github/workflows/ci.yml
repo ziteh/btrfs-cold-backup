@@ -27,12 +27,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
-        # --nocapture so the e2e/vm suites' "skipping: BCB_BTRFS_MOUNT not set" messages show
-        # up in the CI log — otherwise a skipped test and a real pass both just print "ok".
-        # (The e2e/vm job below sets those env vars so this run exercises them for real; here
-        # they're expected to skip.)
-        run: cargo test -- --nocapture
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Only unit + integration tests are instrumented: e2e/vm need real btrfs + S3 and run
+      # separately (uninstrumented) in the e2e job below, so their coverage isn't reflected in
+      # this number.
+      #
+      # The 70% floor is a regression guard, not a target: it's set a couple points below what
+      # this scope currently measures. Raise it as coverage improves; don't lower it to make a
+      # failing PR pass.
+      - name: Test with coverage
+        run: cargo llvm-cov --lib --bins --test integration --fail-under-lines 70
 
   e2e:
     runs-on: ubuntu-latest
