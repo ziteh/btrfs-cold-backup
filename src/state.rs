@@ -20,7 +20,6 @@ pub struct BackupState {
     pub timestamp: String,
     pub output_dir: PathBuf,
     pub stream_hash: Option<String>,
-    #[serde(default)]
     pub total_parts: Option<u32>,
     pub parts_completed: HashMap<String, UploadedPart>,
     pub manifest_uploaded: bool,
