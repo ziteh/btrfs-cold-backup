@@ -323,7 +323,7 @@ pub async fn restore_task<R: RemoteBackend>(
     remote: &R,
 ) -> Result<RestoreProgress> {
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let (timestamp, collision_suffix) = compact_to_iso(date)?;
+    let timestamp = compact_to_iso(date)?;
 
     let lead_days = config
         .s3
@@ -366,13 +366,7 @@ pub async fn restore_task<R: RemoteBackend>(
     let backup: Backup = match tokio::fs::read(&manifest_path).await {
         Ok(bytes) => serde_yaml::from_slice(&bytes)?,
         Err(_) => {
-            let manifest_key = s3_manifest_key(
-                &config.s3.prefix,
-                &sanitized,
-                level,
-                &timestamp,
-                collision_suffix.as_deref(),
-            )?;
+            let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp);
 
             // Check if manifest itself is archived before attempting download. Both
             // NotRequested (needs a retrieval kicked off) and InProgress (already requested,
@@ -449,17 +443,10 @@ pub async fn restore_task<R: RemoteBackend>(
         .parts
         .iter()
         .map(|p| {
-            s3_backup_key(
-                &config.s3.prefix,
-                &sanitized,
-                level,
-                &timestamp,
-                collision_suffix.as_deref(),
-                &p.index,
-            )
-            .map(|k| (p.index.clone(), k))
+            let key = s3_backup_key(&config.s3.prefix, &sanitized, level, &timestamp, &p.index);
+            (p.index.clone(), key)
         })
-        .collect::<Result<_>>()?;
+        .collect();
 
     let result: Result<RestoreProgress> = async {
         // Live S3 retrieval status of every part still needing download; the persisted

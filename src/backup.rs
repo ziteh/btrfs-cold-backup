@@ -15,9 +15,8 @@ use crate::{
     },
 };
 
-// Parses btrbk's snapshot naming (the optional _<n> is btrbk's same-minute collision
-// counter); the expected format is spelled out in the error message below.
-fn snapshot_timestamp(name: &str) -> Result<(String, Option<String>)> {
+// Parses btrbk's snapshot naming; the expected format is spelled out in the error message below.
+fn snapshot_timestamp(name: &str) -> Result<String> {
     let err = || {
         anyhow!(
             "invalid snapshot name '{name}': expected bcb_level<N>.<YYYYMMDD>T<hhmm> \
@@ -30,30 +29,31 @@ fn snapshot_timestamp(name: &str) -> Result<(String, Option<String>)> {
     if !prefix.starts_with("bcb_level") {
         return Err(err());
     }
-    let (date, rest) = ts.split_once('T').ok_or_else(err)?;
-    let mut segments = rest.split('_');
-    let time = segments.next().ok_or_else(err)?;
-    let collision: Vec<&str> = segments.collect();
-    if date.len() != 8
-        || !all_digits(date)
-        || time.len() != 4
-        || !all_digits(time)
-        || !collision.iter().all(|s| all_digits(s))
-    {
+    let (date, time) = ts.split_once('T').ok_or_else(err)?;
+
+    // btrbk appends a counter when it takes two snapshots of the same subvolume within one
+    // minute. bcb identifies a backup by its minute, so it cannot store both. Refusing is
+    // safe: the backup is skipped this cycle only, and the next snapshot sorts after this
+    // one, so the following cycle picks it up without intervention.
+    if let Some((_, counter)) = time.split_once('_') {
+        return Err(anyhow!(
+            "snapshot '{name}' is a btrbk same-minute snapshot (trailing '_{counter}'), \
+             which bcb cannot back up because it identifies backups down to the minute. \
+             Delete or rename it; the next scheduled run will back up normally either way."
+        ));
+    }
+
+    if date.len() != 8 || !all_digits(date) || time.len() != 4 || !all_digits(time) {
         return Err(err());
     }
-    let iso = format!(
+    Ok(format!(
         "{}-{}-{}T{}:{}:00Z",
         &date[0..4],
         &date[4..6],
         &date[6..8],
         &time[0..2],
         &time[2..4]
-    );
-    // The collision suffix is threaded into the S3 key so a second same-minute snapshot
-    // gets its own backup instead of silently colliding with the first one's manifest key.
-    let suffix = (!collision.is_empty()).then(|| collision.join("_"));
-    Ok((iso, suffix))
+    ))
 }
 
 struct PersistentState {
@@ -85,9 +85,9 @@ impl PersistentState {
 struct BackupPlan {
     snapshot_name: String,
     timestamp: String,
-    collision_suffix: Option<String>,
     parent_snapshot: Option<String>,
     output_dir: PathBuf,
+    manifest_key: String,
 }
 
 /// Determines the incremental parent for a level > 0 backup from the last manifest;
@@ -142,17 +142,19 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     remote: &R,
     state: &mut PersistentState,
 ) -> Result<Option<BackupPlan>> {
+    let sanitized = sanitize_subvolume_path(&task.subvolume)?;
+
     if !state.inner.snapshot_name.is_empty() {
+        let timestamp = state.inner.timestamp.clone();
         return Ok(Some(BackupPlan {
+            manifest_key: s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp),
             snapshot_name: state.inner.snapshot_name.clone(),
-            timestamp: state.inner.timestamp.clone(),
-            collision_suffix: state.inner.collision_suffix.clone(),
+            timestamp,
             parent_snapshot: state.inner.parent_snapshot.clone(),
             output_dir: state.inner.output_dir.clone(),
         }));
     }
 
-    let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let snapshots = btrfs.list_snapshots(&task.snapshot_dir).await?;
     let level_prefix = format!("bcb_level{level}.");
     let snapshot_name = snapshots
@@ -160,18 +162,12 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
         .rfind(|s| s.starts_with(&level_prefix))
         .ok_or_else(|| anyhow!("no level {level} snapshot found in {:?}", task.snapshot_dir))?
         .clone();
-    let (timestamp, collision_suffix) = snapshot_timestamp(&snapshot_name)?;
+    let timestamp = snapshot_timestamp(&snapshot_name)?;
 
     // A manifest already on remote means this snapshot is fully backed up: skip rather than
     // redo it — overwriting archived objects incurs minimum-storage-duration charges, and a
     // skip keeps re-runs idempotent so one completed task never blocks the others.
-    let manifest_key = s3_manifest_key(
-        &config.s3.prefix,
-        &sanitized,
-        level,
-        &timestamp,
-        collision_suffix.as_deref(),
-    )?;
+    let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp);
     if remote.exists(&manifest_key).await? {
         tracing::info!(
             "snapshot '{snapshot_name}' is already backed up at level {level}, skipping"
@@ -189,13 +185,7 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
         &timestamp,
     )
     .await?;
-    let output_dir = backup_output_dir(
-        &config.base_dir,
-        &sanitized,
-        level,
-        &timestamp,
-        collision_suffix.as_deref(),
-    )?;
+    let output_dir = backup_output_dir(&config.base_dir, &sanitized, level, &timestamp);
 
     state.inner.task_name = task.name.clone();
     state.inner.level = level;
@@ -203,15 +193,14 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     state.inner.parent_snapshot = parent_snapshot.clone();
     state.inner.timestamp = timestamp.clone();
     state.inner.output_dir = output_dir.clone();
-    state.inner.collision_suffix = collision_suffix.clone();
     state.save()?;
 
     Ok(Some(BackupPlan {
         snapshot_name,
         timestamp,
-        collision_suffix,
         parent_snapshot,
         output_dir,
+        manifest_key,
     }))
 }
 
@@ -430,7 +419,6 @@ fn validate_part_coverage(part_suffixes: &BTreeSet<String>, state: &BackupState)
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn encrypt_and_upload_part<R: RemoteBackend>(
     remote: &R,
     part_index: &str,
@@ -438,7 +426,6 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     sanitized: &str,
     level: u32,
     timestamp: &str,
-    collision_suffix: Option<&str>,
     config: &Config,
 ) -> Result<CompletedPart> {
     let raw_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}"));
@@ -471,14 +458,7 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
                 config.s3.storage_class.backup_data.len()
             )
         })?;
-    let part_key = s3_backup_key(
-        &config.s3.prefix,
-        sanitized,
-        level,
-        timestamp,
-        collision_suffix,
-        part_index,
-    )?;
+    let part_key = s3_backup_key(&config.s3.prefix, sanitized, level, timestamp, part_index);
     remote
         .upload_file(
             &part_key,
@@ -551,7 +531,6 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             &sanitized,
             level,
             &plan.timestamp,
-            plan.collision_suffix.as_deref(),
             config,
         )
         .await?;
@@ -593,16 +572,9 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     };
 
     if !state.inner.manifest_uploaded {
-        let manifest_key = s3_manifest_key(
-            &config.s3.prefix,
-            &sanitized,
-            level,
-            &plan.timestamp,
-            plan.collision_suffix.as_deref(),
-        )?;
         remote
             .upload_bytes(
-                &manifest_key,
+                &plan.manifest_key,
                 serde_yaml::to_string(&backup)?.into_bytes(),
                 &config.s3.storage_class.manifest,
                 "bcb-backup-level=manifest",
@@ -660,16 +632,16 @@ mod tests {
 
     #[test]
     fn test_snapshot_timestamp_valid_name() {
-        let (ts, suffix) = snapshot_timestamp("bcb_level1.20260602T1430").unwrap();
+        let ts = snapshot_timestamp("bcb_level1.20260602T1430").unwrap();
         assert_eq!(ts, "2026-06-02T14:30:00Z");
-        assert!(suffix.is_none());
     }
 
     #[test]
-    fn test_snapshot_timestamp_collision_suffix() {
-        let (ts, suffix) = snapshot_timestamp("bcb_level0.20260602T1430_1").unwrap();
-        assert_eq!(ts, "2026-06-02T14:30:00Z");
-        assert_eq!(suffix.as_deref(), Some("1"));
+    fn test_snapshot_timestamp_same_minute_snapshot_error_is_specific() {
+        let err = snapshot_timestamp("bcb_level0.20260602T1430_1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same-minute"), "unhelpful message: {err}");
     }
 
     #[test]

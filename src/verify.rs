@@ -46,13 +46,8 @@ pub async fn verify_task<R: RemoteBackend>(
     let mut newest_created_at = 0i64;
 
     for entry in &entries {
-        let manifest_key = s3_manifest_key(
-            &config.s3.prefix,
-            &sanitized,
-            entry.level,
-            &entry.timestamp,
-            None,
-        )?;
+        let manifest_key =
+            s3_manifest_key(&config.s3.prefix, &sanitized, entry.level, &entry.timestamp);
         let backup: Backup = match remote.download(&manifest_key).await {
             Ok(bytes) => match serde_yaml::from_slice(&bytes) {
                 Ok(b) => b,
@@ -94,9 +89,8 @@ pub async fn verify_task<R: RemoteBackend>(
                 &sanitized,
                 entry.level,
                 &entry.timestamp,
-                None,
                 &part.index,
-            )?;
+            );
             match remote.head_metadata(&part_key).await {
                 Ok(meta) => {
                     if meta.size_bytes != part.size_bytes {

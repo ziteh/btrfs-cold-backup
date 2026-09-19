@@ -494,12 +494,12 @@ async fn backup_should_skip_already_completed_backup() {
     );
 }
 
-/// Regression test: btrbk's same-minute collision suffix (`_<n>`) must get its own S3 key.
-/// Before the fix, two same-minute snapshots produced the exact same ISO timestamp and
-/// therefore the exact same manifest key, so the second snapshot was silently treated as
-/// "already backed up" and skipped — even though it was never actually uploaded.
+/// Regression test: bcb identifies a backup down to the minute, so btrbk's same-minute
+/// snapshot (`_<n>`) has no distinct key of its own. It must fail loudly. The defect this
+/// guards against is the silent one: reusing the first snapshot's key made the second look
+/// "already backed up" and skipped, even though it was never uploaded.
 #[tokio::test]
-async fn collision_suffixed_snapshot_should_get_its_own_key_not_be_silently_skipped() {
+async fn same_minute_snapshot_should_fail_loudly_not_be_silently_skipped() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
@@ -511,42 +511,15 @@ async fn collision_suffixed_snapshot_should_get_its_own_key_not_be_silently_skip
             "bcb_level0.20260602T1430_1".to_string(),
         ])
     });
-    btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
 
-    let mut remote = MockRemote::new();
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(false));
-    // The first (unsuffixed) snapshot's manifest already exists on remote; the collided
-    // one's must not, or this test would prove nothing about the fix.
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("task_manifest") && !key.contains("_1/"))
-        .returning(|_| Ok(true));
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("task_manifest") && key.contains("_1/"))
-        .returning(|_| Ok(false));
-    remote
-        .expect_upload_file()
-        .withf(|key, _, _, _| key.contains("_1/"))
-        .returning(|_, _, _, _| Ok(()));
-    remote
-        .expect_upload_bytes()
-        .withf(|key, _, _, _| key.contains("task_manifest"))
-        .returning(|_, _, _, _| Ok(()));
-    remote
-        .expect_upload_bytes()
-        .withf(|key, _, _, _| key.contains("last_backup_manifest"))
-        .returning(|_, _, _, _| Ok(()));
+    // No remote expectations: bailing out before touching S3 is part of the contract.
+    let remote = MockRemote::new();
 
-    let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
-
-    let backup = result
-        .expect("collision-suffixed snapshot must back up successfully")
-        .expect("must not be skipped as already backed up");
-    assert_eq!(backup.snapshot_name, "bcb_level0.20260602T1430_1");
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect_err("a same-minute snapshot must not be silently skipped")
+        .to_string();
+    assert!(err.contains("same-minute"), "unhelpful message: {err}");
 }
 
 /// Regression test: completing a new level-0 backup must drop any deeper level's entry from
@@ -716,7 +689,6 @@ async fn resume_should_skip_already_uploaded_parts() {
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
-        collision_suffix: None,
         timestamp: "2026-06-02T14:30:00Z".to_string(),
         output_dir: output_dir.clone(),
         stream_hash: Some("streamhash".to_string()),
@@ -790,7 +762,6 @@ async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
-        collision_suffix: None,
         timestamp: "2026-06-02T14:30:00Z".to_string(),
         output_dir: output_dir.clone(),
         stream_hash: Some("streamhash".to_string()),
@@ -877,7 +848,6 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
-        collision_suffix: None,
         timestamp: "2026-06-02T14:30:00Z".to_string(),
         output_dir: output_dir.clone(),
         stream_hash: Some("streamhash".to_string()),

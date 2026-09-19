@@ -68,8 +68,7 @@ enum Commands {
         task: String,
         #[arg(long)]
         level: u32,
-        /// Backup timestamp: YYYYMMDDHHMM (e.g. 202606021430) or YYYYMMDD for T00:00;
-        /// append _<n> for btrbk's same-minute collision suffix (e.g. 202606021430_1)
+        /// Backup timestamp: YYYYMMDDHHMM (e.g. 202606021430) or YYYYMMDD for T00:00
         #[arg(long)]
         date: String,
         #[arg(long)]

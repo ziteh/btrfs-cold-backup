@@ -46,33 +46,35 @@ pub fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// Parses a compact date/time into ISO 8601, splitting off an optional trailing
-/// `_<digits>` collision-counter suffix (btrbk's same-minute snapshot counter) so a
-/// specific same-minute snapshot stays addressable as a distinct backup.
-pub fn compact_to_iso(s: &str) -> Result<(String, Option<String>)> {
-    let (base, suffix) = match s.split_once('_') {
-        Some((base, suf)) if !suf.is_empty() && suf.bytes().all(|b| b.is_ascii_digit()) => {
-            (base, Some(suf.to_string()))
-        }
-        _ => (s, None),
-    };
+/// Parses a compact date/time into ISO 8601.
+pub fn compact_to_iso(s: &str) -> Result<String> {
+    // btrbk appends `_<n>` when it creates two snapshots of the same subvolume within one
+    // minute. bcb does not back those up (see snapshot_timestamp), so there is never a
+    // backup addressable by such a date; say so rather than blaming the date format.
+    if let Some((_, counter)) = s.split_once('_')
+        && !counter.is_empty()
+        && counter.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(anyhow!(
+            "'{s}' names a btrbk same-minute snapshot, which bcb does not back up, \
+             so no backup exists under that date"
+        ));
+    }
 
-    let iso = if base.len() == 12 && base.chars().all(|c| c.is_ascii_digit()) {
-        format!(
+    if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(format!(
             "{}-{}-{}T{}:{}:00Z",
-            &base[0..4],
-            &base[4..6],
-            &base[6..8],
-            &base[8..10],
-            &base[10..12]
-        )
-    } else if base.len() == 8 && base.chars().all(|c| c.is_ascii_digit()) {
-        format!("{}-{}-{}T00:00:00Z", &base[0..4], &base[4..6], &base[6..8])
+            &s[0..4],
+            &s[4..6],
+            &s[6..8],
+            &s[8..10],
+            &s[10..12]
+        ))
+    } else if s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(format!("{}-{}-{}T00:00:00Z", &s[0..4], &s[4..6], &s[6..8]))
     } else {
-        return Err(anyhow!("date must be YYYYMMDD or YYYYMMDDHHMM, got: {s}"));
-    };
-
-    Ok((iso, suffix))
+        Err(anyhow!("date must be YYYYMMDD or YYYYMMDDHHMM, got: {s}"))
+    }
 }
 
 pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
@@ -95,30 +97,25 @@ pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
     Ok(sanitized)
 }
 
-pub fn task_dir_name(level: u32, timestamp: &str, suffix: Option<&str>) -> Result<String> {
-    if timestamp.len() < 16 {
-        return Err(anyhow!(
-            "timestamp must be in ISO 8601 format (YYYY-MM-DDTHH:MM...)"
-        ));
-    }
-    let date_no_dash = timestamp[0..10].replace('-', "");
-    let time_no_colon = timestamp[11..16].replace(':', "");
-    let mut name = format!("bcb_level{}_{}{}", level, date_no_dash, time_no_colon);
-    if let Some(suffix) = suffix {
-        name.push('_');
-        name.push_str(suffix);
-    }
-    Ok(name)
+/// Builds the directory/key component identifying one backup, from an ISO 8601 timestamp.
+pub fn task_dir_name(level: u32, timestamp: &str) -> String {
+    // The first 12 digits of an ISO 8601 timestamp are exactly YYYYMMDDHHMM.
+    let compact: String = timestamp
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(12)
+        .collect();
+    format!("bcb_level{level}_{compact}")
 }
 
 /// Inverse of [`task_dir_name`]: extracts (level, ISO timestamp) from a task dir name.
 pub fn parse_task_dir_name(dir: &str) -> Option<(u32, String)> {
     let parts: Vec<&str> = dir.split('_').collect();
-    let [_, level_str, compact_ts, ..] = parts.as_slice() else {
+    let [_, level_str, compact_ts] = parts.as_slice() else {
         return None;
     };
     let level: u32 = level_str.strip_prefix("level")?.parse().ok()?;
-    let (timestamp, _) = compact_to_iso(compact_ts).ok()?;
+    let timestamp = compact_to_iso(compact_ts).ok()?;
     Some((level, timestamp))
 }
 
@@ -127,14 +124,10 @@ pub fn s3_backup_key(
     sanitized_subvol: &str,
     level: u32,
     timestamp: &str,
-    suffix: Option<&str>,
     index: &str,
-) -> Result<String> {
-    let dir_name = task_dir_name(level, timestamp, suffix)?;
-    let key = format!(
-        "{prefix}backup-data/{sanitized_subvol}/{dir_name}/{SNAPSHOT_PART_PREFIX}{index}.age"
-    );
-    Ok(key)
+) -> String {
+    let dir_name = task_dir_name(level, timestamp);
+    format!("{prefix}backup-data/{sanitized_subvol}/{dir_name}/{SNAPSHOT_PART_PREFIX}{index}.age")
 }
 
 pub fn s3_manifest_key(
@@ -142,14 +135,9 @@ pub fn s3_manifest_key(
     sanitized_subvol: &str,
     level: u32,
     timestamp: &str,
-    suffix: Option<&str>,
-) -> Result<String> {
-    let dir_name = task_dir_name(level, timestamp, suffix)?;
-    let key = format!(
-        "{}manifests/{}/{}/task_manifest.yaml",
-        prefix, sanitized_subvol, dir_name
-    );
-    Ok(key)
+) -> String {
+    let dir_name = task_dir_name(level, timestamp);
+    format!("{prefix}manifests/{sanitized_subvol}/{dir_name}/task_manifest.yaml")
 }
 
 pub fn state_path(base_dir: &Path, sanitized_subvol: &str) -> PathBuf {
@@ -164,17 +152,13 @@ pub fn backup_output_dir(
     sanitized_subvol: &str,
     level: u32,
     timestamp: &str,
-    suffix: Option<&str>,
-) -> Result<PathBuf> {
-    let dir_name = task_dir_name(level, timestamp, suffix)?;
-    Ok(base_dir.join("task").join(sanitized_subvol).join(dir_name))
+) -> PathBuf {
+    let dir_name = task_dir_name(level, timestamp);
+    base_dir.join("task").join(sanitized_subvol).join(dir_name)
 }
 
 pub fn s3_last_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
-    format!(
-        "{}manifests/{}/last_backup_manifest.yaml",
-        prefix, sanitized_subvol
-    )
+    format!("{prefix}manifests/{sanitized_subvol}/last_backup_manifest.yaml")
 }
 
 #[cfg(test)]
@@ -226,32 +210,32 @@ mod tests {
 
     #[test]
     fn test_task_dir_name_level_zero() {
-        let result = task_dir_name(0, "2026-06-02T14:30:00Z", None).unwrap();
+        let result = task_dir_name(0, "2026-06-02T14:30:00Z");
         assert_eq!(result, "bcb_level0_202606021430");
     }
 
     #[test]
     fn test_task_dir_name_level_one() {
-        let result = task_dir_name(1, "2026-06-02T14:30:00Z", None).unwrap();
+        let result = task_dir_name(1, "2026-06-02T14:30:00Z");
         assert_eq!(result, "bcb_level1_202606021430");
     }
 
     #[test]
     fn test_task_dir_name_different_date() {
-        let result = task_dir_name(2, "2025-12-25T10:15:30Z", None).unwrap();
+        let result = task_dir_name(2, "2025-12-25T10:15:30Z");
         assert_eq!(result, "bcb_level2_202512251015");
     }
 
     #[test]
     fn test_task_dir_name_same_day_different_time() {
-        let a = task_dir_name(0, "2026-06-25T08:00:00Z", None).unwrap();
-        let b = task_dir_name(0, "2026-06-25T20:00:00Z", None).unwrap();
+        let a = task_dir_name(0, "2026-06-25T08:00:00Z");
+        let b = task_dir_name(0, "2026-06-25T20:00:00Z");
         assert_ne!(a, b);
     }
 
     #[test]
     fn test_task_dir_name_parse_round_trip() {
-        let dir = task_dir_name(3, "2026-06-02T14:30:00Z", None).unwrap();
+        let dir = task_dir_name(3, "2026-06-02T14:30:00Z");
         let (level, timestamp) = parse_task_dir_name(&dir).unwrap();
         assert_eq!(level, 3);
         assert_eq!(timestamp, "2026-06-02T14:30:00Z");
@@ -265,56 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn test_task_dir_name_empty_timestamp() {
-        let result = task_dir_name(0, "", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_task_dir_name_invalid_timestamp() {
-        let result = task_dir_name(0, "invalid", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_task_dir_name_with_collision_suffix_differs_from_without() {
-        let a = task_dir_name(0, "2026-06-02T14:30:00Z", None).unwrap();
-        let b = task_dir_name(0, "2026-06-02T14:30:00Z", Some("1")).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(b, format!("{a}_1"));
+    fn test_parse_task_dir_name_rejects_trailing_segment() {
+        assert!(parse_task_dir_name("bcb_level0_202606021430_1").is_none());
     }
 
     #[test]
     fn test_s3_backup_key() {
-        let key = s3_backup_key(
-            "backups/",
-            "mnt_data",
-            0,
-            "2026-06-02T14:30:00Z",
-            None,
-            "000000",
-        )
-        .unwrap();
+        let key = s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", "000000");
         assert_eq!(
             key,
             "backups/backup-data/mnt_data/bcb_level0_202606021430/snapshot.part-000000.age"
-        );
-    }
-
-    #[test]
-    fn test_s3_backup_key_with_collision_suffix() {
-        let key = s3_backup_key(
-            "backups/",
-            "mnt_data",
-            0,
-            "2026-06-02T14:30:00Z",
-            Some("1"),
-            "000000",
-        )
-        .unwrap();
-        assert_eq!(
-            key,
-            "backups/backup-data/mnt_data/bcb_level0_202606021430_1/snapshot.part-000000.age"
         );
     }
 
@@ -325,10 +269,8 @@ mod tests {
             "mnt_data_movies",
             1,
             "2026-06-02T15:00:00Z",
-            None,
             "000004",
-        )
-        .unwrap();
+        );
         assert_eq!(
             key,
             "backups/backup-data/mnt_data_movies/bcb_level1_202606021500/snapshot.part-000004.age"
@@ -337,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_s3_manifest_key() {
-        let key = s3_manifest_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", None).unwrap();
+        let key = s3_manifest_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z");
         assert_eq!(
             key,
             "backups/manifests/mnt_data/bcb_level0_202606021430/task_manifest.yaml"
@@ -352,23 +294,21 @@ mod tests {
 
     #[test]
     fn test_compact_to_iso_12() {
-        let (iso, suffix) = compact_to_iso("202606021430").unwrap();
-        assert_eq!(iso, "2026-06-02T14:30:00Z");
-        assert!(suffix.is_none());
+        assert_eq!(
+            compact_to_iso("202606021430").unwrap(),
+            "2026-06-02T14:30:00Z"
+        );
     }
 
     #[test]
     fn test_compact_to_iso_8() {
-        let (iso, suffix) = compact_to_iso("20260602").unwrap();
-        assert_eq!(iso, "2026-06-02T00:00:00Z");
-        assert!(suffix.is_none());
+        assert_eq!(compact_to_iso("20260602").unwrap(), "2026-06-02T00:00:00Z");
     }
 
     #[test]
-    fn test_compact_to_iso_with_collision_suffix() {
-        let (iso, suffix) = compact_to_iso("202606021430_1").unwrap();
-        assert_eq!(iso, "2026-06-02T14:30:00Z");
-        assert_eq!(suffix.as_deref(), Some("1"));
+    fn test_compact_to_iso_same_minute_snapshot_error_is_specific() {
+        let err = compact_to_iso("202606021430_1").unwrap_err().to_string();
+        assert!(err.contains("same-minute"), "unhelpful message: {err}");
     }
 
     #[test]
@@ -379,10 +319,8 @@ mod tests {
 
     #[test]
     fn test_s3_keys_no_path_collision() {
-        let backup_key =
-            s3_backup_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z", None, "000000").unwrap();
-        let manifest_key =
-            s3_manifest_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z", None).unwrap();
+        let backup_key = s3_backup_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z", "000000");
+        let manifest_key = s3_manifest_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z");
         let last_key = s3_last_manifest_key("prefix/", "sub");
 
         assert_ne!(backup_key, manifest_key);
