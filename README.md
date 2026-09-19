@@ -1,6 +1,6 @@
 # Btrfs Cold Backup
 
-`bcb` backs up btrfs subvolumes to object storage services.
+`bcb` backs up Btrfs subvolume snapshots to an object storage service for offsite backup.
 
 Features:
 
