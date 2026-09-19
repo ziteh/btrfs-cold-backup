@@ -70,7 +70,7 @@ pub struct RestoreProgress {
 /// Deep Archive SLA for each tier (since a single retrieval tier can back either storage
 /// class) with a 1.5x safety margin. Override via `restore.lead_days` if these drift from
 /// AWS's current published values.
-fn calculate_lead_days(tier: &str) -> f64 {
+fn default_lead_days(tier: &str) -> f64 {
     match tier {
         "Expedited" => 0.05, // Glacier only, ~1-5min SLA
         "Standard" => 0.75,  // max(Glacier ~5h, Deep Archive ~12h) * 1.5
@@ -80,7 +80,7 @@ fn calculate_lead_days(tier: &str) -> f64 {
 }
 
 /// Calculates the daily download budget in bytes from expected kbps.
-fn calculate_daily_budget_bytes(expected_download_kbps: u64) -> u64 {
+fn daily_budget_bytes(expected_download_kbps: u64) -> u64 {
     if expected_download_kbps == 0 {
         return 0;
     }
@@ -287,30 +287,107 @@ async fn fetch_live_statuses<R: RemoteBackend>(
     Ok(live)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn restore_task<R: RemoteBackend>(
-    config: &Config,
-    task: &Task,
-    level: u32,
-    date: &str,
-    target_dir: &Path,
-    private_key_str: &str,
-    retrieval: &RetrievalOptions,
+/// Fetches the manifest from S3 once and caches it in the work dir. A paced restore can span
+/// weeks while the manifest's retrieved copy only lives `--restore-days`; without the cache
+/// every expiry would stall the whole restore on a fresh manifest retrieval (hours to days on
+/// archive tiers) even when part copies are sitting ready.
+async fn load_or_fetch_manifest<R: RemoteBackend>(
     remote: &R,
-) -> Result<RestoreProgress> {
-    let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let timestamp = compact_to_iso(date)?;
+    manifest_key: &str,
+    cache_path: &Path,
+    retrieval: &RetrievalOptions,
+) -> Result<Backup> {
+    if let Ok(bytes) = tokio::fs::read(cache_path).await {
+        return Ok(serde_yaml::from_slice(&bytes)?);
+    }
 
+    // The manifest may itself be archived. Both NotRequested (needs a retrieval kicked off)
+    // and InProgress (already requested, not yet Ready) must bail out here — downloading an
+    // archived-and-not-yet-restored object fails at S3.
+    match remote.restore_status_detail(manifest_key).await?.status {
+        RestoreStatus::Ready => {}
+        RestoreStatus::NotRequested => {
+            tracing::warn!("manifest is archived, requesting retrieval");
+            remote
+                .request_restore(manifest_key, retrieval.days, &retrieval.tier)
+                .await?;
+            return Err(anyhow!(
+                "manifest archived, retrieval requested; re-run restore task once retrieval completes"
+            ));
+        }
+        RestoreStatus::InProgress => {
+            return Err(anyhow!(
+                "manifest retrieval already in progress; re-run restore task once it completes"
+            ));
+        }
+    }
+
+    let bytes = remote.download(manifest_key).await?;
+    // Parse before caching so a corrupt download is never persisted.
+    let backup: Backup = serde_yaml::from_slice(&bytes)?;
+    let tmp = cache_path.with_extension("yaml.tmp");
+    tokio::fs::write(&tmp, &bytes).await?;
+    tokio::fs::rename(&tmp, cache_path).await?;
+    Ok(backup)
+}
+
+/// Resumes the state file only if it belongs to this exact manifest; otherwise starts fresh.
+fn load_or_init_state(
+    state_path: &Path,
+    backup: &Backup,
+    task_name: &str,
+    level: u32,
+    timestamp: &str,
+) -> Result<RestoreState> {
+    if let Some(state) = read_restore_state(state_path)?
+        && state.manifest_blake3 == backup.blake3
+    {
+        tracing::info!("resuming from existing restore state");
+        return Ok(state);
+    }
+
+    tracing::info!("starting fresh restore");
+    let mut state = RestoreState {
+        task_name: task_name.to_string(),
+        level,
+        timestamp: timestamp.to_string(),
+        snapshot_name: backup.snapshot_name.clone(),
+        manifest_blake3: backup.blake3.clone(),
+        parts: backup
+            .parts
+            .iter()
+            .map(|p| {
+                (
+                    p.index.clone(),
+                    RestorePartState {
+                        size_bytes: p.size_bytes,
+                        blake3: p.blake3.clone(),
+                        download_state: PartDownloadState::NotDownloaded,
+                    },
+                )
+            })
+            .collect(),
+        stream_verified: false,
+        receive_completed: false,
+        last_updated: 0,
+    };
+    state.save(state_path)?;
+    Ok(state)
+}
+
+/// Computes how many bytes of retrieval may be in flight at once, and rejects a
+/// `--restore-days` too short for the configured pacing before any S3 side effect happens.
+fn retrieval_buffer_target(config: &Config, retrieval: &RetrievalOptions) -> Result<u64> {
     let lead_days = config
         .s3
         .restore
         .lead_days
-        .unwrap_or_else(|| calculate_lead_days(&retrieval.tier));
-    let daily_budget = calculate_daily_budget_bytes(config.s3.restore.expected_download_kbps);
+        .unwrap_or_else(|| default_lead_days(&retrieval.tier));
+    let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);
+
     // With pacing enabled, a wave of retrieved copies is drained over ~lead_days of
     // downloading; a copy expiring before its turn wastes per-GB retrieval fees on a
-    // re-request. Checked before any S3 side effect so a misconfiguration is caught
-    // before retrievals are kicked off.
+    // re-request.
     if daily_budget > 0 && (retrieval.days as f64) < lead_days + 1.0 {
         return Err(anyhow!(
             "retrieved copies would expire before the paced download reaches them: \
@@ -321,117 +398,43 @@ pub async fn restore_task<R: RemoteBackend>(
             lead_days
         ));
     }
-    // expected_download_kbps == 0 means "no pacing estimate given" — fall back to requesting
-    // every remaining part immediately (the pre-pacing behavior), rather than a buffer_target
-    // of 0 bytes, which would never satisfy the budget gate and silently never request
-    // retrieval for anything.
-    let buffer_target = if daily_budget == 0 {
+
+    // expected_download_kbps == 0 means "no pacing estimate given" — request every remaining
+    // part immediately rather than use a target of 0 bytes, which no part could ever fit
+    // under, silently never requesting any retrieval at all.
+    Ok(if daily_budget == 0 {
         u64::MAX
     } else {
         (lead_days * daily_budget as f64) as u64
-    };
+    })
+}
 
-    let work_dir = restore_work_dir(&config.base_dir, &task.name, level, &timestamp);
-    tokio::fs::create_dir_all(&work_dir).await?;
+/// One invocation of the restore pipeline, holding the context its four phases share.
+struct RestoreRun<'a, R: RemoteBackend> {
+    config: &'a Config,
+    remote: &'a R,
+    retrieval: &'a RetrievalOptions,
+    target_dir: &'a Path,
+    private_key: &'a str,
+    backup: Backup,
+    part_keys: HashMap<String, String>,
+    buffer_target: u64,
+    work_dir: PathBuf,
+    state_path: PathBuf,
+    state: RestoreState,
+}
 
-    // The manifest is fetched from S3 once and cached in the work dir. A paced restore can
-    // span weeks while the manifest's retrieved copy only lives `--restore-days`; without
-    // the cache every expiry would stall the whole restore on a fresh manifest retrieval
-    // (hours to days on archive tiers) even when part copies are sitting ready.
-    let manifest_path = work_dir.join("manifest.yaml");
-    let backup: Backup = match tokio::fs::read(&manifest_path).await {
-        Ok(bytes) => serde_yaml::from_slice(&bytes)?,
-        Err(_) => {
-            let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp);
-
-            // Check if manifest itself is archived before attempting download. Both
-            // NotRequested (needs a retrieval kicked off) and InProgress (already requested,
-            // not yet Ready) must bail out here — downloading an archived-and-not-yet-restored
-            // object fails at S3.
-            let manifest_status = remote.restore_status_detail(&manifest_key).await?;
-            match manifest_status.status {
-                RestoreStatus::Ready => {}
-                RestoreStatus::NotRequested => {
-                    tracing::warn!("manifest is archived, requesting retrieval");
-                    remote
-                        .request_restore(&manifest_key, retrieval.days, &retrieval.tier)
-                        .await?;
-                    return Err(anyhow!(
-                        "manifest archived, retrieval requested; re-run restore task once retrieval completes"
-                    ));
-                }
-                RestoreStatus::InProgress => {
-                    return Err(anyhow!(
-                        "manifest retrieval already in progress; re-run restore task once it completes"
-                    ));
-                }
-            }
-
-            let manifest_bytes = remote.download(&manifest_key).await?;
-            // Parse before caching so a corrupt download is never persisted.
-            let backup: Backup = serde_yaml::from_slice(&manifest_bytes)?;
-            let tmp = manifest_path.with_extension("yaml.tmp");
-            tokio::fs::write(&tmp, &manifest_bytes).await?;
-            tokio::fs::rename(&tmp, &manifest_path).await?;
-            backup
-        }
-    };
-
-    let state_path = restore_state_file(&work_dir);
-    let mut state = match read_restore_state(&state_path)? {
-        Some(s) if s.manifest_blake3 == backup.blake3 => {
-            tracing::info!("resuming from existing restore state");
-            s
-        }
-        _ => {
-            tracing::info!("starting fresh restore");
-            let mut new_state = RestoreState {
-                task_name: task.name.clone(),
-                level,
-                timestamp: timestamp.clone(),
-                snapshot_name: backup.snapshot_name.clone(),
-                manifest_blake3: backup.blake3.clone(),
-                parts: backup
-                    .parts
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.index.clone(),
-                            RestorePartState {
-                                size_bytes: p.size_bytes,
-                                blake3: p.blake3.clone(),
-                                download_state: PartDownloadState::NotDownloaded,
-                            },
-                        )
-                    })
-                    .collect(),
-                stream_verified: false,
-                receive_completed: false,
-                last_updated: 0,
-            };
-            new_state.save(&state_path)?;
-            new_state
-        }
-    };
-
-    let part_keys: HashMap<String, String> = backup
-        .parts
-        .iter()
-        .map(|p| {
-            let key = s3_backup_key(&config.s3.prefix, &sanitized, level, &timestamp, &p.index);
-            (p.index.clone(), key)
-        })
-        .collect();
-
-    let result: Result<RestoreProgress> = async {
+impl<R: RemoteBackend> RestoreRun<'_, R> {
+    async fn run(&mut self) -> Result<RestoreProgress> {
         // Live S3 retrieval status of every part still needing download; the persisted
         // per-part states alone can't be trusted for "downloadable now" (a retrieved copy
         // may have expired since the last run, or a partial download's copy may still be
         // valid).
-        let live = fetch_live_statuses(remote, &part_keys, &state, config).await?;
+        let live =
+            fetch_live_statuses(self.remote, &self.part_keys, &self.state, self.config).await?;
 
         let live_bytes = |status: RestoreStatus| -> u64 {
-            state
+            self.state
                 .parts
                 .iter()
                 .filter(|(index, _)| {
@@ -444,26 +447,78 @@ pub async fn restore_task<R: RemoteBackend>(
         let ready_bytes = live_bytes(RestoreStatus::Ready);
         let in_progress_bytes = live_bytes(RestoreStatus::InProgress);
 
-        // Request retrievals BEFORE downloading: requests are instant while draining the
-        // ready wave below can take days, and AWS prepares the next wave in parallel —
-        // requesting afterwards would serialize each cycle into download-then-wait. Ready
-        // bytes are excluded from the budget gate because this run is about to drain them;
-        // what counts against the lead buffer is what will still be arriving after this
-        // run: in-progress retrievals plus the requests made here. Partially downloaded
-        // parts whose copy expired are re-requested unconditionally (their bytes are
-        // already invested; the resume offset stays valid since the object is immutable).
+        self.request_retrievals(&live, ready_bytes, in_progress_bytes)
+            .await?;
+        let parts_failed = self.download_ready_parts(&live).await?;
+
+        let parts_total = self.state.parts.len();
+        let parts_downloaded = self
+            .state
+            .parts
+            .values()
+            .filter(|p| matches!(p.download_state, PartDownloadState::Downloaded))
+            .count();
+
+        if parts_downloaded < parts_total {
+            let bytes_remaining: u64 = self
+                .state
+                .parts
+                .values()
+                .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
+                .map(|p| p.size_bytes)
+                .sum();
+            tracing::info!(
+                "waiting for retrievals: {}/{} parts downloaded, {} download failures this run, {} bytes ready, {} bytes in progress",
+                parts_downloaded,
+                parts_total,
+                parts_failed,
+                ready_bytes,
+                in_progress_bytes,
+            );
+            return Ok(RestoreProgress {
+                completed: false,
+                parts_downloaded,
+                parts_total,
+                bytes_remaining,
+            });
+        }
+
+        self.finalize().await?;
+        Ok(RestoreProgress {
+            completed: true,
+            parts_downloaded,
+            parts_total,
+            bytes_remaining: 0,
+        })
+    }
+
+    /// Requests retrievals BEFORE downloading: requests are instant while draining the ready
+    /// wave can take days, and AWS prepares the next wave in parallel — requesting afterwards
+    /// would serialize each cycle into download-then-wait.
+    async fn request_retrievals(
+        &mut self,
+        live: &HashMap<String, RestoreStatusDetail>,
+        ready_bytes: u64,
+        in_progress_bytes: u64,
+    ) -> Result<()> {
+        // Ready bytes are excluded from the budget gate because this run is about to drain
+        // them; what counts against the lead buffer is what will still be arriving after this
+        // run: in-progress retrievals plus the requests made here. Partially downloaded parts
+        // whose copy expired are re-requested unconditionally (their bytes are already
+        // invested; the resume offset stays valid since the object is immutable).
         let mut bytes_requested = 0u64;
         // Parts skipped purely because the budget was full, in case nothing else this run
         // ends up ready, in progress, or requested (see the stall-avoidance fallback below).
         let mut skipped_by_budget: Vec<String> = Vec::new();
-        for part_info in &backup.parts {
+
+        for part_info in &self.backup.parts {
             let Some(detail) = live.get(&part_info.index) else {
                 continue;
             };
             if detail.status != RestoreStatus::NotRequested {
                 continue;
             }
-            let Some(part) = state.parts.get(&part_info.index) else {
+            let Some(part) = self.state.parts.get(&part_info.index) else {
                 continue;
             };
             if matches!(part.download_state, PartDownloadState::Downloaded) {
@@ -474,18 +529,18 @@ pub async fn restore_task<R: RemoteBackend>(
                 PartDownloadState::PartiallyDownloaded { .. }
             );
             if !partially_downloaded
-                && in_progress_bytes + bytes_requested + part.size_bytes > buffer_target
+                && in_progress_bytes + bytes_requested + part.size_bytes > self.buffer_target
             {
                 skipped_by_budget.push(part_info.index.clone());
                 continue;
             }
 
-            let Some(key) = part_keys.get(&part_info.index) else {
+            let Some(key) = self.part_keys.get(&part_info.index) else {
                 continue;
             };
             tracing::info!("requesting retrieval for part {}", part_info.index);
-            remote
-                .request_restore(key, retrieval.days, &retrieval.tier)
+            self.remote
+                .request_restore(key, self.retrieval.days, &self.retrieval.tier)
                 .await?;
             if !partially_downloaded {
                 bytes_requested += part.size_bytes;
@@ -499,25 +554,33 @@ pub async fn restore_task<R: RemoteBackend>(
         if bytes_requested == 0 && ready_bytes == 0 && in_progress_bytes == 0 {
             let smallest = skipped_by_budget
                 .iter()
-                .filter_map(|index| state.parts.get(index).map(|p| (index.clone(), p.size_bytes)))
+                .filter_map(|index| self.state.parts.get(index).map(|p| (index, p.size_bytes)))
                 .min_by_key(|(_, size)| *size);
             if let Some((index, _)) = smallest
-                && let Some(key) = part_keys.get(&index)
+                && let Some(key) = self.part_keys.get(index)
             {
                 tracing::warn!(
                     "restore budget is smaller than any remaining part; forcing retrieval of \
                      part {index} to avoid stalling forever"
                 );
-                remote
-                    .request_restore(key, retrieval.days, &retrieval.tier)
+                self.remote
+                    .request_restore(key, self.retrieval.days, &self.retrieval.tier)
                     .await?;
             }
         }
 
-        // Download everything whose retrieved copy is live right now — including parts
-        // left half-downloaded by an interrupted run — earliest expiry first, so copies
-        // about to lapse are saved before the others.
-        let mut downloadable: Vec<(String, i64)> = state
+        Ok(())
+    }
+
+    /// Downloads every part whose retrieved copy is live right now — including parts left
+    /// half-downloaded by an interrupted run — earliest expiry first, so copies about to
+    /// lapse are saved before the others. Returns how many parts failed to download.
+    async fn download_ready_parts(
+        &mut self,
+        live: &HashMap<String, RestoreStatusDetail>,
+    ) -> Result<usize> {
+        let mut downloadable: Vec<(String, i64)> = self
+            .state
             .parts
             .iter()
             .filter(|(_, p)| !matches!(p.download_state, PartDownloadState::Downloaded))
@@ -534,16 +597,16 @@ pub async fn restore_task<R: RemoteBackend>(
 
         let mut parts_failed = 0usize;
         for (part_idx, _) in downloadable {
-            let expected_blake3 = match state.parts.get(&part_idx) {
+            let expected_blake3 = match self.state.parts.get(&part_idx) {
                 Some(part) => part.blake3.clone(),
                 None => continue,
             };
-            let key = match part_keys.get(&part_idx) {
+            let key = match self.part_keys.get(&part_idx) {
                 Some(k) => k.clone(),
                 None => continue,
             };
 
-            let enc_path = work_dir.join(format!("part-{}.age", part_idx));
+            let enc_path = self.work_dir.join(format!("part-{part_idx}.age"));
             tracing::info!("downloading part {}", part_idx);
             // Draining a wave can take hours to days, so a copy that was Ready at the
             // status check may expire before its turn, and transient network failures can
@@ -551,13 +614,13 @@ pub async fn restore_task<R: RemoteBackend>(
             // the failed part's progress is already persisted chunk-by-chunk and the next
             // run picks it up again.
             if let Err(e) = download_part_with_resume(
-                remote,
+                self.remote,
                 &key,
                 part_chunk_size() as u64,
                 &enc_path,
-                &mut state,
+                &mut self.state,
                 &part_idx,
-                &state_path,
+                &self.state_path,
             )
             .await
             {
@@ -581,72 +644,46 @@ pub async fn restore_task<R: RemoteBackend>(
                 ));
             }
 
-            let dec_path = work_dir.join(format!("part-{}.btrfs", part_idx));
-            decrypt_file(&enc_path, &dec_path, private_key_str).await?;
+            let dec_path = self.work_dir.join(format!("part-{part_idx}.btrfs"));
+            decrypt_file(&enc_path, &dec_path, self.private_key).await?;
             let _ = tokio::fs::remove_file(&enc_path).await;
 
-            if let Some(part) = state.parts.get_mut(&part_idx) {
+            if let Some(part) = self.state.parts.get_mut(&part_idx) {
                 part.download_state = PartDownloadState::Downloaded;
             }
-            state.save(&state_path)?;
+            self.state.save(&self.state_path)?;
         }
 
-        // Check if all parts are downloaded
-        let parts_total = state.parts.len();
-        let parts_downloaded = state
-            .parts
-            .values()
-            .filter(|p| matches!(p.download_state, PartDownloadState::Downloaded))
-            .count();
+        Ok(parts_failed)
+    }
 
-        if parts_downloaded < parts_total {
-            let bytes_remaining: u64 = state
-                .parts
-                .values()
-                .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
-                .map(|p| p.size_bytes)
-                .sum();
-            tracing::info!(
-                "waiting for retrievals: {}/{} parts downloaded, {} download failures this run, {} bytes ready, {} bytes in progress",
-                parts_downloaded,
-                parts_total,
-                parts_failed,
-                ready_bytes,
-                in_progress_bytes,
-            );
-            return Ok(RestoreProgress {
-                completed: false,
-                parts_downloaded,
-                parts_total,
-                bytes_remaining,
-            });
-        }
-
-        // All parts downloaded. `stream_verified` and `receive_completed` are tracked as two
-        // separate flags (not one "did the final step" flag) so a crash between the hash
-        // check and the btrfs receive step doesn't cause a resumed run to skip re-attempting
-        // receive — that would silently report success without ever writing the subvolume.
+    /// All parts are downloaded: verify the reassembled stream, pipe it into `btrfs receive`
+    /// and clean up. `stream_verified` and `receive_completed` are two separate flags (not
+    /// one "did the final step" flag) so a crash between the hash check and the receive step
+    /// doesn't cause a resumed run to skip re-attempting receive — that would report success
+    /// without ever writing the subvolume.
+    async fn finalize(&mut self) -> Result<()> {
         let mut dec_paths = Vec::new();
-        for part in &backup.parts {
-            let dec_path = work_dir.join(format!("part-{}.btrfs", part.index));
+        for part in &self.backup.parts {
+            let dec_path = self.work_dir.join(format!("part-{}.btrfs", part.index));
             match tokio::fs::metadata(&dec_path).await {
                 Ok(_) => dec_paths.push(dec_path),
                 Err(_) => return Err(anyhow!("decrypted part {} not found", part.index)),
             }
         }
 
-        if !state.stream_verified {
+        if !self.state.stream_verified {
             tracing::info!("verifying stream hash");
-            verify_stream_hash(&dec_paths, &backup.blake3).await?;
-            state.stream_verified = true;
-            state.save(&state_path)?;
+            verify_stream_hash(&dec_paths, &self.backup.blake3).await?;
+            self.state.stream_verified = true;
+            self.state.save(&self.state_path)?;
         }
 
-        if !state.receive_completed {
+        if !self.state.receive_completed {
             tracing::info!("piping to btrfs receive");
-            pipe_to_btrfs_receive(&dec_paths, target_dir).await?;
+            pipe_to_btrfs_receive(&dec_paths, self.target_dir).await?;
 
-            let snapshot_path = target_dir.join(&backup.snapshot_name);
+            let snapshot_path = self.target_dir.join(&self.backup.snapshot_name);
             let verify = tokio::process::Command::new("btrfs")
                 .args(["subvolume", "show"])
                 .arg(&snapshot_path)
@@ -655,35 +692,87 @@ pub async fn restore_task<R: RemoteBackend>(
             if !verify.status.success() {
                 return Err(anyhow!(
                     "snapshot '{}' not found after restore",
-                    backup.snapshot_name
+                    self.backup.snapshot_name
                 ));
             }
 
-            state.receive_completed = true;
-            state.save(&state_path)?;
+            self.state.receive_completed = true;
+            self.state.save(&self.state_path)?;
             tracing::info!("restore completed successfully");
         }
 
         // Only clean up once the receive is fully verified.
-        if let Err(e) = tokio::fs::remove_dir_all(&work_dir).await {
-            tracing::warn!("failed to clean up restore work dir {:?}: {e}", work_dir);
+        if let Err(e) = tokio::fs::remove_dir_all(&self.work_dir).await {
+            tracing::warn!(
+                "failed to clean up restore work dir {:?}: {e}",
+                self.work_dir
+            );
         }
 
-        Ok(RestoreProgress {
-            completed: true,
-            parts_downloaded,
-            parts_total,
-            bytes_remaining: 0,
+        Ok(())
+    }
+}
+
+// The argument count is this function's public shape, as called from main.
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_task<R: RemoteBackend>(
+    config: &Config,
+    task: &Task,
+    level: u32,
+    date: &str,
+    target_dir: &Path,
+    private_key_str: &str,
+    retrieval: &RetrievalOptions,
+    remote: &R,
+) -> Result<RestoreProgress> {
+    let sanitized = sanitize_subvolume_path(&task.subvolume)?;
+    let timestamp = compact_to_iso(date)?;
+    let buffer_target = retrieval_buffer_target(config, retrieval)?;
+
+    let work_dir = restore_work_dir(&config.base_dir, &task.name, level, &timestamp);
+    tokio::fs::create_dir_all(&work_dir).await?;
+
+    let backup = load_or_fetch_manifest(
+        remote,
+        &s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp),
+        &work_dir.join("manifest.yaml"),
+        retrieval,
+    )
+    .await?;
+
+    let state_path = restore_state_file(&work_dir);
+    let state = load_or_init_state(&state_path, &backup, &task.name, level, &timestamp)?;
+
+    let part_keys = backup
+        .parts
+        .iter()
+        .map(|p| {
+            let key = s3_backup_key(&config.s3.prefix, &sanitized, level, &timestamp, &p.index);
+            (p.index.clone(), key)
         })
-    }
-    .await;
+        .collect();
 
-    if let Err(e) = &result {
+    let mut run = RestoreRun {
+        config,
+        remote,
+        retrieval,
+        target_dir,
+        private_key: private_key_str,
+        backup,
+        part_keys,
+        buffer_target,
+        work_dir,
+        state_path,
+        state,
+    };
+
+    run.run().await.inspect_err(|e| {
         tracing::error!("restore failed: {}", e);
-        tracing::info!("restore state preserved at {:?} for resumption", state_path);
-    }
-
-    result
+        tracing::info!(
+            "restore state preserved at {:?} for resumption",
+            run.state_path
+        );
+    })
 }
 
 #[cfg(test)]
