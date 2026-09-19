@@ -476,6 +476,107 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     })
 }
 
+/// Distinguishes "the split produced nothing" from "the output dir disappeared after a split
+/// that had already succeeded": the latter is recoverable by re-running the send, but only
+/// once the stream hash and part count recorded from the vanished run are cleared.
+fn ensure_parts_exist(
+    part_suffixes: &BTreeSet<String>,
+    state: &mut PersistentState,
+    output_dir: &Path,
+) -> Result<()> {
+    if !part_suffixes.is_empty() || !state.inner.parts_completed.is_empty() {
+        return Ok(());
+    }
+    if state.inner.stream_hash.is_some() {
+        state.inner.stream_hash = None;
+        state.inner.total_parts = None;
+        state.save()?;
+        return Err(anyhow!(
+            "output_dir vanished after split; state cleared — re-run to retry from split"
+        ));
+    }
+    Err(anyhow!("no snapshot parts found in {output_dir:?}"))
+}
+
+/// Assembles the manifest describing the backup that was just uploaded.
+async fn build_manifest(
+    config: &Config,
+    plan: &BackupPlan,
+    level: u32,
+    stream_hash: String,
+    state: &BackupState,
+) -> Backup {
+    let mut parts: Vec<PartInfo> = state
+        .parts_completed
+        .iter()
+        .map(|(index, part)| PartInfo {
+            index: index.clone(),
+            size_bytes: part.size_bytes,
+            blake3: part.blake3.clone(),
+        })
+        .collect();
+    parts.sort_by(|a, b| a.index.cmp(&b.index));
+
+    Backup {
+        timestamp: plan.timestamp.clone(),
+        created_at: crate::util::now_unix(),
+        level,
+        snapshot_name: plan.snapshot_name.clone(),
+        parent_snapshot: plan.parent_snapshot.clone(),
+        system: SystemInfo {
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            btrfs_version: crate::btrfs::btrfs_version().await,
+            bcb_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        age_public_key: config.age_public_key.clone(),
+        total_size_bytes: parts.iter().map(|p| p.size_bytes).sum(),
+        blake3: stream_hash,
+        parts,
+    }
+}
+
+/// Records this backup as the newest of its level, and drops every deeper level's entry:
+/// those were built on the level-N snapshot this run just superseded, so leaving them would
+/// let a later deeper-level backup chain silently onto a stale parent instead of failing
+/// loudly and asking for a fresh one.
+async fn publish_latest<R: RemoteBackend>(
+    config: &Config,
+    remote: &R,
+    sanitized: &str,
+    level: u32,
+    plan: &BackupPlan,
+) -> Result<()> {
+    let last_key = s3_last_manifest_key(&config.s3.prefix, sanitized);
+    let mut latest: LatestByLevel = if remote.exists(&last_key).await? {
+        // A corrupted last manifest must not be silently reset: dropping other levels'
+        // entries would break subsequent incremental backups without warning.
+        serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
+            anyhow!("failed to parse last manifest {last_key}: {e}; repair or delete it manually")
+        })?
+    } else {
+        LatestByLevel::default()
+    };
+
+    latest.retain(|&existing_level, _| existing_level <= level);
+    latest.insert(
+        level,
+        LatestBackup {
+            timestamp: plan.timestamp.clone(),
+            snapshot_name: plan.snapshot_name.clone(),
+        },
+    );
+
+    remote
+        .upload_bytes(
+            &last_key,
+            serde_yaml::to_string(&latest)?.into_bytes(),
+            &config.s3.storage_class.manifest,
+            "bcb-backup-level=manifest",
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     config: &Config,
     task: &Task,
@@ -505,17 +606,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
 
     let part_suffixes = collect_disk_parts(&plan.output_dir).await?;
 
-    if part_suffixes.is_empty() && state.inner.parts_completed.is_empty() {
-        if state.inner.stream_hash.is_some() {
-            state.inner.stream_hash = None;
-            state.inner.total_parts = None;
-            state.save()?;
-            return Err(anyhow!(
-                "output_dir vanished after split; state cleared — re-run to retry from split"
-            ));
-        }
-        return Err(anyhow!("no snapshot parts found in {:?}", plan.output_dir));
-    }
+    ensure_parts_exist(&part_suffixes, &mut state, &plan.output_dir)?;
 
     validate_part_coverage(&part_suffixes, &state.inner)?;
 
@@ -540,35 +631,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         state.save()?;
     }
 
-    let mut parts_info: Vec<PartInfo> = state
-        .inner
-        .parts_completed
-        .iter()
-        .map(|(idx, c)| PartInfo {
-            index: idx.clone(),
-            size_bytes: c.size_bytes,
-            blake3: c.blake3.clone(),
-        })
-        .collect();
-    parts_info.sort_by(|a, b| a.index.cmp(&b.index));
-    let total_enc_size: u64 = parts_info.iter().map(|p| p.size_bytes).sum();
-
-    let backup = Backup {
-        timestamp: plan.timestamp.clone(),
-        created_at: crate::util::now_unix(),
-        level,
-        snapshot_name: plan.snapshot_name.clone(),
-        parent_snapshot: plan.parent_snapshot.clone(),
-        system: SystemInfo {
-            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-            btrfs_version: crate::btrfs::btrfs_version().await,
-            bcb_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-        age_public_key: config.age_public_key.clone(),
-        total_size_bytes: total_enc_size,
-        blake3: stream_hash,
-        parts: parts_info,
-    };
+    let backup = build_manifest(config, &plan, level, stream_hash, &state.inner).await;
 
     if !state.inner.manifest_uploaded {
         remote
@@ -583,37 +646,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         state.save()?;
     }
 
-    // Merge current level's entry into the per-level map and re-upload.
-    let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
-    let mut last: LatestByLevel = if remote.exists(&last_key).await? {
-        // A corrupted last manifest must not be silently reset: dropping other levels'
-        // entries would break subsequent incremental backups without warning.
-        serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
-            anyhow!("failed to parse last manifest {last_key}: {e}; repair or delete it manually")
-        })?
-    } else {
-        LatestByLevel::default()
-    };
-    // A fresh level-N backup invalidates every deeper level's incremental chain (they were
-    // built on the level-N snapshot this run just superseded); drop them so the next run of
-    // a deeper level fails loudly asking for a fresh parent, instead of silently chaining
-    // onto a since-superseded snapshot that may no longer even be retained.
-    last.retain(|&existing_level, _| existing_level <= level);
-    last.insert(
-        level,
-        LatestBackup {
-            timestamp: plan.timestamp,
-            snapshot_name: plan.snapshot_name,
-        },
-    );
-    remote
-        .upload_bytes(
-            &last_key,
-            serde_yaml::to_string(&last)?.into_bytes(),
-            &config.s3.storage_class.manifest,
-            "bcb-backup-level=manifest",
-        )
-        .await?;
+    publish_latest(config, remote, &sanitized, level, &plan).await?;
 
     if let Err(e) = tokio::fs::remove_dir_all(&plan.output_dir).await {
         tracing::warn!("failed to clean up output dir {:?}: {e}", plan.output_dir);
