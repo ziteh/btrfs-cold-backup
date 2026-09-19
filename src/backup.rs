@@ -6,9 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     BtrfsOps, Config, RemoteBackend, Task,
     crypto::{blake3_file, encrypt_file},
-    manifest::{
-        Backup, BackupState, CompletedPart, Last, LastEntry, PartInfo, SystemInfo, read_state,
-    },
+    manifest::{Backup, LatestBackup, LatestByLevel, PartInfo, SystemInfo},
+    state::{BackupState, UploadedPart, read_backup_state},
     util::{
         IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, s3_backup_key,
         s3_last_manifest_key, s3_manifest_key, sanitize_subvolume_path, state_path,
@@ -63,7 +62,7 @@ struct PersistentState {
 
 impl PersistentState {
     fn load_or_init(path: PathBuf, task_name: &str, level: u32) -> Result<Self> {
-        let inner = match read_state(&path)? {
+        let inner = match read_backup_state(&path)? {
             Some(s) if s.task_name == task_name && s.level == level => {
                 tracing::info!("resuming from existing backup state");
                 s
@@ -108,7 +107,7 @@ async fn resolve_parent<R: RemoteBackend>(
             "no previous backup; level {level} requires a prior level 0 backup"
         ));
     }
-    let last: Last = serde_yaml::from_slice(&remote.download(last_key).await?)?;
+    let last: LatestByLevel = serde_yaml::from_slice(&remote.download(last_key).await?)?;
     let parent = last.get(&(level - 1)).ok_or_else(|| {
         anyhow!(
             "no level {} entry in last manifest; run a level {} backup first",
@@ -427,7 +426,7 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     level: u32,
     timestamp: &str,
     config: &Config,
-) -> Result<CompletedPart> {
+) -> Result<UploadedPart> {
     let raw_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}"));
     let enc_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}.age"));
 
@@ -443,7 +442,7 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     }
 
     let enc_size = tokio::fs::metadata(&enc_path).await?.len();
-    let hash = blake3_file(&enc_path).await?;
+    let blake3 = blake3_file(&enc_path).await?;
 
     let storage_class = config
         .s3
@@ -471,9 +470,9 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
         tracing::warn!("failed to remove uploaded part {:?}: {e}", enc_path);
     }
 
-    Ok(CompletedPart {
+    Ok(UploadedPart {
         size_bytes: enc_size,
-        hash,
+        blake3,
     })
 }
 
@@ -548,7 +547,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         .map(|(idx, c)| PartInfo {
             index: idx.clone(),
             size_bytes: c.size_bytes,
-            blake3: c.hash.clone(),
+            blake3: c.blake3.clone(),
         })
         .collect();
     parts_info.sort_by(|a, b| a.index.cmp(&b.index));
@@ -586,14 +585,14 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
 
     // Merge current level's entry into the per-level map and re-upload.
     let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
-    let mut last: Last = if remote.exists(&last_key).await? {
+    let mut last: LatestByLevel = if remote.exists(&last_key).await? {
         // A corrupted last manifest must not be silently reset: dropping other levels'
         // entries would break subsequent incremental backups without warning.
         serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
             anyhow!("failed to parse last manifest {last_key}: {e}; repair or delete it manually")
         })?
     } else {
-        Last::default()
+        LatestByLevel::default()
     };
     // A fresh level-N backup invalidates every deeper level's incremental chain (they were
     // built on the level-N snapshot this run just superseded); drop them so the next run of
@@ -602,7 +601,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     last.retain(|&existing_level, _| existing_level <= level);
     last.insert(
         level,
-        LastEntry {
+        LatestBackup {
             timestamp: plan.timestamp,
             snapshot_name: plan.snapshot_name,
         },
@@ -665,9 +664,9 @@ mod tests {
         };
         state.parts_completed.insert(
             "000000".to_string(),
-            crate::manifest::CompletedPart {
+            UploadedPart {
                 size_bytes: 1,
-                hash: String::new(),
+                blake3: String::new(),
             },
         );
 

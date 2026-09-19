@@ -6,7 +6,7 @@ use btrfs_cold_backup::{
     BtrfsOps, Config, ObjectMetadata, RemoteBackend, RestoreConfig, RestoreStatus,
     RestoreStatusDetail, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, Task,
     backup::backup_task,
-    manifest::{Last, LastEntry},
+    manifest::{LatestBackup, LatestByLevel},
     restore::restore_task,
 };
 use mockall::mock;
@@ -84,10 +84,10 @@ fn fake_stream() -> Box<dyn AsyncRead + Send + Unpin> {
 }
 
 fn last_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
-    let mut last = Last::new();
+    let mut last = LatestByLevel::new();
     last.insert(
         level,
-        LastEntry {
+        LatestBackup {
             timestamp: "2026-06-01T14:30:00Z".to_string(),
             snapshot_name: snapshot_name.to_string(),
         },
@@ -541,24 +541,24 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_last_man
     btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
 
     // Existing last manifest carries stale level 1 and level 2 entries from an older chain.
-    let mut stale_last = Last::new();
+    let mut stale_last = LatestByLevel::new();
     stale_last.insert(
         0,
-        LastEntry {
+        LatestBackup {
             timestamp: "2026-01-01T01:00:00Z".to_string(),
             snapshot_name: "bcb_level0.20260101T0100".to_string(),
         },
     );
     stale_last.insert(
         1,
-        LastEntry {
+        LatestBackup {
             timestamp: "2026-01-07T03:00:00Z".to_string(),
             snapshot_name: "bcb_level1.20260107T0300".to_string(),
         },
     );
     stale_last.insert(
         2,
-        LastEntry {
+        LatestBackup {
             timestamp: "2026-01-14T03:00:00Z".to_string(),
             snapshot_name: "bcb_level2.20260114T0300".to_string(),
         },
@@ -604,7 +604,7 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_last_man
         .unwrap()
         .clone()
         .expect("last manifest must be re-uploaded");
-    let uploaded: Last = serde_yaml::from_slice(&uploaded_bytes).unwrap();
+    let uploaded: LatestByLevel = serde_yaml::from_slice(&uploaded_bytes).unwrap();
     assert!(
         uploaded.contains_key(&0),
         "new level 0 entry must be present"
@@ -660,7 +660,7 @@ async fn level1_should_fail_when_snapshot_not_newer_than_parent() {
 /// Resuming after an interruption must upload only the parts not yet completed.
 #[tokio::test]
 async fn resume_should_skip_already_uploaded_parts() {
-    use btrfs_cold_backup::{BackupState, CompletedPart, state_path};
+    use btrfs_cold_backup::{BackupState, UploadedPart, state_path};
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -679,9 +679,9 @@ async fn resume_should_skip_already_uploaded_parts() {
     let mut parts_completed = std::collections::HashMap::new();
     parts_completed.insert(
         "000000".to_string(),
-        CompletedPart {
+        UploadedPart {
             size_bytes: 12,
-            hash: "already-uploaded".to_string(),
+            blake3: "already-uploaded".to_string(),
         },
     );
     let mut state = BackupState {
@@ -1330,7 +1330,6 @@ async fn restore_should_resume_partially_downloaded_part() {
     parts.insert(
         "000000".to_string(),
         RestorePartState {
-            index: "000000".to_string(),
             size_bytes: encrypted_bytes.len() as u64,
             blake3: encrypted_hash,
             download_state: PartDownloadState::PartiallyDownloaded {
@@ -1459,7 +1458,6 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     parts.insert(
         "000000".to_string(),
         RestorePartState {
-            index: "000000".to_string(),
             size_bytes: 100,
             blake3: "parthash".to_string(),
             download_state: PartDownloadState::PartiallyDownloaded {

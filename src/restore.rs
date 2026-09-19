@@ -7,8 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     Config, RemoteBackend, Task,
     crypto::{blake3_file, decrypt_file},
-    manifest::{Backup, PartDownloadState, RestorePartState, RestoreState, read_restore_state},
+    manifest::Backup,
     remote::{RestoreStatus, RestoreStatusDetail},
+    state::{PartDownloadState, RestorePartState, RestoreState, read_restore_state},
     util::{IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
 
@@ -397,7 +398,6 @@ pub async fn restore_task<R: RemoteBackend>(
                         (
                             p.index.clone(),
                             RestorePartState {
-                                index: p.index.clone(),
                                 size_bytes: p.size_bytes,
                                 blake3: p.blake3.clone(),
                                 download_state: PartDownloadState::NotDownloaded,
@@ -433,12 +433,12 @@ pub async fn restore_task<R: RemoteBackend>(
         let live_bytes = |status: RestoreStatus| -> u64 {
             state
                 .parts
-                .values()
-                .filter(|p| {
-                    live.get(&p.index)
+                .iter()
+                .filter(|(index, _)| {
+                    live.get(*index)
                         .is_some_and(|detail| detail.status == status)
                 })
-                .map(|p| p.size_bytes)
+                .map(|(_, p)| p.size_bytes)
                 .sum()
         };
         let ready_bytes = live_bytes(RestoreStatus::Ready);
@@ -483,7 +483,7 @@ pub async fn restore_task<R: RemoteBackend>(
             let Some(key) = part_keys.get(&part_info.index) else {
                 continue;
             };
-            tracing::info!("requesting retrieval for part {}", part.index);
+            tracing::info!("requesting retrieval for part {}", part_info.index);
             remote
                 .request_restore(key, retrieval.days, &retrieval.tier)
                 .await?;
@@ -689,8 +689,8 @@ pub async fn restore_task<R: RemoteBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::RestorePartState;
     use crate::remote::MockRemoteBackend;
+    use crate::state::RestorePartState;
     use std::collections::BTreeMap;
 
     fn state_with_part(index: &str, size: u64) -> RestoreState {
@@ -698,7 +698,6 @@ mod tests {
         parts.insert(
             index.to_string(),
             RestorePartState {
-                index: index.to_string(),
                 size_bytes: size,
                 blake3: String::new(),
                 download_state: PartDownloadState::NotDownloaded,

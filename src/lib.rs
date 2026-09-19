@@ -8,6 +8,7 @@ pub mod lock;
 pub mod manifest;
 pub mod remote;
 pub mod restore;
+pub mod state;
 pub mod util;
 pub mod verify;
 
@@ -18,10 +19,8 @@ pub use crypto::{
     write_private_key,
 };
 pub use lock::PidLock;
-pub use manifest::{
-    Backup, BackupState, CompletedPart, Last, LastEntry, PartDownloadState, PartInfo,
-    RestorePartState, RestoreState,
-};
+pub use manifest::{Backup, LatestBackup, LatestByLevel, PartInfo};
 pub use remote::{ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, S3Backend};
 pub use restore::RetrievalOptions;
+pub use state::{BackupState, PartDownloadState, RestorePartState, RestoreState, UploadedPart};
 pub use util::{sanitize_subvolume_path, state_path};
