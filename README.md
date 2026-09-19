@@ -47,7 +47,7 @@ s3:
       - DEEP_ARCHIVE # Level 1
       - GLACIER      # Level 2
 tasks:
-  - name: example_task
+  - name: example_task # Letters, digits, '.', '_' and '-' only: it becomes a directory name
     description: Example backup task
     subvolume: /mnt/data
     snapshot_dir: /mnt/.snapshots

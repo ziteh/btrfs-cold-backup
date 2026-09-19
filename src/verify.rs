@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::{
     Config, RemoteBackend, Task,
@@ -42,7 +42,7 @@ pub async fn verify_task<R: RemoteBackend>(
     // Collects every snapshot_name seen so far, so a level-N backup's parent_snapshot can be
     // checked against it: a parent that's not in this map has no manifest currently on S3
     // (deleted, expired, or never uploaded), so the chain is broken at that point.
-    let mut by_snapshot: HashMap<String, ()> = HashMap::new();
+    let mut by_snapshot: HashSet<String> = HashSet::new();
     let mut newest_created_at = 0i64;
 
     for entry in &entries {
@@ -72,7 +72,7 @@ pub async fn verify_task<R: RemoteBackend>(
         newest_created_at = newest_created_at.max(backup.created_at);
 
         if let Some(parent) = &backup.parent_snapshot
-            && !by_snapshot.contains_key(parent)
+            && !by_snapshot.contains(parent)
         {
             issues.push(VerifyIssue {
                 level: entry.level,
@@ -131,7 +131,7 @@ pub async fn verify_task<R: RemoteBackend>(
             }
         }
 
-        by_snapshot.insert(backup.snapshot_name.clone(), ());
+        by_snapshot.insert(backup.snapshot_name.clone());
     }
 
     if let Some(max_age_days) = max_age_days {

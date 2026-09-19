@@ -24,15 +24,14 @@ pub fn available_space_bytes(path: &Path) -> Result<u64> {
     use std::os::unix::ffi::OsStrExt;
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| anyhow!("path {:?} is not a valid C string: {e}", path))?;
+        .map_err(|e| anyhow!("path {path:?} is not a valid C string: {e}"))?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: c_path is a valid, NUL-terminated C string for its lifetime, and `stat` is a
     // plain-old-data struct that statvfs(3) fully initializes on success.
     let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
     if ret != 0 {
         return Err(anyhow!(
-            "statvfs failed for {:?}: {}",
-            path,
+            "statvfs failed for {path:?}: {}",
             std::io::Error::last_os_error()
         ));
     }

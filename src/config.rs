@@ -128,6 +128,23 @@ impl Config {
             if task.name.is_empty() {
                 return Err(anyhow!("task name cannot be empty"));
             }
+            // The name becomes a path component under base_dir, so a separator in it would
+            // write outside base_dir. Rejecting here beats sanitizing at each use site: this
+            // fires at `bcb check`, the other is something every new use site must remember.
+            if !task
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            {
+                return Err(anyhow!(
+                    "task '{}': name may only contain letters, digits, '.', '_' and '-'",
+                    task.name
+                ));
+            }
+            // The only two names the charset above still lets escape base_dir.
+            if task.name == "." || task.name == ".." {
+                return Err(anyhow!("task name cannot be '.' or '..'"));
+            }
             if task.subvolume.as_os_str().is_empty() {
                 return Err(anyhow!("task '{}': subvolume cannot be empty", task.name));
             }
@@ -212,6 +229,18 @@ mod tests {
     fn test_valid_config() {
         let config = valid_config();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_task_name_rejects_path_traversal_and_whitespace() {
+        for name in ["../escape", "sub/dir", "..", "has space"] {
+            let mut config = valid_config();
+            config.tasks[0].name = name.to_string();
+            assert!(
+                config.validate().is_err(),
+                "task name {name:?} should be rejected"
+            );
+        }
     }
 
     #[test]

@@ -106,6 +106,10 @@ fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
 }
 
 async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, PidLock)> {
+    // Up front, because a missing executable would otherwise surface only when the pipeline
+    // reaches it, which for `split` is after `btrfs send` has already run for hours.
+    btrfs_cold_backup::check::check_binaries()?;
+
     std::fs::create_dir_all(&config.base_dir)
         .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
 
