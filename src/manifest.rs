@@ -76,15 +76,15 @@ impl BackupState {
     }
 }
 
-/// Persisted download progress of one restore part. `Requested`/`Ready` are an
-/// informational cache for operators inspecting the state file — each run re-checks the
-/// live S3 retrieval status anyway. `PartiallyDownloaded`/`Downloaded` carry the real
-/// resume state.
+/// Persisted download progress of one restore part. Retrieval status is not tracked here:
+/// every run re-checks it live against S3.
+///
+/// `Downloaded` means fully downloaded *and* hash-verified and decrypted, so it cannot be
+/// derived from a byte count: a run killed between the last byte and the hash check must
+/// resume, not be taken for complete.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PartDownloadState {
-    NotRequested,
-    Requested { requested_at: i64 },
-    Ready { ready_since: i64, expires_at: i64 },
+    NotDownloaded,
     PartiallyDownloaded { downloaded_bytes: u64 },
     Downloaded,
 }

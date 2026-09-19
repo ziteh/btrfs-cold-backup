@@ -9,10 +9,7 @@ use crate::{
     crypto::{blake3_file, decrypt_file},
     manifest::{Backup, PartDownloadState, RestorePartState, RestoreState, read_restore_state},
     remote::{RestoreStatus, RestoreStatusDetail},
-    util::{
-        IO_BUF_SIZE, compact_to_iso, now_unix, s3_backup_key, s3_manifest_key,
-        sanitize_subvolume_path,
-    },
+    util::{IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
 
 // Test-only override so chunked-download resume can be exercised without a multi-MiB fixture.
@@ -245,7 +242,7 @@ async fn download_part_with_resume<R: RemoteBackend>(
 async fn fetch_live_statuses<R: RemoteBackend>(
     remote: &R,
     keys_by_index: &HashMap<String, String>,
-    state: &mut RestoreState,
+    state: &RestoreState,
     config: &Config,
 ) -> Result<HashMap<String, RestoreStatusDetail>> {
     let concurrency = (config.s3.restore.status_check_concurrency as usize).max(1);
@@ -281,31 +278,9 @@ async fn fetch_live_statuses<R: RemoteBackend>(
 
     let mut live = HashMap::new();
     for (index, detail) in results {
-        let Some(detail) = detail else { continue };
-        if let Some(part) = state.parts.get_mut(&index)
-            && !matches!(
-                part.download_state,
-                PartDownloadState::PartiallyDownloaded { .. }
-            )
-        {
-            match detail.status {
-                RestoreStatus::Ready => {
-                    part.download_state = PartDownloadState::Ready {
-                        ready_since: now_unix(),
-                        expires_at: detail.expires_at.unwrap_or(0),
-                    };
-                }
-                RestoreStatus::InProgress => {
-                    if matches!(part.download_state, PartDownloadState::NotRequested) {
-                        part.download_state = PartDownloadState::Requested {
-                            requested_at: now_unix(),
-                        };
-                    }
-                }
-                RestoreStatus::NotRequested => {}
-            }
+        if let Some(detail) = detail {
+            live.insert(index, detail);
         }
-        live.insert(index, detail);
     }
 
     Ok(live)
@@ -425,7 +400,7 @@ pub async fn restore_task<R: RemoteBackend>(
                                 index: p.index.clone(),
                                 size_bytes: p.size_bytes,
                                 blake3: p.blake3.clone(),
-                                download_state: PartDownloadState::NotRequested,
+                                download_state: PartDownloadState::NotDownloaded,
                             },
                         )
                     })
@@ -453,8 +428,7 @@ pub async fn restore_task<R: RemoteBackend>(
         // per-part states alone can't be trusted for "downloadable now" (a retrieved copy
         // may have expired since the last run, or a partial download's copy may still be
         // valid).
-        let live = fetch_live_statuses(remote, &part_keys, &mut state, config).await?;
-        state.save(&state_path)?;
+        let live = fetch_live_statuses(remote, &part_keys, &state, config).await?;
 
         let live_bytes = |status: RestoreStatus| -> u64 {
             state
@@ -489,7 +463,7 @@ pub async fn restore_task<R: RemoteBackend>(
             if detail.status != RestoreStatus::NotRequested {
                 continue;
             }
-            let Some(part) = state.parts.get_mut(&part_info.index) else {
+            let Some(part) = state.parts.get(&part_info.index) else {
                 continue;
             };
             if matches!(part.download_state, PartDownloadState::Downloaded) {
@@ -514,9 +488,6 @@ pub async fn restore_task<R: RemoteBackend>(
                 .request_restore(key, retrieval.days, &retrieval.tier)
                 .await?;
             if !partially_downloaded {
-                part.download_state = PartDownloadState::Requested {
-                    requested_at: now_unix(),
-                };
                 bytes_requested += part.size_bytes;
             }
         }
@@ -540,14 +511,8 @@ pub async fn restore_task<R: RemoteBackend>(
                 remote
                     .request_restore(key, retrieval.days, &retrieval.tier)
                     .await?;
-                if let Some(part) = state.parts.get_mut(&index) {
-                    part.download_state = PartDownloadState::Requested {
-                        requested_at: now_unix(),
-                    };
-                }
             }
         }
-        state.save(&state_path)?;
 
         // Download everything whose retrieved copy is live right now — including parts
         // left half-downloaded by an interrupted run — earliest expiry first, so copies
@@ -736,7 +701,7 @@ mod tests {
                 index: index.to_string(),
                 size_bytes: size,
                 blake3: String::new(),
-                download_state: PartDownloadState::NotRequested,
+                download_state: PartDownloadState::NotDownloaded,
             },
         );
         RestoreState {
