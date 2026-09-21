@@ -9,6 +9,28 @@ Features:
 - [Age][age] is used for end-to-end encryption (E2EE).
 - [BLAKE3][b3] hash is used for integrity verification.
 
+```mermaid
+---
+title: Backup Overview
+---
+flowchart LR
+    S["bcb backup --level N"] --> L{"Backup level"}
+    L -->|level 0| F["btrfs send<br/>full stream"]
+    L -->|level N > 0| P["Read the level N-1 parent<br/>from the latest manifest"]
+    P --> I["btrfs send -p parent<br/>incremental stream"]
+
+    F --> X["Split into 3 GiB parts<br/>and compute stream BLAKE3"]
+    I --> X
+    X --> E["Each part:<br/>Age encrypt -> BLAKE3"]
+    E --> D[("S3: encrypted parts<br/>with a per-level storage class")]
+    X --> M["Manifest: parent snapshot, stream BLAKE3, and each part's size and BLAKE3"]
+    E --> M
+    M --> SM[("S3: manifest")]
+```
+
+To restore, apply level 0, level 1, …, level N in order; each incremental
+requires its parent level to be present on the target.
+
 > For ZFS: [zrb](https://github.com/ziteh/zfs-remote-backup)
 
 ## Usage
