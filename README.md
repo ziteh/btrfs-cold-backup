@@ -4,10 +4,10 @@
 
 Features:
 
-- Specifically designed for [AWS S3 Glacier Deep Archive][s3-gda] cold storage, optimal storage costs.
 - Full and incremental multi-level backups.
-- [Age][age] is used for end-to-end encryption (E2EE).
-- [BLAKE3][b3] hash is used for integrity verification.
+- Built for [AWS S3 Glacier Deep Archive][s3-gda] cold storage, optimal storage costs.
+- End-to-end encryption via [Age][age].
+- Integrity verification via [BLAKE3][b3].
 
 ```mermaid
 ---
@@ -28,30 +28,32 @@ flowchart LR
     M --> SM[("S3: manifest")]
 ```
 
-To restore, apply level 0, level 1, …, level N in order; each incremental
-requires its parent level to be present on the target.
+To restore, apply level 0, level 1, …, level N in order; each incremental requires its parent level to be present on the target.
 
 > For ZFS: [zrb](https://github.com/ziteh/zfs-remote-backup)
 
+## Installation
+
+```bash
+cargo build --release
+sudo install -m 755 target/release/bcb /usr/local/bin/bcb
+```
+
 ## Usage
 
-**Build:**
-
 ```bash
-cargo fmt && cargo clippy && cargo build && cargo test
+sudo bcb check                          # validate config and connectivity
+bcb backup --level 0                    # run a backup
+bcb restore --task <name> --level 0 --date <YYYYMMDDHHMM> --target <path> --private-key <key>
 
-# release
-cargo build --release
+bcb genkey --output ./bcb_private.key   # generate an age key pair
+bcb list                                # list backups on S3
+bcb verify                              # audit backups without triggering retrieval
 ```
 
-**Execute:**
+Config path defaults to `/etc/bcb/config.yaml`; override with `--config`. Run `bcb --help` or `bcb <command> --help` for the full option list.
 
-```bash
-cd target/release
-./bcb --help
-```
-
-## Configuration
+### Config
 
 ```yaml
 # /etc/bcb/config.yaml
@@ -78,186 +80,56 @@ tasks:
 
 `base_dir` is bcb's local working directory: it holds the lock file, resume state, daily log files, and the temporary split/encrypted parts during backup and restore. Its filesystem needs free space roughly equal to one full backup.
 
-## Snapshots
+### Snapshots
 
-`bcb` does not create snapshots itself; it expects snapshots to already exist in each task's `snapshot_dir`, created by [btrbk][btrbk].
-
-Snapshots must follow btrbk's naming with `snapshot_name bcb_level<N>` and `timestamp_format long` (btrbk's default):
+`bcb` does **not** create snapshots; it expects them in each task's `snapshot_dir`, created by [btrbk][btrbk] with `snapshot_name bcb_level<N>` and `timestamp_format long`:
 
 ```text
 bcb_level<N>.<YYYYMMDD>T<hhmm>
 ```
 
-For example `bcb_level1.20261231T2359`. A backup is identified down to the minute, so btrbk's same-minute snapshot suffix (`_<n>`, added when two snapshots of one subvolume land in the same minute) cannot be backed up: bcb fails with a message naming the snapshot. Delete or rename it; either way the next scheduled run backs up normally.
-
-For each level, `bcb backup --level N` picks the newest matching snapshot. A level-N (N > 0) backup requires the level-(N-1) parent snapshot recorded in the last backup to still exist locally, and the level-N snapshot must be newer than that parent.
-
-Each task backs up one subvolume; tasks run sequentially and one failing task does not block the others. Re-running a backup is idempotent: a snapshot whose backup already completed is skipped, and an interrupted backup resumes where it left off.
-
-## Example: Periodic Backups
-
-A NAS backing up `/mnt/data` with a level 0 full backup on Jan 1 / Jul 1 and a level 1 incremental every Sunday, using the configuration above.
-
-One-time setup:
-
-```bash
-sudo install -m 755 target/release/bcb /usr/local/bin/bcb
-
-# Prints the public key (put it in the config). Keep the private key OFF this
-# machine (paper, password manager); backups only ever need the public key.
-bcb genkey --output ./bcb_private.key
-
-sudo bcb check
-```
-
-AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy needs `PutObject`, `PutObjectTagging`, `GetObject`, `HeadObject`, `ListBucket`, `ListBucketMultipartUploads`, `AbortMultipartUpload`, `DeleteObject`, `RestoreObject`, and `HeadBucket` on the bucket. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
-
-Snapshots come from btrbk, one [config][btrbk-conf] per level so each can be created and pruned independently. `/etc/btrbk/bcb-level0.conf` (level 1 is identical except `snapshot_name bcb_level1`):
-
-```txt
-timestamp_format        long
-snapshot_create         always
-snapshot_preserve_min   latest
-snapshot_preserve       12m
-snapshot_dir            .snapshots
-lockfile                /run/lock/btrbk-bcb.lock
-transaction_log         /var/log/btrbk.log
-
-volume /mnt
-  subvolume data
-    snapshot_name bcb_level0
-```
-
-`snapshot_preserve_min latest` guarantees the newest snapshot per level always survives pruning — exactly the parent the next incremental needs — while `snapshot_preserve 12m` additionally keeps a year of monthly snapshots locally. The shared `lockfile` keeps the two levels' btrbk invocations from overlapping (a level 0 upload can run for hours into the next timer), and `transaction_log` records every snapshot create/delete for audits.
-
-For incremental levels, `snapshot_create onchange` is worth considering instead of `always`: if the subvolume has not changed since the last snapshot, btrbk creates nothing and bcb idempotently skips the upload.
-
-The scheduled job snapshots, backs up, then prunes. `/usr/local/sbin/bcb-run`:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-LEVEL="$1"
-CONF="/etc/btrbk/bcb-level${LEVEL}.conf"
-
-btrbk -c "$CONF" snapshot
-bcb backup --level "$LEVEL"
-
-# Prune only after a successful backup, so a failed run keeps the previous snapshot
-# still referenced as parent by the last backup manifest
-btrbk -c "$CONF" prune
-```
-
-On failure the script exits non-zero before pruning, and re-running is safe: an interrupted backup resumes, a completed one is skipped.
-
-```ini
-; /etc/systemd/system/bcb-backup@.service
-[Unit]
-Description=bcb backup level %i
-OnFailure=bcb-notify-failure@%n.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/bcb-run %i
-```
-
-`OnFailure=` only fires when the unit actually ran and failed — it can't catch a timer that
-never fired at all (disabled, machine off past `Persistent=true`'s catch-up window, or a full
-disk that keeps `bcb` from starting). A silently-stopped backup schedule reports no failure
-and no error, so also set up a positive liveness signal — e.g. a dead man's switch
-(`curl` a healthchecks.io-style URL at the end of a successful `bcb-run`) that alerts you
-when it *stops* hearing from the job, rather than only reacting to failures it's told about.
-
-```ini
-; /etc/systemd/system/bcb-notify-failure@.service
-[Unit]
-Description=Notify bcb failure for %i
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/bcb-notify %i
-```
-
-`/usr/local/sbin/bcb-notify` forwards the failed unit's recent log to wherever you want to
-hear about it (mail, ntfy, a webhook):
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-journalctl -u "$1" -n 50 --no-pager | mail -s "bcb failure: $1" ops@example.com
-```
-
-```ini
-; /etc/systemd/system/bcb-backup@0.timer
-[Timer]
-OnCalendar=*-01,07-01 01:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-```ini
-; /etc/systemd/system/bcb-backup@1.timer
-[Timer]
-OnCalendar=Sun *-*-* 03:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-```bash
-sudo systemctl enable --now bcb-backup@0.timer bcb-backup@1.timer
-```
-
-`Persistent=true` catches up on schedules missed while powered off. Runs are logged in `journalctl -u 'bcb-backup@*'` and in `<base_dir>/log/` (kept to the last 30 daily files); failure notifications land in `journalctl -u 'bcb-notify-failure@*'`.
-
-Notes:
-
-- Each level 1 is the cumulative delta since the last level 0 and grows over the half year; if that gets large, add a monthly level 1 and weekly level 2 instead.
-- Set bucket lifecycle expirations filtered on the `bcb-backup-level` tag (see Retention below) to at least 13 months so the current and previous chains always survive.
-- Drill restores: `bcb list` regularly, and walk a full restore on a test machine at least yearly to prove the private key and procedure work. See [docs/restore-drill-runbook.md](docs/restore-drill-runbook.md) for a runbook that exercises the real Glacier retrieval path (which no automated test does).
-- Run `bcb verify` regularly (e.g. a monthly systemd timer, wired into the same `OnFailure=` alerting as the backup jobs): it audits every backup's incremental chain, part existence and size, and storage class against S3 via HeadObject/ListObjectsV2 only, so it never triggers an archive retrieval or its cost. Pass `--max-age-days` to also flag a task whose newest backup is older than expected — the one check that can catch a schedule that silently stopped running. It complements, not replaces, an actual restore drill: it cannot detect data corrupted in a way that preserves size, nor verify the private key still works.
+- `bcb backup --level N` picks the newest matching snapshot.
+- A level-N (N > 0) backup requires the level-(N-1) parent snapshot from the last backup, and the level-N snapshot must be newer.
+- btrbk's same-minute suffix (`_<n>`) is not supported; bcb fails naming the snapshot, delete or rename it.
+- Backups are idempotent: a completed snapshot is skipped, an interrupted one resumes. Tasks run sequentially; one failing task doesn't block the others.
 
 ## Restoring
 
-Objects in S3 `GLACIER` (including `DEEP_ARCHIVE`) storage classes cannot be downloaded directly; they must be retrieved first, which takes hours. `bcb restore` works incrementally: each run requests retrieval for the next batch, then downloads whatever parts are currently retrievable (resuming interrupted downloads from where they stopped), and exits — AWS prepares the next batch while the current one downloads. Re-run the same command until it prints `restore complete` — exit code 2 means "in progress, run again later", so a scheduler can just retry until exit 0. A part whose download fails mid-run (expired copy, network drop) is logged and skipped rather than failing the run; the next run picks it up.
+AWS S3 Glacier objects **require** retrieval before download.
 
-If you wrap a periodic restore retry in a systemd timer/service the same way as the backup jobs above, add `SuccessExitStatus=2` to its `[Service]` section — otherwise systemd treats every still-in-progress run as a failure and `OnFailure=` fires on every single retry instead of only on a genuine error.
+`bcb restore` requests retrieval for the next batch, downloads whatever is currently retrievable, and exits — re-run until it prints `restore complete`. Exit code 2 means in progress, exit 0 means done, so a scheduler can just retry. A failed part download is logged and skipped; the next run retries it.
 
-`--restore-tier` and `--restore-days` control the retrieval speed/cost and how long each retrieved copy stays downloadable. On slow connections, set `s3.restore.expected_download_kbps` in the config so retrievals are paced to what you can actually download before the copies expire (instead of requesting everything at once); `s3.restore.lead_days` overrides how much download-time worth of parts to keep retrievable ahead. With pacing enabled, `--restore-days` must exceed the lead window by at least a day, or copies would expire before the download budget reaches them — `bcb` rejects such a configuration up front.
-
-To restore an incremental backup, restore each level in order onto the same target (level 0 first, then level 1, and so on); each incremental needs its parent present on the target.
+- `--restore-tier` / `--restore-days`: retrieval speed/cost and how long a retrieved copy stays downloadable.
+- `s3.restore.expected_download_kbps` / `s3.restore.lead_days`: pace retrieval to available bandwidth instead of requesting everything at once. With pacing on, `--restore-days` must exceed the lead window by at least a day.
+- Restore levels in order onto the same target (level 0 first); each incremental needs its parent already restored.
+- If wrapped in a systemd timer, add `SuccessExitStatus=2` or every in-progress retry is treated as a failure.
 
 ## Retention
 
-`bcb` never deletes anything from S3; use bucket lifecycle rules for retention.
+`bcb` **never** deletes from S3; use bucket lifecycle rules.
 
-Every uploaded object carries a `bcb-backup-level` tag (`0`, `1`, ... for backup parts, `manifest` for manifests), so one lifecycle rule per level covers all subvolumes — filter on the tag, optionally combined with the bucket prefix. Leave `manifest`-tagged objects unexpired (they are tiny and needed to restore anything).
+Every object is tagged `bcb-backup-level` (`0`, `1`, ... or `manifest`) so one lifecycle rule per level covers all subvolumes.
 
-Be careful that lifecycle rules must not expire a backup that later incremental levels still depend on (deleting a level-0 breaks every chain built on it), and a level's expiration must respect its storage class minimum duration (e.g. 180 days for `DEEP_ARCHIVE`).
+Leave `manifest` objects unexpired. Don't expire a level that a later incremental still depends on, and respect each storage class's minimum duration.
 
-## Testing
+## Documentation
 
-**Unit and integration:**
+- [Periodic backup example](docs/periodic-backup-example.md) — btrbk config, systemd units, failure alerting
+- [Restore drill runbook](docs/restore-drill-runbook.md)
+
+## Development
 
 ```bash
-cargo test
+cargo fmt && cargo clippy && cargo build && cargo test
 ```
 
-The e2e and VM suites below are compiled into this same `cargo test` run, but each test skips
-itself (reporting "ok" either way) when its required environment variables aren't set —
-run with `cargo test -- --nocapture` to see the "skipping: ..." messages that distinguish an
-actual pass from a skip.
-
-**E2E:**
-
-Requires Docker and [Multipass](https://multipass.run). The script creates and setup the VM on first run.
+**E2E:** requires Docker and [Multipass](https://multipass.run); the script creates and sets up the VM on first run.
 
 ```bash
 bash scripts/run-vm-tests.sh
 ```
+
+The e2e and VM suites are compiled into the same `cargo test` run, but each test skips itself (reporting "ok" either way) when its required environment variables aren't set — run with `cargo test -- --nocapture` to see the "skipping: ..." messages that distinguish an actual pass from a skip.
 
 ## TODO
 
@@ -272,8 +144,11 @@ bash scripts/run-vm-tests.sh
 - [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents (retrieval cost/latency, so off by default; for periodic drills)
 - [ ] Add btrbk to VM for E2E testing
 
+## License
+
+[Apache License 2.0](LICENSE)
+
 [s3-gda]: https://aws.amazon.com/s3/storage-classes/glacier/
 [age]: https://github.com/filosottile/age
 [b3]: https://github.com/BLAKE3-team/BLAKE3
 [btrbk]: https://github.com/digint/btrbk
-[btrbk-conf]: https://digint.ch/btrbk/doc/btrbk.conf.5.html
