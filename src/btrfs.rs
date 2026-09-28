@@ -86,7 +86,11 @@ impl BtrfsStream {
                 }
             }
             Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            // Without the exit status a truncated stream is indistinguishable from a complete
+            // one, so this must not read as EOF.
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::other(
+                "btrfs send exit status was lost; the stream may be incomplete",
+            ))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -263,6 +267,24 @@ mod tests {
         let uuids = parse_subvolume_uuids(out).unwrap();
         assert_eq!(uuids.uuid, "abc");
         assert!(uuids.parent_uuid.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_fails_when_exit_status_is_lost() {
+        let mut child = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
+        let (status_tx, status_rx) = oneshot::channel();
+        drop(status_tx);
+        let (kill_tx, _kill_rx) = oneshot::channel();
+        let mut stream = BtrfsStream {
+            stdout: Box::pin(child.stdout.take().unwrap()),
+            status_rx,
+            _kill_tx: kill_tx,
+            stdout_done: false,
+        };
+
+        let mut buf = Vec::new();
+        assert!(stream.read_to_end(&mut buf).await.is_err());
+        child.wait().await.unwrap();
     }
 
     #[test]
