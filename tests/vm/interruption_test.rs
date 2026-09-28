@@ -657,15 +657,20 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
     child.kill().unwrap();
     child.wait().unwrap();
 
-    // bcb's restore work dir is named deterministically from task/level/timestamp; read its
-    // state directly (real file, no mocking involved) to confirm the kill actually landed
+    // bcb's restore work dir is named deterministically from subvolume/level/timestamp; read
+    // its state directly (real file, no mocking involved) to confirm the kill actually landed
     // mid-part rather than after it had already finished.
-    let restore_work_dir = fixture.work_dir.join(format!(
-        "restore-{}-level0-2026-06-01T00:00",
-        fixture.task_name
-    ));
+    let restore_work_dir = btrfs_cold_backup::util::restore_work_dir(
+        &fixture.work_dir,
+        &sanitize_subvolume_path(&fixture.subvol).unwrap(),
+        0,
+        "2026-06-01T00:00",
+    );
     let state: btrfs_cold_backup::RestoreState = serde_yaml::from_str(
-        &std::fs::read_to_string(restore_work_dir.join("restore-state.yaml")).unwrap(),
+        &std::fs::read_to_string(btrfs_cold_backup::util::restore_state_path(
+            &restore_work_dir,
+        ))
+        .unwrap(),
     )
     .unwrap();
     let part_state = state

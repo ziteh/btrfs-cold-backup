@@ -115,7 +115,7 @@ mod tests {
             source_uuid: "src-uuid".to_string(),
             snapshot_uuid: "snap-uuid".to_string(),
             timestamp: "2026-06-02T14:30".to_string(),
-            output_dir: PathBuf::from("/var/lib/bcb/task/mnt_data/bcb_level0_20260602"),
+            output_dir: PathBuf::from("/var/lib/bcb/backup/mnt_data/bcb_level0_20260602"),
             stream_hash: Some("abc123".to_string()),
             parts: BTreeMap::new(),
             uploaded_parts: BTreeSet::new(),
@@ -146,14 +146,14 @@ mod tests {
 
     #[test]
     fn test_read_state_not_found() {
-        let result = read_state::<BackupState>(Path::new("/nonexistent/path/backup_state.yaml"));
+        let result = read_state::<BackupState>(Path::new("/nonexistent/path/state.yaml"));
         assert!(result.unwrap().is_none());
     }
 
     #[test]
     fn test_write_and_read_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("backup_state.yaml");
+        let path = dir.path().join("state.yaml");
 
         let mut state = BackupState {
             level: 1,
@@ -162,7 +162,7 @@ mod tests {
             source_uuid: "src-uuid".to_string(),
             snapshot_uuid: "snap-uuid".to_string(),
             timestamp: "2026-06-02T14:30".to_string(),
-            output_dir: PathBuf::from("/tmp/bcb/task/mnt/bcb_level1_20260602"),
+            output_dir: PathBuf::from("/tmp/bcb/backup/mnt/bcb_level1_20260602"),
             stream_hash: Some("streamhash".to_string()),
             parts: BTreeMap::new(),
             uploaded_parts: BTreeSet::new(),

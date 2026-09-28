@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::{
     Config, RemoteBackend, Task,
-    util::{parse_task_dir_name, sanitize_subvolume_path},
+    util::{parse_backup_dir_name, sanitize_subvolume_path},
 };
 
 pub struct BackupEntry {
@@ -12,7 +12,7 @@ pub struct BackupEntry {
 
 fn parse_entry(key: &str) -> Option<BackupEntry> {
     let dir = key.split('/').find(|s| s.starts_with("bcb_level"))?;
-    let (level, timestamp) = parse_task_dir_name(dir)?;
+    let (level, timestamp) = parse_backup_dir_name(dir)?;
     Some(BackupEntry { level, timestamp })
 }
 

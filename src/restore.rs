@@ -11,8 +11,8 @@ use crate::{
     remote::{RestoreStatus, RestoreStatusDetail},
     state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
-        BYTES_PER_KBPS, IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key,
-        sanitize_subvolume_path,
+        BYTES_PER_KBPS, IO_BUF_SIZE, compact_to_iso, restore_state_path, restore_work_dir,
+        s3_backup_key, s3_manifest_key, sanitize_subvolume_path,
     },
 };
 
@@ -88,19 +88,6 @@ fn daily_budget_bytes(expected_download_kbps: u64) -> u64 {
         return 0;
     }
     (expected_download_kbps as f64 * BYTES_PER_KBPS * 86400.0) as u64
-}
-
-/// Returns the restoration working directory (deterministic, not random).
-fn restore_work_dir(base_dir: &Path, task_name: &str, level: u32, timestamp: &str) -> PathBuf {
-    base_dir.join(format!(
-        "restore-{}-level{}-{}",
-        task_name, level, timestamp
-    ))
-}
-
-/// Returns the restoration state file path.
-fn restore_state_file(work_dir: &Path) -> PathBuf {
-    work_dir.join("restore-state.yaml")
 }
 
 async fn pipe_to_btrfs_receive(dec_paths: &[std::path::PathBuf], target_dir: &Path) -> Result<()> {
@@ -736,7 +723,7 @@ pub async fn restore_task<R: RemoteBackend>(
     let timestamp = compact_to_iso(date)?;
     let buffer_target = retrieval_buffer_target(config, retrieval)?;
 
-    let work_dir = restore_work_dir(&config.base_dir, &task.name, level, &timestamp);
+    let work_dir = restore_work_dir(&config.base_dir, &sanitized, level, &timestamp);
     tokio::fs::create_dir_all(&work_dir).await?;
 
     let backup = load_or_fetch_manifest(
@@ -747,7 +734,7 @@ pub async fn restore_task<R: RemoteBackend>(
     )
     .await?;
 
-    let state_path = restore_state_file(&work_dir);
+    let state_path = restore_state_path(&work_dir);
     let state = load_or_init_state(&state_path, &backup)?;
 
     let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);

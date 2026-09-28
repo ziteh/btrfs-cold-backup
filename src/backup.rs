@@ -13,9 +13,9 @@ use crate::{
     },
     state::{BackupState, PartRecord, read_state},
     util::{
-        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, fsync_dir,
-        s3_backup_key, s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path,
-        state_path,
+        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir,
+        backup_state_path, fsync_dir, s3_backup_key, s3_latest_manifest_key, s3_manifest_key,
+        sanitize_subvolume_path,
     },
     verify::check_parts,
 };
@@ -751,7 +751,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     remote: &R,
 ) -> Result<Option<Backup>> {
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let state_file = state_path(&config.base_dir, &sanitized);
+    let state_file = backup_state_path(&config.base_dir, &sanitized);
     tokio::fs::create_dir_all(state_file.parent().unwrap()).await?;
 
     let mut state = PersistentState::load_or_init(state_file, &task.name, level)?;

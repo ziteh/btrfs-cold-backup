@@ -24,4 +24,4 @@ pub use lock::PidLock;
 pub use remote::{ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, S3Backend};
 pub use restore::RetrievalOptions;
 pub use state::{BackupState, PartDownloadState, PartRecord, RestorePartState, RestoreState};
-pub use util::{sanitize_subvolume_path, state_path};
+pub use util::{backup_state_path, sanitize_subvolume_path};

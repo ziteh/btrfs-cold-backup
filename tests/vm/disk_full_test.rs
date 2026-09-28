@@ -63,8 +63,8 @@ async fn backup_should_report_enospc_and_clean_up_when_base_dir_fills() {
         "error must name ENOSPC: {stderr}"
     );
 
-    let task_dir = fixture.work_dir.join("task");
-    let leftovers: Vec<_> = walk(&task_dir)
+    let backup_dir = fixture.work_dir.join("backup");
+    let leftovers: Vec<_> = walk(&backup_dir)
         .into_iter()
         .filter(|p| p.is_file())
         .collect();

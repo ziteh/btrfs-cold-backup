@@ -134,7 +134,7 @@ pub fn sanitize_subvolume_path(subvolume: &Path) -> Result<String> {
 }
 
 /// Builds the directory/key component identifying one backup, from an ISO 8601 timestamp.
-pub fn task_dir_name(level: u32, timestamp: &str) -> String {
+pub fn backup_dir_name(level: u32, timestamp: &str) -> String {
     // The first 12 digits of an ISO 8601 timestamp are exactly YYYYMMDDHHMM.
     let compact: String = timestamp
         .chars()
@@ -144,8 +144,8 @@ pub fn task_dir_name(level: u32, timestamp: &str) -> String {
     format!("bcb_level{level}_{compact}")
 }
 
-/// Inverse of [`task_dir_name`]: extracts (level, ISO timestamp) from a task dir name.
-pub fn parse_task_dir_name(dir: &str) -> Option<(u32, String)> {
+/// Inverse of [`backup_dir_name`]: extracts (level, ISO timestamp) from a task dir name.
+pub fn parse_backup_dir_name(dir: &str) -> Option<(u32, String)> {
     let parts: Vec<&str> = dir.split('_').collect();
     let [_, level_str, compact_ts] = parts.as_slice() else {
         return None;
@@ -162,7 +162,7 @@ pub fn s3_backup_key(
     timestamp: &str,
     index: &str,
 ) -> String {
-    let dir_name = task_dir_name(level, timestamp);
+    let dir_name = backup_dir_name(level, timestamp);
     format!("{prefix}backup-data/{sanitized_subvol}/{dir_name}/{SNAPSHOT_PART_PREFIX}{index}.age")
 }
 
@@ -172,15 +172,15 @@ pub fn s3_manifest_key(
     level: u32,
     timestamp: &str,
 ) -> String {
-    let dir_name = task_dir_name(level, timestamp);
+    let dir_name = backup_dir_name(level, timestamp);
     format!("{prefix}manifests/{sanitized_subvol}/{dir_name}/manifest.yaml")
 }
 
-pub fn state_path(base_dir: &Path, sanitized_subvol: &str) -> PathBuf {
+pub fn backup_state_path(base_dir: &Path, sanitized_subvol: &str) -> PathBuf {
     base_dir
-        .join("run")
+        .join("backup")
         .join(sanitized_subvol)
-        .join("backup_state.yaml")
+        .join("state.yaml")
 }
 
 pub fn backup_output_dir(
@@ -189,8 +189,43 @@ pub fn backup_output_dir(
     level: u32,
     timestamp: &str,
 ) -> PathBuf {
-    let dir_name = task_dir_name(level, timestamp);
-    base_dir.join("task").join(sanitized_subvol).join(dir_name)
+    let dir_name = backup_dir_name(level, timestamp);
+    base_dir
+        .join("backup")
+        .join(sanitized_subvol)
+        .join(dir_name)
+}
+
+pub fn restore_work_dir(
+    base_dir: &Path,
+    sanitized_subvol: &str,
+    level: u32,
+    timestamp: &str,
+) -> PathBuf {
+    let dir_name = backup_dir_name(level, timestamp);
+    base_dir
+        .join("restore")
+        .join(sanitized_subvol)
+        .join(dir_name)
+}
+
+pub fn restore_state_path(work_dir: &Path) -> PathBuf {
+    work_dir.join("state.yaml")
+}
+
+/// Lists entries in base_dir left by the layout used before backup/ and restore/.
+pub fn find_old_layout(base_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(base_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "run" || name == "task" || name.starts_with("restore-") {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 pub fn s3_latest_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
@@ -245,48 +280,93 @@ mod tests {
     }
 
     #[test]
-    fn test_task_dir_name_level_zero() {
-        let result = task_dir_name(0, "2026-06-02T14:30");
+    fn test_backup_dir_name_level_zero() {
+        let result = backup_dir_name(0, "2026-06-02T14:30");
         assert_eq!(result, "bcb_level0_202606021430");
     }
 
     #[test]
-    fn test_task_dir_name_level_one() {
-        let result = task_dir_name(1, "2026-06-02T14:30");
+    fn test_backup_dir_name_level_one() {
+        let result = backup_dir_name(1, "2026-06-02T14:30");
         assert_eq!(result, "bcb_level1_202606021430");
     }
 
     #[test]
-    fn test_task_dir_name_different_date() {
-        let result = task_dir_name(2, "2025-12-25T10:15");
+    fn test_backup_dir_name_different_date() {
+        let result = backup_dir_name(2, "2025-12-25T10:15");
         assert_eq!(result, "bcb_level2_202512251015");
     }
 
     #[test]
-    fn test_task_dir_name_same_day_different_time() {
-        let a = task_dir_name(0, "2026-06-25T08:00");
-        let b = task_dir_name(0, "2026-06-25T20:00");
+    fn test_backup_dir_name_same_day_different_time() {
+        let a = backup_dir_name(0, "2026-06-25T08:00");
+        let b = backup_dir_name(0, "2026-06-25T20:00");
         assert_ne!(a, b);
     }
 
     #[test]
-    fn test_task_dir_name_parse_round_trip() {
-        let dir = task_dir_name(3, "2026-06-02T14:30");
-        let (level, timestamp) = parse_task_dir_name(&dir).unwrap();
+    fn test_backup_dir_name_parse_round_trip() {
+        let dir = backup_dir_name(3, "2026-06-02T14:30");
+        let (level, timestamp) = parse_backup_dir_name(&dir).unwrap();
         assert_eq!(level, 3);
         assert_eq!(timestamp, "2026-06-02T14:30");
     }
 
     #[test]
-    fn test_parse_task_dir_name_invalid() {
-        assert!(parse_task_dir_name("bcb").is_none());
-        assert!(parse_task_dir_name("bcb_levelX_202606021430").is_none());
-        assert!(parse_task_dir_name("bcb_level0_notadate").is_none());
+    fn test_parse_backup_dir_name_invalid() {
+        assert!(parse_backup_dir_name("bcb").is_none());
+        assert!(parse_backup_dir_name("bcb_levelX_202606021430").is_none());
+        assert!(parse_backup_dir_name("bcb_level0_notadate").is_none());
     }
 
     #[test]
-    fn test_parse_task_dir_name_rejects_trailing_segment() {
-        assert!(parse_task_dir_name("bcb_level0_202606021430_1").is_none());
+    fn test_parse_backup_dir_name_rejects_trailing_segment() {
+        assert!(parse_backup_dir_name("bcb_level0_202606021430_1").is_none());
+    }
+
+    #[test]
+    fn test_local_paths() {
+        let base = Path::new("/base");
+        assert_eq!(
+            backup_state_path(base, "mnt_data"),
+            Path::new("/base/backup/mnt_data/state.yaml")
+        );
+        assert_eq!(
+            backup_output_dir(base, "mnt_data", 1, "2026-06-02T14:30"),
+            Path::new("/base/backup/mnt_data/bcb_level1_202606021430")
+        );
+        let work_dir = restore_work_dir(base, "mnt_data", 1, "2026-06-02T14:30");
+        assert_eq!(
+            work_dir,
+            Path::new("/base/restore/mnt_data/bcb_level1_202606021430")
+        );
+        assert!(!work_dir.to_string_lossy().contains(':'));
+        assert_eq!(restore_state_path(&work_dir), work_dir.join("state.yaml"));
+    }
+
+    #[test]
+    fn test_find_old_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in [
+            "run",
+            "task",
+            "restore-movies-level0-x",
+            "backup",
+            "restore",
+            "log",
+        ] {
+            std::fs::create_dir(dir.path().join(d)).unwrap();
+        }
+        std::fs::write(dir.path().join("bcb.lock"), "").unwrap();
+        let found = find_old_layout(dir.path()).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                dir.path().join("restore-movies-level0-x"),
+                dir.path().join("run"),
+                dir.path().join("task"),
+            ]
+        );
     }
 
     #[test]

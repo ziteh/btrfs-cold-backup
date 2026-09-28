@@ -111,6 +111,15 @@ async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, Pid
 
     btrfs_cold_backup::util::prepare_base_dir(&config.base_dir)
         .map_err(|e| anyhow!("failed to prepare base_dir: {e}"))?;
+    let old = btrfs_cold_backup::util::find_old_layout(&config.base_dir)?;
+    if !old.is_empty() {
+        let list: Vec<String> = old.iter().map(|p| p.display().to_string()).collect();
+        return Err(anyhow!(
+            "base_dir holds files from an older bcb layout: {}; \
+             delete them once confirmed unneeded",
+            list.join(", ")
+        ));
+    }
 
     let lock_path = config.base_dir.join("bcb.lock");
     let lock = PidLock::acquire(&lock_path)?;

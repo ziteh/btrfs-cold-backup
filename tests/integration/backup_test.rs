@@ -210,7 +210,7 @@ async fn failed_send_should_remove_output_dir() {
     assert!(
         !work_dir
             .path()
-            .join("task/mnt_data_movies/bcb_level0_202606021430")
+            .join("backup/mnt_data_movies/bcb_level0_202606021430")
             .exists(),
         "output_dir must be removed after a failed send"
     );
@@ -1093,7 +1093,7 @@ fn sent_state(output_dir: &Path) -> btrfs_cold_backup::BackupState {
 /// Resuming after an interruption must upload only the parts not yet completed.
 #[tokio::test]
 async fn resume_should_skip_already_uploaded_parts() {
-    use btrfs_cold_backup::state_path;
+    use btrfs_cold_backup::backup_state_path;
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1102,7 +1102,7 @@ async fn resume_should_skip_already_uploaded_parts() {
 
     let output_dir = work_dir
         .path()
-        .join("task")
+        .join("backup")
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
@@ -1121,7 +1121,7 @@ async fn resume_should_skip_already_uploaded_parts() {
         "000001".to_string(),
         write_part(&output_dir, "000001", b"pending part"),
     );
-    let sp = state_path(work_dir.path(), sanitized);
+    let sp = backup_state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
 
@@ -1152,7 +1152,7 @@ async fn resume_should_skip_already_uploaded_parts() {
 /// disk, so the resumed run re-uploads it instead of finding the part missing.
 #[tokio::test]
 async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
-    use btrfs_cold_backup::state_path;
+    use btrfs_cold_backup::backup_state_path;
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1161,7 +1161,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
 
     let output_dir = work_dir
         .path()
-        .join("task")
+        .join("backup")
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
@@ -1171,7 +1171,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
         "000000".to_string(),
         write_part(&output_dir, "000000", b"only part"),
     );
-    let sp = state_path(work_dir.path(), sanitized);
+    let sp = backup_state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
 
@@ -1216,7 +1216,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
 /// is the only record of which parts already reached S3.
 #[tokio::test]
 async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
-    use btrfs_cold_backup::{BackupState, PartRecord, state_path};
+    use btrfs_cold_backup::{BackupState, PartRecord, backup_state_path};
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1229,7 +1229,7 @@ async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
         timestamp: "2026-06-02T14:30".to_string(),
         output_dir: work_dir
             .path()
-            .join("task/mnt_data_movies/bcb_level0_202606021430"),
+            .join("backup/mnt_data_movies/bcb_level0_202606021430"),
         stream_hash: Some("streamhash".to_string()),
         parts: [(
             "000000".to_string(),
@@ -1241,7 +1241,7 @@ async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
         .into(),
         ..Default::default()
     };
-    let sp = state_path(work_dir.path(), sanitized);
+    let sp = backup_state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
     let before = std::fs::read(&sp).unwrap();
@@ -1321,7 +1321,7 @@ async fn uploaded_part_should_decrypt_to_the_send_stream() {
 /// nothing uploaded yet the state is reset so the next run redoes the send.
 #[tokio::test]
 async fn resume_should_reset_state_when_part_is_damaged_before_any_upload() {
-    use btrfs_cold_backup::{BackupState, state_path};
+    use btrfs_cold_backup::{BackupState, backup_state_path};
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1330,7 +1330,7 @@ async fn resume_should_reset_state_when_part_is_damaged_before_any_upload() {
 
     let output_dir = work_dir
         .path()
-        .join("task")
+        .join("backup")
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
@@ -1341,7 +1341,7 @@ async fn resume_should_reset_state_when_part_is_damaged_before_any_upload() {
         write_part(&output_dir, "000000", b"original"),
     );
     std::fs::write(output_dir.join("snapshot.part-000000.age"), b"damaged!").unwrap();
-    let sp = state_path(work_dir.path(), sanitized);
+    let sp = backup_state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
 
@@ -1363,7 +1363,7 @@ async fn resume_should_reset_state_when_part_is_damaged_before_any_upload() {
 /// behind the state's back; the backup must fail and keep the state.
 #[tokio::test]
 async fn resume_should_fail_when_parts_missing_from_disk() {
-    use btrfs_cold_backup::state_path;
+    use btrfs_cold_backup::backup_state_path;
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1372,7 +1372,7 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
 
     let output_dir = work_dir
         .path()
-        .join("task")
+        .join("backup")
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
@@ -1388,7 +1388,7 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
         write_part(&output_dir, "000001", b"lost"),
     );
     std::fs::remove_file(output_dir.join("snapshot.part-000001.age")).unwrap();
-    let sp = state_path(work_dir.path(), sanitized);
+    let sp = backup_state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
     let before = std::fs::read(&sp).unwrap();
@@ -1408,7 +1408,7 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
 /// recover instead of misreading it.
 #[tokio::test]
 async fn resume_should_refuse_state_from_older_layout() {
-    use btrfs_cold_backup::state_path;
+    use btrfs_cold_backup::backup_state_path;
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1417,13 +1417,13 @@ async fn resume_should_refuse_state_from_older_layout() {
 
     let output_dir = work_dir
         .path()
-        .join("task")
+        .join("backup")
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
     std::fs::write(output_dir.join("snapshot.part-000000"), b"raw part").unwrap();
 
-    let sp = state_path(work_dir.path(), sanitized);
+    let sp = backup_state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     std::fs::write(
         &sp,
@@ -1920,7 +1920,7 @@ async fn restore_should_resume_partially_downloaded_part() {
     let half = encrypted_bytes.len() as u64 / 2;
     let restore_dir = work_dir
         .path()
-        .join("restore-movies-level0-2026-06-02T00:00");
+        .join("restore/mnt_data_movies/bcb_level0_202606020000");
     std::fs::create_dir_all(&restore_dir).unwrap();
     std::fs::write(
         restore_dir.join("part-000000.age"),
@@ -1945,9 +1945,7 @@ async fn restore_should_resume_partially_downloaded_part() {
         receive_completed: false,
         last_updated: 0,
     };
-    seeded
-        .save(&restore_dir.join("restore-state.yaml"))
-        .unwrap();
+    seeded.save(&restore_dir.join("state.yaml")).unwrap();
 
     let remaining: Vec<u8> = encrypted_bytes[half as usize..].to_vec();
     let mut remote = MockRemote::new();
@@ -1990,10 +1988,9 @@ async fn restore_should_resume_partially_downloaded_part() {
     .await
     .expect_err("btrfs receive must fail in this non-btrfs test environment");
 
-    let state: RestoreState = serde_yaml::from_str(
-        &std::fs::read_to_string(restore_dir.join("restore-state.yaml")).unwrap(),
-    )
-    .unwrap();
+    let state: RestoreState =
+        serde_yaml::from_str(&std::fs::read_to_string(restore_dir.join("state.yaml")).unwrap())
+            .unwrap();
     assert_eq!(
         state.parts["000000"].download_state,
         PartDownloadState::Downloaded,
@@ -2052,7 +2049,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     // reports NotRequested for it, not Ready).
     let restore_dir = work_dir
         .path()
-        .join("restore-movies-level0-2026-06-02T00:00");
+        .join("restore/mnt_data_movies/bcb_level0_202606020000");
     std::fs::create_dir_all(&restore_dir).unwrap();
     let mut parts = BTreeMap::new();
     parts.insert(
@@ -2072,9 +2069,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
         receive_completed: false,
         last_updated: 0,
     };
-    seeded
-        .save(&restore_dir.join("restore-state.yaml"))
-        .unwrap();
+    seeded.save(&restore_dir.join("state.yaml")).unwrap();
 
     let mut remote = MockRemote::new();
     remote.expect_restore_status_detail().returning(|key| {
@@ -2117,10 +2112,9 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     assert!(!progress.completed);
 
     // The resume offset must be preserved, not reset to a fresh Requested state.
-    let state: RestoreState = serde_yaml::from_str(
-        &std::fs::read_to_string(restore_dir.join("restore-state.yaml")).unwrap(),
-    )
-    .unwrap();
+    let state: RestoreState =
+        serde_yaml::from_str(&std::fs::read_to_string(restore_dir.join("state.yaml")).unwrap())
+            .unwrap();
     assert_eq!(
         state.parts["000000"].download_state,
         PartDownloadState::PartiallyDownloaded {
