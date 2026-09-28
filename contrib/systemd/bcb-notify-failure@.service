@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify bcb failure for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bcb-notify %i

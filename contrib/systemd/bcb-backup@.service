@@ -1,0 +1,7 @@
+[Unit]
+Description=bcb backup level %i
+OnFailure=bcb-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bcb-run %i

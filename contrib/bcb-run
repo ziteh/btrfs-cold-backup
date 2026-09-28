@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+LEVEL="$1"
+CONF="/etc/btrbk/bcb-level${LEVEL}.conf"
+
+btrbk -c "$CONF" snapshot
+bcb backup --level "$LEVEL"
+
+# Prune only after a successful backup, so a failed run keeps the previous snapshot
+# still referenced as parent by the last backup manifest
+btrbk -c "$CONF" prune

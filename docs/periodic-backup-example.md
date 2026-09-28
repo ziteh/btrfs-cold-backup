@@ -2,6 +2,8 @@
 
 A NAS backing up `/mnt/data` with a level 0 full backup on Jan 1 / Jul 1 and a level 1 incremental every Sunday, using the configuration from the [README](../README.md#configuration).
 
+Ready-to-copy versions of everything below live in [../contrib/](../contrib/README.md).
+
 One-time setup:
 
 ```bash
@@ -16,100 +18,19 @@ sudo bcb check
 
 AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy needs `PutObject`, `PutObjectTagging`, `GetObject`, `HeadObject`, `ListBucket`, `ListBucketMultipartUploads`, `AbortMultipartUpload`, `DeleteObject`, `RestoreObject`, and `HeadBucket` on the bucket. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
 
-Snapshots come from btrbk, one [config][btrbk-conf] per level so each can be created and pruned independently. `/etc/btrbk/bcb-level0.conf` (level 1 is identical except `snapshot_name bcb_level1`):
-
-```txt
-timestamp_format        long
-snapshot_create         always
-snapshot_preserve_min   latest
-snapshot_preserve       12m
-snapshot_dir            .snapshots
-lockfile                /run/lock/btrbk-bcb.lock
-transaction_log         /var/log/btrbk.log
-
-volume /mnt
-  subvolume data
-    snapshot_name bcb_level0
-```
+Snapshots come from btrbk, one [config][btrbk-conf] per level so each can be created and pruned independently ([contrib/btrbk/](../contrib/btrbk/), level 1 identical to level 0 except `snapshot_name bcb_level1`).
 
 `snapshot_preserve_min latest` guarantees the newest snapshot per level always survives pruning — exactly the parent the next incremental needs — while `snapshot_preserve 12m` additionally keeps a year of monthly snapshots locally. The shared `lockfile` keeps the two levels' btrbk invocations from overlapping (a level 0 upload can run for hours into the next timer), and `transaction_log` records every snapshot create/delete for audits.
 
 For incremental levels, `snapshot_create onchange` is worth considering instead of `always`: if the subvolume has not changed since the last snapshot, btrbk creates nothing and bcb idempotently skips the upload.
 
-The scheduled job snapshots, backs up, then prunes. `/usr/local/sbin/bcb-run`:
+The scheduled job snapshots, backs up, then prunes ([contrib/bcb-run](../contrib/bcb-run)). On failure the script exits non-zero before pruning, and re-running is safe: an interrupted backup resumes, a completed one is skipped.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-LEVEL="$1"
-CONF="/etc/btrbk/bcb-level${LEVEL}.conf"
+The systemd service ([contrib/systemd/bcb-backup@.service](../contrib/systemd/bcb-backup@.service)) wires that script to `OnFailure=`, which only fires when the unit actually ran and failed — it can't catch a timer that never fired at all (disabled, machine off past `Persistent=true`'s catch-up window, or a full disk that keeps `bcb` from starting). A silently-stopped backup schedule reports no failure and no error, so also set up a positive liveness signal — e.g. a dead man's switch (`curl` a healthchecks.io-style URL at the end of a successful `bcb-run`) that alerts you when it *stops* hearing from the job, rather than only reacting to failures it's told about.
 
-btrbk -c "$CONF" snapshot
-bcb backup --level "$LEVEL"
+The failure path ([contrib/systemd/bcb-notify-failure@.service](../contrib/systemd/bcb-notify-failure@.service) + [contrib/bcb-notify](../contrib/bcb-notify)) forwards the failed unit's recent log to wherever you want to hear about it (mail, ntfy, a webhook).
 
-# Prune only after a successful backup, so a failed run keeps the previous snapshot
-# still referenced as parent by the last backup manifest
-btrbk -c "$CONF" prune
-```
-
-On failure the script exits non-zero before pruning, and re-running is safe: an interrupted backup resumes, a completed one is skipped.
-
-```ini
-; /etc/systemd/system/bcb-backup@.service
-[Unit]
-Description=bcb backup level %i
-OnFailure=bcb-notify-failure@%n.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/bcb-run %i
-```
-
-`OnFailure=` only fires when the unit actually ran and failed — it can't catch a timer that
-never fired at all (disabled, machine off past `Persistent=true`'s catch-up window, or a full
-disk that keeps `bcb` from starting). A silently-stopped backup schedule reports no failure
-and no error, so also set up a positive liveness signal — e.g. a dead man's switch
-(`curl` a healthchecks.io-style URL at the end of a successful `bcb-run`) that alerts you
-when it *stops* hearing from the job, rather than only reacting to failures it's told about.
-
-```ini
-; /etc/systemd/system/bcb-notify-failure@.service
-[Unit]
-Description=Notify bcb failure for %i
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/bcb-notify %i
-```
-
-`/usr/local/sbin/bcb-notify` forwards the failed unit's recent log to wherever you want to
-hear about it (mail, ntfy, a webhook):
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-journalctl -u "$1" -n 50 --no-pager | mail -s "bcb failure: $1" ops@example.com
-```
-
-```ini
-; /etc/systemd/system/bcb-backup@0.timer
-[Timer]
-OnCalendar=*-01,07-01 01:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-```ini
-; /etc/systemd/system/bcb-backup@1.timer
-[Timer]
-OnCalendar=Sun *-*-* 03:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
+Timers ([contrib/systemd/bcb-backup@0.timer](../contrib/systemd/bcb-backup@0.timer), [contrib/systemd/bcb-backup@1.timer](../contrib/systemd/bcb-backup@1.timer)):
 
 ```bash
 sudo systemctl enable --now bcb-backup@0.timer bcb-backup@1.timer

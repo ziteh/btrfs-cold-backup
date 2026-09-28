@@ -1,0 +1,7 @@
+# EDIT: OnCalendar= to match your desired level 0 (full backup) schedule
+[Timer]
+OnCalendar=*-01,07-01 01:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

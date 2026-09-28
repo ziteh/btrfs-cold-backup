@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# EDIT: replace with wherever you want to hear about failures (mail, ntfy, a webhook, ...)
+journalctl -u "$1" -n 50 --no-pager | mail -s "bcb failure: $1" ops@example.com
