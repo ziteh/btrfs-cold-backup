@@ -162,7 +162,9 @@ gantt
 
 Every object is tagged `bcb-backup-level` (`0`, `1`, ... or `manifest`) so one lifecycle rule per level covers all subvolumes.
 
-Leave `manifest` objects unexpired. Don't expire a level that a later incremental still depends on, and respect each storage class's minimum duration.
+Leave `manifest` objects unexpired. Don't expire a level that a later incremental still depends on: its expiration must come after the last incremental built on it. Respect each storage class's minimum duration too.
+
+Before a level N backup, bcb checks that the manifest of every lower level listed in `latest.yaml` still exists, and fails otherwise; run a level 0 backup to start a new chain. It does not check the parts, so it cannot catch data parts expired while their manifest was kept.
 
 ## Documentation
 

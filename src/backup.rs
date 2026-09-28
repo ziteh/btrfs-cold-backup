@@ -111,6 +111,8 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
     btrfs: &B,
     remote: &R,
     task: &Task,
+    prefix: &str,
+    sanitized: &str,
     latest_key: &str,
     snapshots: &[String],
     level: u32,
@@ -168,6 +170,18 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
             parent.snapshot_name,
             parent.timestamp
         ));
+    }
+    // Restoring this incremental needs every ancestor. Only manifests are checked, one HEAD
+    // per level; parts are not.
+    for (&l, entry) in latest.levels.range(..level) {
+        let key = s3_manifest_key(prefix, sanitized, l, &entry.timestamp);
+        if !remote.exists(&key).await? {
+            return Err(anyhow!(
+                "level {l} manifest {key} listed in {latest_key} is missing, so a level \
+                 {level} backup could never be restored; it may have been deleted by an S3 \
+                 lifecycle expiration rule. Run a level 0 backup to start a new chain"
+            ));
+        }
     }
     Ok(Some(parent.snapshot_name.clone()))
 }
@@ -249,6 +263,8 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
         btrfs,
         remote,
         task,
+        &config.s3.prefix,
+        &sanitized,
         &latest_key,
         &snapshots,
         level,
