@@ -119,17 +119,17 @@ impl S3Backend {
     }
 }
 
+/// Only classes bcb's cost and retrieval model covers: INTELLIGENT_TIERING's archive tiers
+/// need a different retrieval flow, and REDUCED_REDUNDANCY is deprecated.
 pub(crate) fn parse_storage_class(s: &str) -> Result<StorageClass> {
     match s {
         "DEEP_ARCHIVE" => Ok(StorageClass::DeepArchive),
         "GLACIER" => Ok(StorageClass::Glacier),
         "GLACIER_IR" => Ok(StorageClass::GlacierIr),
-        "INTELLIGENT_TIERING" => Ok(StorageClass::IntelligentTiering),
         "ONEZONE_IA" => Ok(StorageClass::OnezoneIa),
-        "REDUCED_REDUNDANCY" => Ok(StorageClass::ReducedRedundancy),
         "STANDARD" => Ok(StorageClass::Standard),
         "STANDARD_IA" => Ok(StorageClass::StandardIa),
-        other => Err(anyhow!("unknown S3 storage class: {other}")),
+        other => Err(anyhow!("unsupported S3 storage class: {other}")),
     }
 }
 
@@ -659,14 +659,14 @@ mod tests {
         assert!(parse_storage_class("DEEP_ARCHIVE").is_ok());
         assert!(parse_storage_class("GLACIER").is_ok());
         assert!(parse_storage_class("GLACIER_IR").is_ok());
-        assert!(parse_storage_class("INTELLIGENT_TIERING").is_ok());
         assert!(parse_storage_class("ONEZONE_IA").is_ok());
-        assert!(parse_storage_class("REDUCED_REDUNDANCY").is_ok());
         assert!(parse_storage_class("STANDARD_IA").is_ok());
     }
 
     #[test]
     fn test_parse_storage_class_unknown_is_err() {
         assert!(parse_storage_class("BOGUS").is_err());
+        assert!(parse_storage_class("INTELLIGENT_TIERING").is_err());
+        assert!(parse_storage_class("REDUCED_REDUNDANCY").is_err());
     }
 }

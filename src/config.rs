@@ -186,6 +186,15 @@ impl Config {
         if self.s3.region.is_empty() {
             return Err(anyhow!("s3.region cannot be empty"));
         }
+        // Keys are built as `{prefix}manifests/...`; without the trailing slash the prefix
+        // would glue onto the next component, and a leading slash creates an empty-named
+        // top-level "directory" on S3.
+        let prefix = &self.s3.prefix;
+        if !prefix.is_empty() && (!prefix.ends_with('/') || prefix.starts_with('/')) {
+            return Err(anyhow!(
+                "s3.prefix must be empty or end with '/' and not start with '/', got {prefix:?}"
+            ));
+        }
         if self.s3.retry.max_attempts == 0 {
             return Err(anyhow!("s3.retry.max_attempts must be > 0"));
         }
@@ -196,6 +205,18 @@ impl Config {
         }
         crate::remote::parse_storage_class(&self.s3.storage_class.manifest)
             .map_err(|e| anyhow!("s3.storage_class.manifest: {e}"))?;
+        // Manifests are read on every backup and at the start of a restore, so they must be
+        // downloadable without an archive retrieval.
+        if matches!(
+            self.s3.storage_class.manifest.as_str(),
+            "GLACIER" | "DEEP_ARCHIVE"
+        ) {
+            return Err(anyhow!(
+                "s3.storage_class.manifest cannot be {}: manifests must be readable without \
+                 an archive retrieval",
+                self.s3.storage_class.manifest
+            ));
+        }
         for (level, class) in self.s3.storage_class.backup_data.iter().enumerate() {
             crate::remote::parse_storage_class(class)
                 .map_err(|e| anyhow!("s3.storage_class.backup_data[{level}]: {e}"))?;
@@ -407,6 +428,45 @@ mod tests {
 
         let mut config = valid_config();
         config.s3.storage_class.manifest = "bogus".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_s3_prefix_rules() {
+        for ok in ["", "backups/", "a/b/"] {
+            let mut config = valid_config();
+            config.s3.prefix = ok.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "prefix {ok:?} should be accepted"
+            );
+        }
+        for bad in ["backups", "/backups/", "/"] {
+            let mut config = valid_config();
+            config.s3.prefix = bad.to_string();
+            assert!(
+                config.validate().is_err(),
+                "prefix {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_archive_manifest_class_rejected() {
+        for class in ["GLACIER", "DEEP_ARCHIVE"] {
+            let mut config = valid_config();
+            config.s3.storage_class.manifest = class.to_string();
+            assert!(config.validate().is_err(), "{class} should be rejected");
+        }
+        let mut config = valid_config();
+        config.s3.storage_class.manifest = "GLACIER_IR".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_unsupported_backup_data_class_rejected() {
+        let mut config = valid_config();
+        config.s3.storage_class.backup_data = vec!["INTELLIGENT_TIERING".to_string()];
         assert!(config.validate().is_err());
     }
 

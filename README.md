@@ -54,11 +54,11 @@ base_dir: /var/lib/bcb/
 age_public_key: age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 s3:
   bucket: my-backup-bucket
-  prefix: btrfs-backups/
+  prefix: btrfs-backups/ # Empty, or ends with "/" and does not start with "/"
   endpoint: "" # Leave empty for AWS S3, or specify custom endpoint for S3-compatible services
   region: us-east-1
   storage_class:
-    manifest: STANDARD
+    manifest: STANDARD # Must be readable without retrieval: STANDARD, STANDARD_IA, ONEZONE_IA or GLACIER_IR
     backup_data: # One entry per backup level; a level without an entry is an error
       - DEEP_ARCHIVE # Level 0 (full backup)
       - DEEP_ARCHIVE # Level 1
@@ -72,6 +72,8 @@ tasks:
 ```
 
 `base_dir` is bcb's local working directory: it holds the lock file, resume state, daily log files, and the temporary split/encrypted parts during backup and restore. Its filesystem needs free space roughly equal to one full backup.
+
+`backup_data` accepts STANDARD, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER and DEEP_ARCHIVE.
 
 ### Snapshots
 
