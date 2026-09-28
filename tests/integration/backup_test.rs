@@ -1003,6 +1003,81 @@ async fn resume_should_skip_already_uploaded_parts() {
     assert_eq!(backup.blake3, "streamhash");
 }
 
+/// A crash after a part's upload but before the state records it must leave the `.age` on
+/// disk, so the resumed run re-uploads it instead of finding the part missing.
+#[tokio::test]
+async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
+    use btrfs_cold_backup::{BackupState, state_path};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let output_dir = work_dir
+        .path()
+        .join("task")
+        .join(sanitized)
+        .join("bcb_level0_202606021430");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    std::fs::write(output_dir.join("snapshot.part-000000"), b"only part").unwrap();
+
+    let mut state = BackupState {
+        task_name: task.name.clone(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        timestamp: "2026-06-02T14:30".to_string(),
+        output_dir: output_dir.clone(),
+        stream_hash: Some("streamhash".to_string()),
+        total_parts: Some(1),
+        parts_completed: Default::default(),
+        manifest_uploaded: false,
+        last_updated: 0,
+    };
+    let sp = state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    state.save(&sp).unwrap();
+
+    // A directory squatting on the state's tmp path makes the save after the upload fail,
+    // standing in for a crash at that point (and works even when tests run as root).
+    let tmp_path = PathBuf::from(format!("{}.tmp", sp.display()));
+    let squat = tmp_path.clone();
+    let btrfs = MockBtrfs::new();
+    let mut remote = MockRemote::new();
+    remote
+        .expect_upload_file()
+        .times(1)
+        .returning(move |_, _, _, _| {
+            std::fs::create_dir(&squat).unwrap();
+            Ok(())
+        });
+    assert!(
+        backup_task(&config, &task, 0, &btrfs, &remote)
+            .await
+            .is_err()
+    );
+    assert!(output_dir.join("snapshot.part-000000.age").exists());
+
+    std::fs::remove_dir(&tmp_path).unwrap();
+    let mut remote = MockRemote::new();
+    remote
+        .expect_upload_file()
+        .withf(|key, _, _, _| key.contains("part-000000"))
+        .times(1)
+        .returning(|_, _, _, _| Ok(()));
+    remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+    remote.expect_exists().returning(|_| Ok(false));
+
+    let backup = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect("resumed backup should succeed")
+        .expect("resume must not be skipped");
+    assert_eq!(backup.parts.len(), 1);
+}
+
 /// A part left with both its raw file and a `.age` file (encryption was interrupted mid-run
 /// on a previous attempt, so the `.age` may be truncated) must have the existing `.age`
 /// discarded and freshly re-encrypted from the raw file — not uploaded as whatever partial

@@ -544,9 +544,6 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
             &format!("bcb-backup-level={level}"),
         )
         .await?;
-    if let Err(e) = tokio::fs::remove_file(&enc_path).await {
-        tracing::warn!("failed to remove uploaded part {:?}: {e}", enc_path);
-    }
 
     Ok(UploadedPart {
         size_bytes: enc_size,
@@ -729,6 +726,15 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             .parts_completed
             .insert(suffix.clone(), completed);
         state.save()?;
+        // Deleted only once the state records the upload: gone any earlier, a crash would
+        // leave a part that is neither on disk nor marked complete. A crash after the save
+        // leaves the file for the output_dir cleanup below.
+        let enc_path = plan
+            .output_dir
+            .join(format!("{SNAPSHOT_PART_PREFIX}{suffix}.age"));
+        if let Err(e) = tokio::fs::remove_file(&enc_path).await {
+            tracing::warn!("failed to remove uploaded part {:?}: {e}", enc_path);
+        }
     }
 
     let backup = build_manifest(config, &plan, level, stream_hash, &state.inner).await;
