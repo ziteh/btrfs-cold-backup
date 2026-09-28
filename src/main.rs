@@ -110,8 +110,8 @@ async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, Pid
     // reaches it, which for `split` is after `btrfs send` has already run for hours.
     btrfs_cold_backup::check::check_binaries()?;
 
-    std::fs::create_dir_all(&config.base_dir)
-        .map_err(|e| anyhow!("failed to create base_dir: {e}"))?;
+    btrfs_cold_backup::util::prepare_base_dir(&config.base_dir)
+        .map_err(|e| anyhow!("failed to prepare base_dir: {e}"))?;
 
     let lock_path = config.base_dir.join("bcb.lock");
     let lock = PidLock::acquire(&lock_path)?;
