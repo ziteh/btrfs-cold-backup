@@ -27,8 +27,8 @@ impl Drop for TmpfsMount {
     }
 }
 
-/// Running out of space in base_dir must report the real cause (ENOSPC), not the broken pipe
-/// it causes upstream, and must leave no parts behind to starve the next task.
+/// Running out of space in base_dir must report ENOSPC and leave no parts behind to starve
+/// the next task.
 ///
 /// The free-space precheck estimates from `du`, which counts an empty file as zero bytes while
 /// `btrfs send` spends a few hundred bytes of stream on each; many empty files therefore pass

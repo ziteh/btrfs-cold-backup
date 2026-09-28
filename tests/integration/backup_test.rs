@@ -1053,10 +1053,34 @@ async fn level1_should_fail_when_snapshot_not_newer_than_parent() {
     assert!(err.contains("not newer"), "unexpected error: {err}");
 }
 
+/// Writes a stand-in encrypted part into `output_dir` and returns its record. The upload
+/// stage never decrypts, so any bytes serve.
+fn write_part(output_dir: &Path, index: &str, bytes: &[u8]) -> btrfs_cold_backup::PartRecord {
+    std::fs::write(output_dir.join(format!("snapshot.part-{index}.age")), bytes).unwrap();
+    btrfs_cold_backup::PartRecord {
+        size_bytes: bytes.len() as u64,
+        blake3: blake3::hash(bytes).to_hex().to_string(),
+    }
+}
+
+/// State of a level 0 backup of movies whose send already finished.
+fn sent_state(output_dir: &Path) -> btrfs_cold_backup::BackupState {
+    btrfs_cold_backup::BackupState {
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        timestamp: "2026-06-02T14:30".to_string(),
+        output_dir: output_dir.to_path_buf(),
+        stream_hash: Some("streamhash".to_string()),
+        ..Default::default()
+    }
+}
+
 /// Resuming after an interruption must upload only the parts not yet completed.
 #[tokio::test]
 async fn resume_should_skip_already_uploaded_parts() {
-    use btrfs_cold_backup::{BackupState, UploadedPart, state_path};
+    use btrfs_cold_backup::state_path;
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1069,31 +1093,21 @@ async fn resume_should_skip_already_uploaded_parts() {
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
-    // part 000000 was already uploaded (gone from disk); 000001 is still pending
-    std::fs::write(output_dir.join("snapshot.part-000001"), b"pending part").unwrap();
 
-    let mut parts_completed = std::collections::HashMap::new();
-    parts_completed.insert(
+    let mut state = sent_state(&output_dir);
+    // part 000000 was already uploaded (gone from disk); 000001 is still pending
+    state.parts.insert(
         "000000".to_string(),
-        UploadedPart {
+        btrfs_cold_backup::PartRecord {
             size_bytes: 12,
             blake3: "already-uploaded".to_string(),
         },
     );
-    let mut state = BackupState {
-        level: 0,
-        snapshot_name: "bcb_level0.20260602T1430".to_string(),
-        parent_snapshot: None,
-        source_uuid: SOURCE_UUID.to_string(),
-        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
-        timestamp: "2026-06-02T14:30".to_string(),
-        output_dir: output_dir.clone(),
-        stream_hash: Some("streamhash".to_string()),
-        total_parts: Some(2),
-        parts_completed,
-        manifest_uploaded: false,
-        last_updated: 0,
-    };
+    state.uploaded_parts.insert("000000".to_string());
+    state.parts.insert(
+        "000001".to_string(),
+        write_part(&output_dir, "000001", b"pending part"),
+    );
     let sp = state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
@@ -1125,7 +1139,7 @@ async fn resume_should_skip_already_uploaded_parts() {
 /// disk, so the resumed run re-uploads it instead of finding the part missing.
 #[tokio::test]
 async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
-    use btrfs_cold_backup::{BackupState, state_path};
+    use btrfs_cold_backup::state_path;
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1138,22 +1152,12 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
-    std::fs::write(output_dir.join("snapshot.part-000000"), b"only part").unwrap();
 
-    let mut state = BackupState {
-        level: 0,
-        snapshot_name: "bcb_level0.20260602T1430".to_string(),
-        parent_snapshot: None,
-        source_uuid: SOURCE_UUID.to_string(),
-        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
-        timestamp: "2026-06-02T14:30".to_string(),
-        output_dir: output_dir.clone(),
-        stream_hash: Some("streamhash".to_string()),
-        total_parts: Some(1),
-        parts_completed: Default::default(),
-        manifest_uploaded: false,
-        last_updated: 0,
-    };
+    let mut state = sent_state(&output_dir);
+    state.parts.insert(
+        "000000".to_string(),
+        write_part(&output_dir, "000000", b"only part"),
+    );
     let sp = state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
@@ -1199,7 +1203,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
 /// is the only record of which parts already reached S3.
 #[tokio::test]
 async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
-    use btrfs_cold_backup::{BackupState, state_path};
+    use btrfs_cold_backup::{BackupState, PartRecord, state_path};
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
@@ -1214,6 +1218,14 @@ async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
             .path()
             .join("task/mnt_data_movies/bcb_level0_202606021430"),
         stream_hash: Some("streamhash".to_string()),
+        parts: [(
+            "000000".to_string(),
+            PartRecord {
+                size_bytes: 1,
+                blake3: String::new(),
+            },
+        )]
+        .into(),
         ..Default::default()
     };
     let sp = state_path(work_dir.path(), sanitized);
@@ -1236,13 +1248,10 @@ async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
     assert_eq!(std::fs::read(&sp).unwrap(), before);
 }
 
-/// A part left with both its raw file and a `.age` file (encryption was interrupted mid-run
-/// on a previous attempt, so the `.age` may be truncated) must have the existing `.age`
-/// discarded and freshly re-encrypted from the raw file — not uploaded as whatever partial
-/// bytes were left behind.
+/// What reaches S3 must be the send stream encrypted to the configured key, with no
+/// plaintext part left in base_dir along the way.
 #[tokio::test]
-async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run() {
-    use btrfs_cold_backup::{BackupState, state_path};
+async fn uploaded_part_should_decrypt_to_the_send_stream() {
     use secrecy::ExposeSecret;
     use std::sync::{Arc, Mutex};
 
@@ -1251,95 +1260,54 @@ async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run
     let mut config = test_config(work_dir.path());
     config.age_public_key = identity.to_public().to_string();
     let task = movies_task();
-    let sanitized = "mnt_data_movies";
+    let snap = "bcb_level0.20260602T1430";
 
-    let output_dir = work_dir
-        .path()
-        .join("task")
-        .join(sanitized)
-        .join("bcb_level0_202606021430");
-    std::fs::create_dir_all(&output_dir).unwrap();
-    let raw_content = b"the real snapshot data for this part".to_vec();
-    std::fs::write(output_dir.join("snapshot.part-000000"), &raw_content).unwrap();
-    // Simulates a run killed mid-encryption in a previous attempt: a truncated/garbage .age
-    // file sitting alongside the still-present raw part.
-    std::fs::write(
-        output_dir.join("snapshot.part-000000.age"),
-        b"truncated garbage",
-    )
-    .unwrap();
+    let mut btrfs = btrfs_with_uuids();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![snap.to_string()]));
+    btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
 
-    let mut state = BackupState {
-        level: 0,
-        snapshot_name: "bcb_level0.20260602T1430".to_string(),
-        parent_snapshot: None,
-        source_uuid: SOURCE_UUID.to_string(),
-        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
-        timestamp: "2026-06-02T14:30".to_string(),
-        output_dir: output_dir.clone(),
-        stream_hash: Some("streamhash".to_string()),
-        total_parts: Some(1),
-        parts_completed: std::collections::HashMap::new(),
-        manifest_uploaded: false,
-        last_updated: 0,
-    };
-    let sp = state_path(work_dir.path(), sanitized);
-    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
-    state.save(&sp).unwrap();
-
-    // resume path: no btrfs calls at all
-    let btrfs = MockBtrfs::new();
-
-    // upload_file() only gets the path; production code deletes that file right after a
-    // successful upload, so the bytes must be captured here, before that happens.
-    let uploaded_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let uploaded_bytes_clone = uploaded_bytes.clone();
-
+    // production code deletes the file right after a successful upload, so the bytes and
+    // the directory listing must be captured here, before that happens.
+    let uploaded = Arc::new(Mutex::new(None::<(Vec<u8>, usize)>));
+    let uploaded_clone = uploaded.clone();
     let mut remote = MockRemote::new();
+    remote.expect_exists().returning(|_| Ok(false));
     remote
         .expect_upload_file()
-        .withf(|key, _, _, _| key.contains("part-000000"))
         .times(1)
         .returning(move |_, path, _, _| {
-            *uploaded_bytes_clone.lock().unwrap() = Some(std::fs::read(path)?);
+            let files = std::fs::read_dir(path.parent().unwrap())?.count();
+            *uploaded_clone.lock().unwrap() = Some((std::fs::read(path)?, files));
             Ok(())
         });
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(false));
 
     let backup = backup_task(&config, &task, 0, &btrfs, &remote)
         .await
-        .expect("resumed backup should succeed")
-        .expect("resume must not be skipped");
-    assert_eq!(backup.parts.len(), 1);
-
-    // Decrypt what was actually uploaded and confirm it's the real content — proving the
-    // truncated .age was discarded and freshly re-encrypted, not uploaded as-is.
-    let uploaded_bytes = uploaded_bytes
-        .lock()
         .unwrap()
-        .clone()
-        .expect("part must have been uploaded");
-    let uploaded_copy_path = work_dir.path().join("uploaded_copy.age");
-    std::fs::write(&uploaded_copy_path, &uploaded_bytes).unwrap();
-    let decrypted_path = work_dir.path().join("decrypted");
-    btrfs_cold_backup::decrypt_file(
-        &uploaded_copy_path,
-        &decrypted_path,
-        identity.to_string().expose_secret(),
-    )
-    .await
-    .expect("uploaded part must decrypt with the real key, not be leftover garbage");
-    assert_eq!(std::fs::read(&decrypted_path).unwrap(), raw_content);
+        .unwrap();
+
+    let (bytes, files) = uploaded.lock().unwrap().clone().unwrap();
+    assert_eq!(files, 1, "only the .age part may be in output_dir");
+    assert_eq!(
+        backup.parts[0].blake3,
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    let enc = work_dir.path().join("uploaded.age");
+    let dec = work_dir.path().join("decrypted");
+    std::fs::write(&enc, &bytes).unwrap();
+    btrfs_cold_backup::decrypt_file(&enc, &dec, identity.to_string().expose_secret())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dec).unwrap(), b"btrfs send data");
 }
 
-/// If parts recorded in the state are gone from disk and not uploaded, the resumed backup
-/// must fail loudly instead of silently uploading an incomplete set.
+/// A pending part that no longer matches its recorded hash must not be uploaded. With
+/// nothing uploaded yet the state is reset so the next run redoes the send.
 #[tokio::test]
-async fn resume_should_fail_when_parts_missing_from_disk() {
+async fn resume_should_reset_state_when_part_is_damaged_before_any_upload() {
     use btrfs_cold_backup::{BackupState, state_path};
 
     let work_dir = tempfile::tempdir().unwrap();
@@ -1353,26 +1321,64 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
         .join(sanitized)
         .join("bcb_level0_202606021430");
     std::fs::create_dir_all(&output_dir).unwrap();
-    // state says 2 parts, but only one exists and none were uploaded
-    std::fs::write(output_dir.join("snapshot.part-000000"), b"only part").unwrap();
 
-    let mut state = BackupState {
-        level: 0,
-        snapshot_name: "bcb_level0.20260602T1430".to_string(),
-        parent_snapshot: None,
-        source_uuid: SOURCE_UUID.to_string(),
-        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
-        timestamp: "2026-06-02T14:30".to_string(),
-        output_dir: output_dir.clone(),
-        stream_hash: Some("streamhash".to_string()),
-        total_parts: Some(2),
-        parts_completed: std::collections::HashMap::new(),
-        manifest_uploaded: false,
-        last_updated: 0,
-    };
+    let mut state = sent_state(&output_dir);
+    state.parts.insert(
+        "000000".to_string(),
+        write_part(&output_dir, "000000", b"original"),
+    );
+    std::fs::write(output_dir.join("snapshot.part-000000.age"), b"damaged!").unwrap();
     let sp = state_path(work_dir.path(), sanitized);
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     state.save(&sp).unwrap();
+
+    // No upload expectations: uploading the damaged part would fail the test.
+    let btrfs = MockBtrfs::new();
+    let remote = MockRemote::new();
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("state cleared"), "unexpected error: {err}");
+    let saved: BackupState = serde_yaml::from_slice(&std::fs::read(&sp).unwrap()).unwrap();
+    assert!(saved.stream_hash.is_none());
+    assert!(saved.parts.is_empty());
+}
+
+/// Once some parts are on S3, a missing pending part can't be recovered by redoing the send
+/// behind the state's back; the backup must fail and keep the state.
+#[tokio::test]
+async fn resume_should_fail_when_parts_missing_from_disk() {
+    use btrfs_cold_backup::state_path;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let output_dir = work_dir
+        .path()
+        .join("task")
+        .join(sanitized)
+        .join("bcb_level0_202606021430");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    let mut state = sent_state(&output_dir);
+    state.parts.insert(
+        "000000".to_string(),
+        write_part(&output_dir, "000000", b"uploaded"),
+    );
+    state.uploaded_parts.insert("000000".to_string());
+    state.parts.insert(
+        "000001".to_string(),
+        write_part(&output_dir, "000001", b"lost"),
+    );
+    std::fs::remove_file(output_dir.join("snapshot.part-000001.age")).unwrap();
+    let sp = state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    state.save(&sp).unwrap();
+    let before = std::fs::read(&sp).unwrap();
 
     let btrfs = MockBtrfs::new();
     let remote = MockRemote::new();
@@ -1381,7 +1387,60 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
         .await
         .expect_err("incomplete part set must fail")
         .to_string();
-    assert!(err.contains("expected 2 parts"), "unexpected error: {err}");
+    assert!(err.contains("000001"), "unexpected error: {err}");
+    assert_eq!(std::fs::read(&sp).unwrap(), before);
+}
+
+/// A state from a version that kept plaintext parts can't be resumed; bcb must say how to
+/// recover instead of misreading it.
+#[tokio::test]
+async fn resume_should_refuse_state_from_older_layout() {
+    use btrfs_cold_backup::state_path;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let output_dir = work_dir
+        .path()
+        .join("task")
+        .join(sanitized)
+        .join("bcb_level0_202606021430");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    std::fs::write(output_dir.join("snapshot.part-000000"), b"raw part").unwrap();
+
+    let sp = state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    std::fs::write(
+        &sp,
+        format!(
+            "level: 0\n\
+             snapshot_name: bcb_level0.20260602T1430\n\
+             parent_snapshot: null\n\
+             source_uuid: {SOURCE_UUID}\n\
+             snapshot_uuid: x\n\
+             timestamp: 2026-06-02T14:30\n\
+             output_dir: {}\n\
+             stream_hash: streamhash\n\
+             total_parts: 1\n\
+             parts_completed: {{}}\n\
+             manifest_uploaded: false\n\
+             last_updated: 0\n",
+            output_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let btrfs = MockBtrfs::new();
+    let remote = MockRemote::new();
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("older bcb"), "unexpected error: {err}");
+    assert!(output_dir.join("snapshot.part-000000").exists());
 }
 
 /// Archived parts must trigger a retrieval request and a retry-later error, not a download.

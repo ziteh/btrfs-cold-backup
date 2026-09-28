@@ -1,16 +1,17 @@
-use anyhow::{Result, anyhow};
-use std::collections::BTreeSet;
+use age::x25519;
+use anyhow::{Context, Result, anyhow};
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     BtrfsOps, Config, RemoteBackend, Task,
-    crypto::{blake3_file, encrypt_file},
+    crypto::blake3_file,
     manifest::{
         Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo, parse_backup,
         parse_latest,
     },
-    state::{BackupState, UploadedPart, read_state},
+    state::{BackupState, PartRecord, read_state},
     util::{
         IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, fsync_dir,
         s3_backup_key, s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path,
@@ -69,6 +70,14 @@ impl PersistentState {
     /// discard its uploaded parts and leave that level without a backup.
     fn load_or_init(path: PathBuf, task_name: &str, level: u32) -> Result<Self> {
         let inner = match read_state::<BackupState>(&path)? {
+            // Older versions kept plaintext parts and recorded no per-part hashes.
+            Some(s) if s.stream_hash.is_some() && s.parts.is_empty() => {
+                return Err(anyhow!(
+                    "backup state {path:?} was written by an older bcb whose local parts this \
+                     version cannot resume; delete it and {:?}, then re-run",
+                    s.output_dir
+                ));
+            }
             Some(s) if s.level == level => {
                 tracing::info!("resuming from existing backup state");
                 s
@@ -295,8 +304,8 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     }))
 }
 
-// Test-only pause point: parks here, with both the btrfs-send and split children already
-// spawned and alive, so the VM e2e suite can SIGKILL bcb at a deterministic point to exercise
+// Test-only pause point: parks here, with the btrfs-send child already spawned and alive, so
+// the VM e2e suite can SIGKILL bcb at a deterministic point to exercise
 // orphaned-child-process handling (see util::die_with_parent) instead of racing on sleep timing.
 #[cfg(debug_assertions)]
 async fn test_pause_during_send() {
@@ -357,19 +366,11 @@ async fn snapshot_size_bytes(path: &Path) -> Result<u64> {
         .map_err(|e| anyhow!("failed to parse du output '{size_str}' for {:?}: {e}", path))
 }
 
-/// One part more than the snapshot is needed: while a part is encrypted, its raw file and its
-/// `.age` file exist side by side.
-fn ensure_enough_space(
-    available: u64,
-    snapshot_size: u64,
-    part_size: u64,
-    snapshot_path: &Path,
-) -> Result<()> {
-    let required = snapshot_size + part_size;
+fn ensure_enough_space(available: u64, required: u64, snapshot_path: &Path) -> Result<()> {
     if available < required {
         return Err(anyhow!(
             "insufficient free space for base_dir: {:.1} GiB available, ~{:.1} GiB needed \
-             (estimated from the size of {:?} plus one part); free up space or point base_dir at a larger \
+             (estimated from the size of {:?}); free up space or point base_dir at a larger \
              filesystem before retrying",
             available as f64 / GIB,
             required as f64 / GIB,
@@ -385,7 +386,7 @@ fn ensure_enough_space(
 /// or an unsupported flag on a non-Linux `du`), so a failure to estimate only skips the
 /// check — it must never block a backup that might otherwise have succeeded.
 async fn check_available_space(snapshot_path: &Path, output_dir: &Path) -> Result<()> {
-    let snapshot_size = match snapshot_size_bytes(snapshot_path).await {
+    let required = match snapshot_size_bytes(snapshot_path).await {
         Ok(size) => size,
         Err(e) => {
             tracing::warn!("could not estimate snapshot size, skipping free-space check: {e}");
@@ -394,15 +395,16 @@ async fn check_available_space(snapshot_path: &Path, output_dir: &Path) -> Resul
     };
     // output_dir was just created under base_dir, so it's on the same filesystem.
     let available = available_space_bytes(output_dir)?;
-    ensure_enough_space(available, snapshot_size, split_part_size(), snapshot_path)
+    ensure_enough_space(available, required, snapshot_path)
 }
 
-async fn send_and_split<B: BtrfsOps>(
+async fn send_and_encrypt<B: BtrfsOps>(
     btrfs: &B,
     task: &Task,
     snapshot_name: &str,
     parent: &Option<String>,
     output_dir: &Path,
+    public_key: &str,
     state: &mut PersistentState,
 ) -> Result<String> {
     if let Some(ref h) = state.inner.stream_hash {
@@ -415,7 +417,16 @@ async fn send_and_split<B: BtrfsOps>(
     }
     tokio::fs::create_dir_all(output_dir).await?;
 
-    let result = send_into_parts(btrfs, task, snapshot_name, parent, output_dir, state).await;
+    let result = send_into_parts(
+        btrfs,
+        task,
+        snapshot_name,
+        parent,
+        output_dir,
+        public_key,
+        state,
+    )
+    .await;
     // Without a recorded stream hash the next run starts over anyway; left behind, the parts
     // would take space from the tasks that run after this one.
     if result.is_err()
@@ -432,12 +443,17 @@ async fn send_into_parts<B: BtrfsOps>(
     snapshot_name: &str,
     parent: &Option<String>,
     output_dir: &Path,
+    public_key: &str,
     state: &mut PersistentState,
 ) -> Result<String> {
+    let recipient: x25519::Recipient = public_key
+        .parse()
+        .map_err(|e| anyhow!("invalid age public key: {e}"))?;
+
     let snapshot_path = task.snapshot_dir.join(snapshot_name);
     check_available_space(&snapshot_path, output_dir).await?;
 
-    let mut stream = match parent {
+    let stream = match parent {
         Some(p) => {
             btrfs
                 .send_incremental(&task.snapshot_dir.join(p.as_str()), &snapshot_path)
@@ -445,121 +461,139 @@ async fn send_into_parts<B: BtrfsOps>(
         }
         None => btrfs.send_full(&snapshot_path).await?,
     };
-
-    let part_prefix = output_dir.join(SNAPSHOT_PART_PREFIX);
-    let part_prefix_str = part_prefix
-        .to_str()
-        .ok_or_else(|| anyhow!("invalid part prefix path"))?;
-    let mut split_cmd = tokio::process::Command::new("split");
-    split_cmd
-        .args([
-            "-b",
-            &split_part_size().to_string(),
-            "-d",
-            "-a",
-            "6",
-            "-",
-            part_prefix_str,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        split_cmd.pre_exec(crate::util::die_with_parent);
-    }
-    let mut split_child = split_cmd.spawn()?;
     test_pause_during_send().await;
 
-    // A failed write usually means split itself failed (e.g. ENOSPC), and then the write
-    // error is only a broken pipe; split's stderr below holds the actual cause.
-    let (hash, write_err) = {
-        let mut split_stdin = split_child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("failed to open split stdin"))?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; IO_BUF_SIZE];
-        let mut write_err = None;
-        loop {
-            let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            if let Err(e) = split_stdin.write_all(&buf[..n]).await {
-                write_err = Some(e);
-                break;
-            }
-        }
-        (hasher.finalize().to_hex().to_string(), write_err)
-    };
+    let stream = tokio_util::io::SyncIoBridge::new(stream);
+    let dir = output_dir.to_path_buf();
+    let part_size = split_part_size();
+    let (hash, parts) = tokio::task::spawn_blocking(move || {
+        encrypt_into_parts(stream, &dir, part_size, &recipient)
+    })
+    .await??;
 
-    let split_out = split_child.wait_with_output().await?;
-    if !split_out.status.success() {
-        return Err(anyhow!(
-            "split failed: {}",
-            String::from_utf8_lossy(&split_out.stderr).trim()
-        ));
-    }
-    if let Some(e) = write_err {
-        return Err(anyhow!("failed to write the send stream to split: {e}"));
-    }
-
-    // The state saved below claims these parts exist; after a power loss they must too.
-    let parts = collect_disk_parts(output_dir).await?;
-    for suffix in &parts {
-        let part = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{suffix}"));
-        tokio::fs::File::open(&part).await?.sync_all().await?;
-    }
-    fsync_dir(output_dir)?;
-    let total_parts = parts.len() as u32;
-
-    state.inner.total_parts = Some(total_parts);
+    state.inner.parts = parts;
     state.inner.stream_hash = Some(hash.clone());
     state.save()?;
 
     Ok(hash)
 }
 
-async fn collect_disk_parts(output_dir: &Path) -> Result<BTreeSet<String>> {
-    let mut part_suffixes = BTreeSet::new();
-    if !output_dir.exists() {
-        return Ok(part_suffixes);
+/// Passes writes through to `inner`, hashing and counting the bytes written.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+    written: u64,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
     }
-    let mut read_dir = tokio::fs::read_dir(output_dir).await?;
-    while let Some(entry) = read_dir.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let base = name.strip_suffix(".age").unwrap_or(name.as_str());
-        if let Some(suffix) = base.strip_prefix(SNAPSHOT_PART_PREFIX) {
-            part_suffixes.insert(suffix.to_string());
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Cuts `stream` into parts of `part_size` plaintext bytes, each written straight to an
+/// encrypted `.age` file in `output_dir`, so plaintext never touches the disk. Returns the
+/// BLAKE3 of the whole plaintext stream and each part's ciphertext size and BLAKE3.
+fn encrypt_into_parts(
+    mut stream: impl Read,
+    output_dir: &Path,
+    part_size: u64,
+    recipient: &x25519::Recipient,
+) -> Result<(String, BTreeMap<String, PartRecord>)> {
+    let mut stream_hasher = blake3::Hasher::new();
+    let mut parts = BTreeMap::new();
+    let mut buf = vec![0u8; IO_BUF_SIZE];
+    loop {
+        let mut part_stream = (&mut stream).take(part_size);
+        let mut n = part_stream.read(&mut buf)?;
+        // Checked before creating the file, so a stream ending on a part boundary doesn't
+        // produce an empty trailing part.
+        if n == 0 {
+            break;
+        }
+
+        let index = format!("{:06}", parts.len());
+        let path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{index}.age"));
+        let write_err = || format!("failed to write {path:?}");
+        let file = std::fs::File::create(&path).with_context(write_err)?;
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(recipient as &dyn age::Recipient))
+                .map_err(|e| anyhow!("failed to create encryptor: {e}"))?;
+        let mut writer = encryptor
+            .wrap_output(HashingWriter {
+                inner: file,
+                hasher: blake3::Hasher::new(),
+                written: 0,
+            })
+            .with_context(write_err)?;
+        while n > 0 {
+            stream_hasher.update(&buf[..n]);
+            writer.write_all(&buf[..n]).with_context(write_err)?;
+            n = part_stream.read(&mut buf)?;
+        }
+        let out = writer.finish().with_context(write_err)?;
+        // The state saved after this claims the part exists; after a power loss it must too.
+        out.inner.sync_all().with_context(write_err)?;
+
+        parts.insert(
+            index,
+            PartRecord {
+                size_bytes: out.written,
+                blake3: out.hasher.finalize().to_hex().to_string(),
+            },
+        );
+    }
+    fsync_dir(output_dir)?;
+    Ok((stream_hasher.finalize().to_hex().to_string(), parts))
+}
+
+/// Checks that every part not yet uploaded is on disk exactly as the send stage wrote it.
+/// If nothing was uploaded yet, a bad part only costs a fresh send, so the state is reset
+/// for the next run to redo it.
+async fn verify_pending_parts(state: &mut PersistentState, output_dir: &Path) -> Result<()> {
+    let mut bad = Vec::new();
+    for (index, record) in &state.inner.parts {
+        if state.inner.uploaded_parts.contains(index) {
+            continue;
+        }
+        let path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{index}.age"));
+        let intact = match tokio::fs::metadata(&path).await {
+            Ok(m) => m.len() == record.size_bytes && blake3_file(&path).await? == record.blake3,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !intact {
+            bad.push(index.clone());
         }
     }
-    Ok(part_suffixes)
-}
-
-fn validate_part_coverage(part_suffixes: &BTreeSet<String>, state: &BackupState) -> Result<()> {
-    let Some(total) = state.total_parts else {
+    if bad.is_empty() {
         return Ok(());
-    };
-    let mut all: BTreeSet<&str> = part_suffixes.iter().map(String::as_str).collect();
-    for k in state.parts_completed.keys() {
-        all.insert(k.as_str());
     }
-    let found = all.len();
-    if found < total as usize {
+
+    if state.inner.uploaded_parts.is_empty() {
+        state.inner.stream_hash = None;
+        state.inner.parts.clear();
+        state.save()?;
         return Err(anyhow!(
-            "expected {total} parts but only found {found} \
-             ({} on disk, {} already uploaded); \
-             output_dir may have been cleared — restore missing parts and re-run",
-            part_suffixes.len(),
-            state.parts_completed.len()
+            "parts {bad:?} in {output_dir:?} are missing or damaged; state cleared, re-run \
+             to redo the send"
         ));
     }
-    Ok(())
+    Err(anyhow!(
+        "parts {bad:?} in {output_dir:?} are missing or damaged, and others were already \
+         uploaded; to start over delete the state file {:?} and {output_dir:?}, then re-run",
+        state.path
+    ))
 }
 
-async fn encrypt_and_upload_part<R: RemoteBackend>(
+async fn upload_part<R: RemoteBackend>(
     remote: &R,
     part_index: &str,
     output_dir: &Path,
@@ -567,26 +601,8 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     level: u32,
     timestamp: &str,
     config: &Config,
-) -> Result<UploadedPart> {
-    let raw_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}"));
+) -> Result<()> {
     let enc_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}.age"));
-
-    if enc_path.exists() && raw_path.exists() {
-        // coexisting raw+enc means encryption was interrupted; enc may be truncated
-        tokio::fs::remove_file(&enc_path).await?;
-    }
-    if !enc_path.exists() {
-        encrypt_file(&raw_path, &enc_path, &config.age_public_key).await?;
-        // The .age entry must be durable before the raw part it replaces disappears.
-        fsync_dir(output_dir)?;
-        if let Err(e) = tokio::fs::remove_file(&raw_path).await {
-            tracing::warn!("failed to remove raw part {:?}: {e}", raw_path);
-        }
-    }
-
-    let enc_size = tokio::fs::metadata(&enc_path).await?.len();
-    let blake3 = blake3_file(&enc_path).await?;
-
     let storage_class = config
         .s3
         .storage_class
@@ -608,34 +624,7 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
             storage_class,
             &format!("bcb-backup-level={level}"),
         )
-        .await?;
-
-    Ok(UploadedPart {
-        size_bytes: enc_size,
-        blake3,
-    })
-}
-
-/// Distinguishes "the split produced nothing" from "the output dir disappeared after a split
-/// that had already succeeded": the latter is recoverable by re-running the send, but only
-/// once the stream hash and part count recorded from the vanished run are cleared.
-fn ensure_parts_exist(
-    part_suffixes: &BTreeSet<String>,
-    state: &mut PersistentState,
-    output_dir: &Path,
-) -> Result<()> {
-    if !part_suffixes.is_empty() || !state.inner.parts_completed.is_empty() {
-        return Ok(());
-    }
-    if state.inner.stream_hash.is_some() {
-        state.inner.stream_hash = None;
-        state.inner.total_parts = None;
-        state.save()?;
-        return Err(anyhow!(
-            "output_dir vanished after split; state cleared — re-run to retry from split"
-        ));
-    }
-    Err(anyhow!("no snapshot parts found in {output_dir:?}"))
+        .await
 }
 
 /// Assembles the manifest describing the backup that was just uploaded.
@@ -646,8 +635,8 @@ async fn build_manifest(
     stream_hash: String,
     state: &BackupState,
 ) -> Backup {
-    let mut parts: Vec<PartInfo> = state
-        .parts_completed
+    let parts: Vec<PartInfo> = state
+        .parts
         .iter()
         .map(|(index, part)| PartInfo {
             index: index.clone(),
@@ -655,7 +644,6 @@ async fn build_manifest(
             blake3: part.blake3.clone(),
         })
         .collect();
-    parts.sort_by(|a, b| a.index.cmp(&b.index));
 
     Backup {
         format_version: FORMAT_VERSION.to_string(),
@@ -756,29 +744,30 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         return Ok(None);
     };
 
-    let stream_hash = send_and_split(
+    let stream_hash = send_and_encrypt(
         btrfs,
         task,
         &plan.snapshot_name,
         &plan.parent_snapshot,
         &plan.output_dir,
+        &config.age_public_key,
         &mut state,
     )
     .await?;
 
-    let part_suffixes = collect_disk_parts(&plan.output_dir).await?;
+    verify_pending_parts(&mut state, &plan.output_dir).await?;
 
-    ensure_parts_exist(&part_suffixes, &mut state, &plan.output_dir)?;
-
-    validate_part_coverage(&part_suffixes, &state.inner)?;
-
-    for suffix in &part_suffixes {
-        if state.inner.parts_completed.contains_key(suffix.as_str()) {
-            continue;
-        }
-        let completed = encrypt_and_upload_part(
+    let pending: Vec<String> = state
+        .inner
+        .parts
+        .keys()
+        .filter(|i| !state.inner.uploaded_parts.contains(*i))
+        .cloned()
+        .collect();
+    for index in pending {
+        upload_part(
             remote,
-            suffix,
+            &index,
             &plan.output_dir,
             &sanitized,
             level,
@@ -786,17 +775,14 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             config,
         )
         .await?;
-        state
-            .inner
-            .parts_completed
-            .insert(suffix.clone(), completed);
+        state.inner.uploaded_parts.insert(index.clone());
         state.save()?;
         // Deleted only once the state records the upload: gone any earlier, a crash would
-        // leave a part that is neither on disk nor marked complete. A crash after the save
+        // leave a part that is neither on disk nor marked uploaded. A crash after the save
         // leaves the file for the output_dir cleanup below.
         let enc_path = plan
             .output_dir
-            .join(format!("{SNAPSHOT_PART_PREFIX}{suffix}.age"));
+            .join(format!("{SNAPSHOT_PART_PREFIX}{index}.age"));
         if let Err(e) = tokio::fs::remove_file(&enc_path).await {
             tracing::warn!("failed to remove uploaded part {:?}: {e}", enc_path);
         }
@@ -861,56 +847,70 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_part_coverage_counts_disk_and_uploaded() {
-        let mut state = BackupState {
-            total_parts: Some(2),
-            ..Default::default()
-        };
-        state.parts_completed.insert(
-            "000000".to_string(),
-            UploadedPart {
-                size_bytes: 1,
-                blake3: String::new(),
-            },
-        );
-
-        let mut on_disk = BTreeSet::new();
-        assert!(validate_part_coverage(&on_disk, &state).is_err());
-
-        on_disk.insert("000001".to_string());
-        assert!(validate_part_coverage(&on_disk, &state).is_ok());
-
-        // a part both on disk and uploaded must not be double-counted
-        on_disk.insert("000000".to_string());
-        state.total_parts = Some(3);
-        assert!(validate_part_coverage(&on_disk, &state).is_err());
-    }
-
-    #[test]
-    fn test_validate_part_coverage_no_total_is_ok() {
-        let state = BackupState::default();
-        assert!(validate_part_coverage(&BTreeSet::new(), &state).is_ok());
-    }
-
-    #[test]
     fn test_ensure_enough_space_sufficient_is_ok() {
-        assert!(ensure_enough_space(100, 50, 10, Path::new("/snap")).is_ok());
+        assert!(ensure_enough_space(100, 50, Path::new("/snap")).is_ok());
     }
 
     #[test]
-    fn test_ensure_enough_space_exactly_snapshot_plus_part_is_ok() {
-        assert!(ensure_enough_space(60, 50, 10, Path::new("/snap")).is_ok());
-    }
-
-    #[test]
-    fn test_ensure_enough_space_room_for_snapshot_only_is_err() {
-        assert!(ensure_enough_space(59, 50, 10, Path::new("/snap")).is_err());
-        assert!(ensure_enough_space(50, 50, 10, Path::new("/snap")).is_err());
+    fn test_ensure_enough_space_exactly_equal_is_ok() {
+        assert!(ensure_enough_space(50, 50, Path::new("/snap")).is_ok());
     }
 
     #[test]
     fn test_ensure_enough_space_insufficient_is_err() {
-        let err = ensure_enough_space(10, 50, 10, Path::new("/snap")).unwrap_err();
+        let err = ensure_enough_space(10, 50, Path::new("/snap")).unwrap_err();
         assert!(err.to_string().contains("insufficient free space"));
+    }
+
+    fn decrypt(bytes: &[u8], identity: &x25519::Identity) -> Vec<u8> {
+        let decryptor = age::Decryptor::new(bytes).unwrap();
+        let mut reader = decryptor
+            .decrypt(std::iter::once(identity as &dyn age::Identity))
+            .unwrap();
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_encrypt_into_parts_round_trips_and_records_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = x25519::Identity::generate();
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+
+        let (stream_hash, parts) =
+            encrypt_into_parts(&data[..], dir.path(), 4096, &identity.to_public()).unwrap();
+
+        assert_eq!(stream_hash, blake3::hash(&data).to_hex().to_string());
+        assert_eq!(
+            parts.keys().collect::<Vec<_>>(),
+            ["000000", "000001", "000002"]
+        );
+        let mut joined = Vec::new();
+        for (index, record) in &parts {
+            let bytes = std::fs::read(
+                dir.path()
+                    .join(format!("{SNAPSHOT_PART_PREFIX}{index}.age")),
+            )
+            .unwrap();
+            assert_eq!(record.size_bytes, bytes.len() as u64);
+            assert_eq!(record.blake3, blake3::hash(&bytes).to_hex().to_string());
+            joined.extend(decrypt(&bytes, &identity));
+        }
+        assert_eq!(joined, data);
+        // No plaintext part files: every file in the dir is a recorded .age part.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), parts.len());
+    }
+
+    #[test]
+    fn test_encrypt_into_parts_stream_on_part_boundary_has_no_empty_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = x25519::Identity::generate();
+        let data = vec![7u8; 8192];
+
+        let (_, parts) =
+            encrypt_into_parts(&data[..], dir.path(), 4096, &identity.to_public()).unwrap();
+
+        assert_eq!(parts.len(), 2);
     }
 }

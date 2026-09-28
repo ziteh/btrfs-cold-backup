@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Filename prefix of split stream parts, both locally and in S3 keys.
+/// Filename prefix of stream parts, both locally and in S3 keys.
 pub const SNAPSHOT_PART_PREFIX: &str = "snapshot.part-";
 
 /// Buffer size for streaming file/pipe IO.
@@ -11,7 +11,7 @@ pub const IO_BUF_SIZE: usize = 64 * 1024;
 /// Bytes per second per 1 kbps (kilobit/s = 1000 bits/s / 8 bits per byte).
 pub const BYTES_PER_KBPS: f64 = 1000.0 / 8.0;
 
-// SIGKILL bypasses Drop, so kill_on_drop alone can't stop a child (btrfs send / split)
+// SIGKILL bypasses Drop, so kill_on_drop alone can't stop a child (btrfs send)
 // from outliving a killed bcb process; PR_SET_PDEATHSIG asks the kernel to do it instead.
 #[cfg(target_os = "linux")]
 pub fn die_with_parent() -> std::io::Result<()> {
@@ -66,8 +66,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Creates base_dir and restricts it to its owner: it holds decrypted restore data and
-/// plaintext split parts. Applied on every run, so a pre-existing directory is tightened too.
+/// Creates base_dir and restricts it to its owner: it holds decrypted restore data. Applied
+/// on every run, so a pre-existing directory is tightened too.
 pub fn prepare_base_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;

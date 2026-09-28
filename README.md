@@ -71,7 +71,7 @@ tasks:
     enabled: true
 ```
 
-`base_dir` is bcb's local working directory: it holds the lock file, resume state, daily log files, and the temporary split/encrypted parts during backup and restore. Its filesystem needs free space roughly equal to one full backup plus one part; bcb checks this before sending and refuses to start otherwise. bcb sets its permissions to 0700 on every run.
+`base_dir` is bcb's local working directory: it holds the lock file, resume state, daily log files, and the temporary encrypted parts during backup and the downloaded parts during restore. Its filesystem needs free space roughly equal to one full backup; bcb checks this before sending and refuses to start otherwise. bcb sets its permissions to 0700 on every run.
 
 `backup_data` accepts STANDARD, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER and DEEP_ARCHIVE.
 

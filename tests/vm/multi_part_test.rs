@@ -4,7 +4,7 @@ use btrfs_cold_backup::sanitize_subvolume_path;
 
 use crate::interruption_test::{raw_s3_client, setup_fixture, vm_env};
 
-/// A backup spanning multiple split parts must round-trip: parts are encrypted and uploaded
+/// A backup spanning multiple parts must round-trip: parts are encrypted and uploaded
 /// individually, and restore must reassemble them in order before piping to btrfs receive.
 /// Uses the debug-only BCB_TEST_SPLIT_SIZE override so a small fixture exercises the
 /// multi-part path without multi-GiB test data.

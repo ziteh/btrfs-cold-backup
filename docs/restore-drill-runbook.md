@@ -34,7 +34,7 @@ not optional.
   exercised for real.
 - **A dev build** (`cargo build`, not `--release`), so the test-only env vars that shrink part
   sizes are compiled in:
-  - `BCB_TEST_SPLIT_SIZE` (see `split_part_size` in `src/backup.rs`) — set to a few MB so a
+  - `BCB_TEST_SPLIT_SIZE` (see `split_part_size` in `src/backup.rs`) — set to a few MB, in bytes, so a
     15-20MB dataset splits into 2-3 parts instead of needing GB-scale data to trigger multipart.
   - `BCB_TEST_PART_CHUNK_SIZE` (see `part_chunk_size` in `src/restore.rs`) — same idea for
     download chunking.

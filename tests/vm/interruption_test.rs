@@ -246,11 +246,11 @@ fn no_process_matches(pgrep_args: &[&str]) -> bool {
         .success()
 }
 
-/// Polls until no btrfs-send / split process remains, or returns false on timeout.
+/// Polls until no btrfs-send process remains, or returns false on timeout.
 fn wait_no_orphan_children(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if no_process_matches(&["-f", "btrfs.*send"]) && no_process_matches(&["-x", "split"]) {
+        if no_process_matches(&["-f", "btrfs.*send"]) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -280,7 +280,7 @@ pub(crate) fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Pa
     let subvol = btrfs_dir.join("subvol");
     let snap_dir = btrfs_dir.join("snapshots");
     let restore_dir = btrfs_dir.join("restore");
-    // work_dir holds bcb's lock file, state file, and multi-GB split/encrypt parts — keep it
+    // work_dir holds bcb's lock file, state file, and multi-GB encrypted parts — keep it
     // off the btrfs loop device (which is small) to avoid filling the btrfs device with bcb's
     // own working data.  /var/tmp is on the VM's root filesystem which has ample free space.
     let work_dir = PathBuf::from(format!("/var/tmp/bcb-work-{name}-{}", std::process::id()));
@@ -357,7 +357,7 @@ impl Drop for Fixture {
 async fn kill_during_multipart_upload_then_resume_should_abort_orphan_and_succeed() {
     let Some(env) = vm_env() else { return };
     let fixture = setup_fixture(&env, "multipart", |subvol| {
-        // >64MB (PART_SIZE) so the single split part's .age upload spans >=2 S3 multipart chunks.
+        // >64MB (PART_SIZE) so the single part's .age upload spans >=2 S3 multipart chunks.
         let status = Command::new("dd")
             .args([
                 "if=/dev/urandom",
@@ -480,7 +480,7 @@ async fn kill_during_multipart_upload_then_resume_should_abort_orphan_and_succee
     assert_eq!(original, recovered, "restored content must match source");
 }
 
-/// Killing bcb while btrfs-send/split are running must not leave them as orphan processes that
+/// Killing bcb while btrfs-send is running must not leave them as orphan processes that
 /// could collide with the next run (verifies the PR_SET_PDEATHSIG fix end-to-end).
 #[tokio::test]
 async fn kill_during_send_then_resume_should_leave_no_orphan_children() {
@@ -509,7 +509,7 @@ async fn kill_during_send_then_resume_should_leave_no_orphan_children() {
 
     assert!(
         wait_no_orphan_children(Duration::from_secs(5)),
-        "btrfs send / split processes survived the parent's SIGKILL"
+        "btrfs send processes survived the parent's SIGKILL"
     );
 
     let resumed = run_bcb(

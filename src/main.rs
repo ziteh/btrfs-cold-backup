@@ -106,8 +106,7 @@ fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
 }
 
 async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, PidLock)> {
-    // Up front, because a missing executable would otherwise surface only when the pipeline
-    // reaches it, which for `split` is after `btrfs send` has already run for hours.
+    // Up front, so a missing executable fails the run before any work starts.
     btrfs_cold_backup::check::check_binaries()?;
 
     btrfs_cold_backup::util::prepare_base_dir(&config.base_dir)

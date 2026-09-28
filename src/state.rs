@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::util::{now_unix, write_atomic};
 
+/// An encrypted part as written by the send stage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UploadedPart {
+pub struct PartRecord {
     pub size_bytes: u64,
     pub blake3: String,
 }
@@ -22,8 +23,12 @@ pub struct BackupState {
     pub timestamp: String,
     pub output_dir: PathBuf,
     pub stream_hash: Option<String>,
-    pub total_parts: Option<u32>,
-    pub parts_completed: HashMap<String, UploadedPart>,
+    /// Every part of the stream, recorded together with `stream_hash`. Defaulted so a
+    /// state from before these fields loads and can be recognized as such.
+    #[serde(default)]
+    pub parts: BTreeMap<String, PartRecord>,
+    #[serde(default)]
+    pub uploaded_parts: BTreeSet<String>,
     pub manifest_uploaded: bool,
     pub last_updated: i64,
 }
@@ -97,7 +102,7 @@ mod tests {
         let state = BackupState::default();
         assert_eq!(state.level, 0);
         assert!(state.stream_hash.is_none());
-        assert!(state.parts_completed.is_empty());
+        assert!(state.parts.is_empty());
         assert!(!state.manifest_uploaded);
     }
 
@@ -112,25 +117,27 @@ mod tests {
             timestamp: "2026-06-02T14:30".to_string(),
             output_dir: PathBuf::from("/var/lib/bcb/task/mnt_data/bcb_level0_20260602"),
             stream_hash: Some("abc123".to_string()),
-            total_parts: Some(2),
-            parts_completed: HashMap::new(),
+            parts: BTreeMap::new(),
+            uploaded_parts: BTreeSet::new(),
             manifest_uploaded: false,
             last_updated: 1748872200,
         };
-        state.parts_completed.insert(
+        state.parts.insert(
             "000000".to_string(),
-            UploadedPart {
+            PartRecord {
                 size_bytes: 3221225472,
                 blake3: "hash1".to_string(),
             },
         );
-        state.parts_completed.insert(
+        state.parts.insert(
             "000001".to_string(),
-            UploadedPart {
+            PartRecord {
                 size_bytes: 1073741824,
                 blake3: "hash2".to_string(),
             },
         );
+
+        state.uploaded_parts.insert("000000".to_string());
 
         let yaml = serde_yaml::to_string(&state).unwrap();
         let deserialized: BackupState = serde_yaml::from_str(&yaml).unwrap();
@@ -157,8 +164,8 @@ mod tests {
             timestamp: "2026-06-02T14:30".to_string(),
             output_dir: PathBuf::from("/tmp/bcb/task/mnt/bcb_level1_20260602"),
             stream_hash: Some("streamhash".to_string()),
-            total_parts: None,
-            parts_completed: HashMap::new(),
+            parts: BTreeMap::new(),
+            uploaded_parts: BTreeSet::new(),
             manifest_uploaded: true,
             last_updated: 12345,
         };
