@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use crate::{
     Config, RemoteBackend, Task,
     list::list_backups,
-    manifest::parse_backup,
+    manifest::{Backup, parse_backup},
+    remote::ObjectMetadata,
     util::{now_unix, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
 
@@ -83,53 +84,33 @@ pub async fn verify_task<R: RemoteBackend>(
             });
         }
 
-        for part in &backup.parts {
-            let part_key = s3_backup_key(
-                &config.s3.prefix,
-                &sanitized,
-                entry.level,
-                &entry.timestamp,
-                &part.index,
-            );
-            match remote.head_metadata(&part_key).await {
-                Ok(meta) => {
-                    if meta.size_bytes != part.size_bytes {
-                        issues.push(VerifyIssue {
-                            level: entry.level,
-                            timestamp: entry.timestamp.clone(),
-                            description: format!(
-                                "part {part_key}: manifest says {} bytes, S3 reports {} bytes",
-                                part.size_bytes, meta.size_bytes
-                            ),
-                        });
-                    }
-                    if let Some(expected) = config
-                        .s3
-                        .storage_class
-                        .backup_data
-                        .get(entry.level as usize)
-                        && &meta.storage_class != expected
-                    {
-                        issues.push(VerifyIssue {
-                            level: entry.level,
-                            timestamp: entry.timestamp.clone(),
-                            description: format!(
-                                "part {part_key}: storage class is {}, but level {} is \
-                                 configured for {expected}",
-                                meta.storage_class, entry.level
-                            ),
-                        });
-                    }
-                }
-                Err(e) => {
-                    issues.push(VerifyIssue {
-                        level: entry.level,
-                        timestamp: entry.timestamp.clone(),
-                        description: format!("part {part_key} missing or inaccessible: {e}"),
-                    });
-                }
-            }
-        }
+        let level_class = config
+            .s3
+            .storage_class
+            .backup_data
+            .get(entry.level as usize);
+        let part_issues = check_parts(
+            remote,
+            &config.s3.prefix,
+            &sanitized,
+            entry.level,
+            &entry.timestamp,
+            &backup,
+            |part_key, meta| match level_class {
+                Some(expected) if &meta.storage_class != expected => Some(format!(
+                    "part {part_key}: storage class is {}, but level {} is configured for \
+                     {expected}",
+                    meta.storage_class, entry.level
+                )),
+                _ => None,
+            },
+        )
+        .await;
+        issues.extend(part_issues.into_iter().map(|description| VerifyIssue {
+            level: entry.level,
+            timestamp: entry.timestamp.clone(),
+            description,
+        }));
 
         by_snapshot.insert(backup.snapshot_name.clone());
     }
@@ -151,12 +132,42 @@ pub async fn verify_task<R: RemoteBackend>(
     Ok(issues)
 }
 
+/// HEADs every part of `backup` and describes each that is missing, inaccessible, or not the
+/// size its manifest records. `check_found` adds caller-specific checks on parts that exist.
+pub async fn check_parts<R: RemoteBackend>(
+    remote: &R,
+    prefix: &str,
+    sanitized: &str,
+    level: u32,
+    timestamp: &str,
+    backup: &Backup,
+    mut check_found: impl FnMut(&str, &ObjectMetadata) -> Option<String>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    for part in &backup.parts {
+        let part_key = s3_backup_key(prefix, sanitized, level, timestamp, &part.index);
+        match remote.head_metadata(&part_key).await {
+            Ok(meta) => {
+                if meta.size_bytes != part.size_bytes {
+                    issues.push(format!(
+                        "part {part_key}: manifest says {} bytes, S3 reports {} bytes",
+                        part.size_bytes, meta.size_bytes
+                    ));
+                }
+                issues.extend(check_found(&part_key, &meta));
+            }
+            Err(e) => issues.push(format!("part {part_key} missing or inaccessible: {e}")),
+        }
+    }
+    issues
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::S3StorageClass;
-    use crate::manifest::{Backup, PartInfo, SystemInfo};
-    use crate::remote::{MockRemoteBackend, ObjectMetadata};
+    use crate::manifest::{PartInfo, SystemInfo};
+    use crate::remote::MockRemoteBackend;
     use std::path::PathBuf;
 
     fn test_task() -> Task {

@@ -274,6 +274,45 @@ async fn backup_should_fail_when_latest_manifest_is_corrupt() {
     );
 }
 
+/// Makes every ancestor manifest downloadable, each listing one part of `ANCESTOR_PART_SIZE`
+/// bytes. `head_metadata` answers each part with the size `part_size` returns for its key.
+fn expect_ancestors(remote: &mut MockRemote, part_size: fn(&str) -> Result<u64>) {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    remote
+        .expect_download()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(|_| {
+            let backup = Backup {
+                format_version: FORMAT_VERSION.to_string(),
+                timestamp: String::new(),
+                created_at: 0,
+                level: 0,
+                snapshot_name: String::new(),
+                parent_snapshot: None,
+                source_uuid: SOURCE_UUID.to_string(),
+                snapshot_uuid: String::new(),
+                system: SystemInfo::default(),
+                age_public_key: String::new(),
+                total_size_bytes: ANCESTOR_PART_SIZE,
+                blake3: String::new(),
+                parts: vec![PartInfo {
+                    index: "000000".to_string(),
+                    size_bytes: ANCESTOR_PART_SIZE,
+                    blake3: String::new(),
+                }],
+            };
+            Ok(serde_yaml::to_string(&backup).unwrap().into_bytes())
+        });
+    remote.expect_head_metadata().returning(move |key| {
+        Ok(ObjectMetadata {
+            size_bytes: part_size(key)?,
+            storage_class: "STANDARD".to_string(),
+        })
+    });
+}
+
+const ANCESTOR_PART_SIZE: u64 = 100;
+
 /// Level-1 incremental backup: read parent from latest manifest, use send_incremental.
 #[tokio::test]
 async fn level1_incremental_should_use_level0_as_parent() {
@@ -301,11 +340,12 @@ async fn level1_incremental_should_use_level0_as_parent() {
     remote
         .expect_exists()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|key| Ok(!key.contains("bcb_level1_202606021430")));
+        .returning(|_| Ok(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
+    expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
@@ -352,11 +392,12 @@ async fn level2_incremental_should_use_level1_as_parent() {
     remote
         .expect_exists()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|key| Ok(!key.contains("bcb_level2_202606021430")));
+        .returning(|_| Ok(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
+    expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
     remote
         .expect_upload_file()
         .withf(|_, _, _, tags| tags == "bcb-backup-level=2")
@@ -372,73 +413,44 @@ async fn level2_incremental_should_use_level1_as_parent() {
     assert_eq!(backup.parent_snapshot.as_deref(), Some(parent));
 }
 
-/// An ancestor whose manifest is gone (e.g. expired by a lifecycle rule) makes the new
-/// incremental unrestorable, so the backup must fail before sending anything.
-#[tokio::test]
-async fn level2_should_fail_before_send_when_level0_manifest_is_missing() {
+/// Level 1 backup whose level 0 ancestor's parts are answered by `part_size`.
+async fn level1_backup_with_ancestor_parts(part_size: fn(&str) -> Result<u64>) -> String {
     let work_dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(work_dir.path());
-    config
-        .s3
-        .storage_class
-        .backup_data
-        .push("GLACIER".to_string());
+    let config = test_config(work_dir.path());
     let task = movies_task();
-    let grandparent = "bcb_level0.20260501T1430";
-    let parent = "bcb_level1.20260601T1430";
-    let snap = "bcb_level2.20260602T1430";
+    let parent = "bcb_level0.20260601T1430";
+    let snap = "bcb_level1.20260602T1430";
 
     // No send expectations: calling send would fail the test.
     let mut btrfs = btrfs_with_uuids();
-    btrfs.expect_list_snapshots().returning(move |_| {
-        Ok(vec![
-            grandparent.to_string(),
-            parent.to_string(),
-            snap.to_string(),
-        ])
-    });
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
 
-    let mut latest = LatestManifest::new(SOURCE_UUID.to_string());
-    latest.levels.insert(
-        0,
-        LatestBackup {
-            timestamp: "2026-05-01T14:30".to_string(),
-            snapshot_name: grandparent.to_string(),
-            snapshot_uuid: snap_uuid(grandparent),
-        },
-    );
-    latest.levels.insert(
-        1,
-        LatestBackup {
-            timestamp: "2026-06-01T14:30".to_string(),
-            snapshot_name: parent.to_string(),
-            snapshot_uuid: snap_uuid(parent),
-        },
-    );
-    let latest_bytes = serde_yaml::to_string(&latest).unwrap().into_bytes();
+    let mut remote = remote_with_latest(latest_manifest_yaml(parent, 0));
+    expect_ancestors(&mut remote, part_size);
 
-    let mut remote = MockRemote::new();
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|key| Ok(key.contains("bcb_level1_202606011430")));
-    remote
-        .expect_download()
-        .withf(|key| key.contains("latest.yaml"))
-        .returning(move |_| Ok(latest_bytes.clone()));
-
-    let err = backup_task(&config, &task, 2, &btrfs, &remote)
+    backup_task(&config, &task, 1, &btrfs, &remote)
         .await
         .unwrap_err()
-        .to_string();
+        .to_string()
+}
+
+/// An ancestor part that is gone (e.g. expired by a lifecycle rule, which leaves manifests
+/// alone) makes the new incremental unrestorable, so the backup must fail before sending.
+#[tokio::test]
+async fn level1_should_fail_before_send_when_level0_part_is_missing() {
+    let err = level1_backup_with_ancestor_parts(|_| Err(anyhow::anyhow!("NotFound"))).await;
     assert!(
-        err.contains("level 0 manifest") && err.contains("bcb_level0_202605011430"),
+        err.contains("level 0 backup") && err.contains("snapshot.part-000000"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn level1_should_fail_before_send_when_level0_part_size_differs() {
+    let err = level1_backup_with_ancestor_parts(|_| Ok(ANCESTOR_PART_SIZE - 1)).await;
+    assert!(err.contains("S3 reports"), "unexpected error: {err}");
 }
 
 /// A level whose storage class isn't configured must fail loudly before ever uploading,
@@ -470,11 +482,12 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
     remote
         .expect_exists()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|key| Ok(!key.contains("bcb_level1_202606021430")));
+        .returning(|_| Ok(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
+    expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
     // No upload_file/upload_bytes expectations: the storage-class lookup must fail before
     // ever calling upload_file (any such call would itself be a test failure).
 

@@ -17,6 +17,7 @@ use crate::{
         s3_backup_key, s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path,
         state_path,
     },
+    verify::check_parts,
 };
 
 // Parses btrbk's snapshot naming; the expected format is spelled out in the error message below.
@@ -180,15 +181,30 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
             parent.timestamp
         ));
     }
-    // Restoring this incremental needs every ancestor. Only manifests are checked, one HEAD
-    // per level; parts are not.
+    // Restoring this incremental needs every ancestor's parts. Lifecycle expiration removes
+    // parts but not manifests, so each part is HEADed; any failure, even a network error,
+    // fails the backup rather than letting a broken chain grow.
     for (&l, entry) in latest.levels.range(..level) {
-        let key = s3_manifest_key(prefix, sanitized, l, &entry.timestamp);
-        if !remote.exists(&key).await? {
+        let manifest_key = s3_manifest_key(prefix, sanitized, l, &entry.timestamp);
+        let ancestor = parse_backup(&remote.download(&manifest_key).await?)
+            .map_err(|e| anyhow!("failed to parse manifest {manifest_key}: {e}"))?;
+        let issues = check_parts(
+            remote,
+            prefix,
+            sanitized,
+            l,
+            &entry.timestamp,
+            &ancestor,
+            |_, _| None,
+        )
+        .await;
+        if let Some(first) = issues.first() {
             return Err(anyhow!(
-                "level {l} manifest {key} listed in {latest_key} is missing, so a level \
-                 {level} backup could never be restored; it may have been deleted by an S3 \
-                 lifecycle expiration rule. Run a level 0 backup to start a new chain"
+                "level {l} backup {manifest_key} is incomplete ({} problem(s), first: {first}), \
+                 so a level {level} backup on top of it could never be restored; its parts may \
+                 have been deleted by an S3 lifecycle expiration rule. Run a level 0 backup to \
+                 start a new chain",
+                issues.len()
             ));
         }
     }
