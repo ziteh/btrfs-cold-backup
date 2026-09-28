@@ -65,15 +65,23 @@ struct PersistentState {
 }
 
 impl PersistentState {
+    /// Refuses to replace another level's unfinished backup: starting fresh would silently
+    /// discard its uploaded parts and leave that level without a backup.
     fn load_or_init(path: PathBuf, task_name: &str, level: u32) -> Result<Self> {
         let inner = match read_backup_state(&path)? {
-            Some(s) if s.task_name == task_name && s.level == level => {
+            Some(s) if s.level == level => {
                 tracing::info!("resuming from existing backup state");
                 s
             }
-            Some(_) => {
-                tracing::info!("existing state is for a different task/level, starting fresh");
-                BackupState::default()
+            Some(s) => {
+                return Err(anyhow!(
+                    "an unfinished level {} backup exists (state {path:?}, parts in {:?}); \
+                     finish it with `bcb backup --level {} --task {task_name}`, or to abandon \
+                     it delete both paths",
+                    s.level,
+                    s.output_dir,
+                    s.level
+                ));
             }
             None => BackupState::default(),
         };
@@ -251,7 +259,6 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     .await?;
     let output_dir = backup_output_dir(&config.base_dir, &sanitized, level, &timestamp);
 
-    state.inner.task_name = task.name.clone();
     state.inner.level = level;
     state.inner.snapshot_name = snapshot_name.clone();
     state.inner.parent_snapshot = parent_snapshot.clone();

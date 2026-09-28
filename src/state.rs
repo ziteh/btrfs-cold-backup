@@ -13,7 +13,6 @@ pub struct UploadedPart {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BackupState {
-    pub task_name: String,
     pub level: u32,
     pub snapshot_name: String,
     pub parent_snapshot: Option<String>,
@@ -101,7 +100,6 @@ mod tests {
     #[test]
     fn test_backup_state_default() {
         let state = BackupState::default();
-        assert!(state.task_name.is_empty());
         assert_eq!(state.level, 0);
         assert!(state.stream_hash.is_none());
         assert!(state.parts_completed.is_empty());
@@ -111,7 +109,6 @@ mod tests {
     #[test]
     fn test_backup_state_serialize_deserialize() {
         let mut state = BackupState {
-            task_name: "home".to_string(),
             level: 0,
             snapshot_name: "bcb_level0.20260602T1430".to_string(),
             parent_snapshot: None,
@@ -157,7 +154,6 @@ mod tests {
         let path = dir.path().join("backup_state.yaml");
 
         let mut state = BackupState {
-            task_name: "test-task".to_string(),
             level: 1,
             snapshot_name: "bcb_level1.20260602T1430".to_string(),
             parent_snapshot: Some("bcb_level0.20260601T1000".to_string()),
@@ -174,7 +170,7 @@ mod tests {
 
         state.save(&path).unwrap();
         let loaded = read_backup_state(&path).unwrap().unwrap();
-        assert_eq!(state.task_name, loaded.task_name);
+        assert_eq!(state.snapshot_name, loaded.snapshot_name);
         assert_eq!(state.output_dir, loaded.output_dir);
         assert_eq!(state.stream_hash, loaded.stream_hash);
     }

@@ -962,7 +962,6 @@ async fn resume_should_skip_already_uploaded_parts() {
         },
     );
     let mut state = BackupState {
-        task_name: task.name.clone(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
@@ -1023,7 +1022,6 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
     std::fs::write(output_dir.join("snapshot.part-000000"), b"only part").unwrap();
 
     let mut state = BackupState {
-        task_name: task.name.clone(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
@@ -1078,6 +1076,47 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
     assert_eq!(backup.parts.len(), 1);
 }
 
+/// An unfinished backup of another level must not be discarded to start this one: its state
+/// is the only record of which parts already reached S3.
+#[tokio::test]
+async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
+    use btrfs_cold_backup::{BackupState, state_path};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let mut state = BackupState {
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
+        output_dir: work_dir
+            .path()
+            .join("task/mnt_data_movies/bcb_level0_202606021430"),
+        stream_hash: Some("streamhash".to_string()),
+        ..Default::default()
+    };
+    let sp = state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    state.save(&sp).unwrap();
+    let before = std::fs::read(&sp).unwrap();
+
+    // No expectations: the refusal must come before any btrfs or S3 call.
+    let btrfs = MockBtrfs::new();
+    let remote = MockRemote::new();
+
+    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--level 0 --task movies"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(std::fs::read(&sp).unwrap(), before);
+}
+
 /// A part left with both its raw file and a `.age` file (encryption was interrupted mid-run
 /// on a previous attempt, so the `.age` may be truncated) must have the existing `.age`
 /// discarded and freshly re-encrypted from the raw file — not uploaded as whatever partial
@@ -1112,7 +1151,6 @@ async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run
     .unwrap();
 
     let mut state = BackupState {
-        task_name: task.name.clone(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
@@ -1200,7 +1238,6 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
     std::fs::write(output_dir.join("snapshot.part-000000"), b"only part").unwrap();
 
     let mut state = BackupState {
-        task_name: task.name.clone(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,

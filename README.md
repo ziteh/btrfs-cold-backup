@@ -89,6 +89,7 @@ bcb_level<N>.<YYYYMMDD>T<hhmm>
 - A level-N (N > 0) backup requires the level-(N-1) parent snapshot from the latest backup, and the level-N snapshot must be newer.
 - btrbk's same-minute suffix (`_<n>`) is not supported; bcb fails naming the snapshot, delete or rename it.
 - Backups are idempotent: a completed snapshot is skipped, an interrupted one resumes. Tasks run sequentially; one failing task doesn't block the others.
+- While a level of a task has an unfinished backup, backing up another level of that task fails until it is finished, or abandoned by deleting its state file and parts directory.
 
 ## Restoring
 
