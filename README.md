@@ -143,6 +143,7 @@ The e2e and VM suites are compiled into the same `cargo test` run, but each test
 - [x] `bcb verify`: audit chain completeness, part existence/size, storage class, and freshness without triggering an archive retrieval
 - [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents (retrieval cost/latency, so off by default; for periodic drills)
 - [ ] Add btrbk to VM for E2E testing
+- [ ] `--download-kbps` override `expected_download_kbps`
 
 ## License
 

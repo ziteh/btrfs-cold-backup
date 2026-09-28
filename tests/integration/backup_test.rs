@@ -1547,11 +1547,11 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
     let work_dir = tempfile::tempdir().unwrap();
     let identity = age::x25519::Identity::generate();
     let mut config = test_config(work_dir.path());
-    // 1 KiB/s expected download; lead_days chosen so the buffer target is 15 bytes —
+    // 1 kbps expected download; lead_days chosen so the buffer target is 15 bytes —
     // room for exactly one of the two 10-byte archived parts below.
     config.s3.restore = RestoreConfig {
         expected_download_kbps: 1,
-        lead_days: Some(15.0 / (1024.0 * 86400.0)),
+        lead_days: Some(15.0 / (125.0 * 86400.0)),
         ..RestoreConfig::default()
     };
     let task = movies_task();
@@ -1670,11 +1670,11 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
 
     let work_dir = tempfile::tempdir().unwrap();
     let mut config = test_config(work_dir.path());
-    // 1 KiB/s expected download with a tiny lead_days: buffer_target computes to about 1
+    // 1 kbps expected download with a tiny lead_days: buffer_target computes to about 1
     // byte, far under the 10-byte part below, so the plain budget check skips it forever.
     config.s3.restore = RestoreConfig {
         expected_download_kbps: 1,
-        lead_days: Some(1.0 / (1024.0 * 86400.0)),
+        lead_days: Some(1.0 / (125.0 * 86400.0)),
         ..RestoreConfig::default()
     };
     let task = movies_task();

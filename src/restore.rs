@@ -10,7 +10,10 @@ use crate::{
     manifest::Backup,
     remote::{RestoreStatus, RestoreStatusDetail},
     state::{PartDownloadState, RestorePartState, RestoreState, read_restore_state},
-    util::{IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
+    util::{
+        BYTES_PER_KBPS, IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key,
+        sanitize_subvolume_path,
+    },
 };
 
 // Test-only override so chunked-download resume can be exercised without a multi-MiB fixture.
@@ -84,7 +87,7 @@ fn daily_budget_bytes(expected_download_kbps: u64) -> u64 {
     if expected_download_kbps == 0 {
         return 0;
     }
-    expected_download_kbps * 1024 * 86400
+    (expected_download_kbps as f64 * BYTES_PER_KBPS * 86400.0) as u64
 }
 
 /// Returns the restoration working directory (deterministic, not random).
@@ -595,10 +598,12 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             .collect();
         downloadable.sort_by_key(|(_, expires_at)| *expires_at);
 
+        let download_started_at = std::time::Instant::now();
+        let mut downloaded_bytes = 0u64;
         let mut parts_failed = 0usize;
         for (part_idx, _) in downloadable {
-            let expected_blake3 = match self.state.parts.get(&part_idx) {
-                Some(part) => part.blake3.clone(),
+            let (expected_blake3, size_bytes) = match self.state.parts.get(&part_idx) {
+                Some(part) => (part.blake3.clone(), part.size_bytes),
                 None => continue,
             };
             let key = match self.part_keys.get(&part_idx) {
@@ -652,6 +657,18 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
                 part.download_state = PartDownloadState::Downloaded;
             }
             self.state.save(&self.state_path)?;
+            downloaded_bytes += size_bytes;
+        }
+
+        if downloaded_bytes > 0 {
+            let elapsed_secs = download_started_at.elapsed().as_secs_f64().max(0.001);
+            let measured_kbps = (downloaded_bytes as f64 / elapsed_secs) / BYTES_PER_KBPS;
+            tracing::info!(
+                "download speed this run: {} bytes in {:.1}s, ~{:.1} kbps (compare with expected_download_kbps)",
+                downloaded_bytes,
+                elapsed_secs,
+                measured_kbps
+            );
         }
 
         Ok(parts_failed)
@@ -742,6 +759,29 @@ pub async fn restore_task<R: RemoteBackend>(
 
     let state_path = restore_state_file(&work_dir);
     let state = load_or_init_state(&state_path, &backup, &task.name, level, &timestamp)?;
+
+    let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);
+    let remaining_bytes: u64 = state
+        .parts
+        .values()
+        .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
+        .map(|p| p.size_bytes)
+        .sum();
+    if daily_budget > 0 {
+        let estimated_days = (remaining_bytes as f64 / daily_budget as f64).ceil() as u64;
+        tracing::info!(
+            "restore schedule: buffer_target {} bytes, daily_budget {} bytes/day, {} bytes remaining, ~{} day(s) to complete at this pace",
+            buffer_target,
+            daily_budget,
+            remaining_bytes,
+            estimated_days
+        );
+    } else {
+        tracing::info!(
+            "restore schedule: no pacing configured (expected_download_kbps is 0), all {} remaining bytes will be requested for retrieval without throttling",
+            remaining_bytes
+        );
+    }
 
     let part_keys = backup
         .parts

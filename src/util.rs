@@ -8,6 +8,9 @@ pub const SNAPSHOT_PART_PREFIX: &str = "snapshot.part-";
 /// Buffer size for streaming file/pipe IO.
 pub const IO_BUF_SIZE: usize = 64 * 1024;
 
+/// Bytes per second per 1 kbps (kilobit/s = 1000 bits/s / 8 bits per byte).
+pub const BYTES_PER_KBPS: f64 = 1000.0 / 8.0;
+
 // SIGKILL bypasses Drop, so kill_on_drop alone can't stop a child (btrfs send / split)
 // from outliving a killed bcb process; PR_SET_PDEATHSIG asks the kernel to do it instead.
 #[cfg(target_os = "linux")]

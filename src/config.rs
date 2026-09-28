@@ -16,7 +16,7 @@ impl Default for S3RetryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RestoreConfig {
-    /// Expected download speed in KiB/s; used to calculate lead_days buffer.
+    /// Expected download speed in kilobit/s; used to calculate lead_days buffer.
     /// Only for scheduling estimation, not for actual speed limiting.
     /// 0 means no estimation (disable prefetch scheduling).
     #[serde(default)]
@@ -48,7 +48,7 @@ pub struct S3Config {
     pub storage_class: S3StorageClass,
     #[serde(default)]
     pub retry: S3RetryConfig,
-    /// KiB/s; 0 means unlimited.
+    /// kilobit/s; 0 means unlimited.
     #[serde(default)]
     pub upload_speed_limit_kbps: u64,
     /// Restore-specific configuration.

@@ -11,6 +11,7 @@ use std::path::Path;
 use tokio::io::AsyncReadExt;
 
 use crate::config::S3Config;
+use crate::util::BYTES_PER_KBPS;
 
 const PART_SIZE: usize = 64 * 1024 * 1024;
 
@@ -107,7 +108,7 @@ impl S3Backend {
         }
 
         let upload_speed_limit_bps = (config.upload_speed_limit_kbps > 0)
-            .then_some(config.upload_speed_limit_kbps as f64 * 1024.0);
+            .then_some(config.upload_speed_limit_kbps as f64 * BYTES_PER_KBPS);
 
         Ok(Self {
             client: Client::from_conf(builder.build()),
