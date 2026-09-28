@@ -32,13 +32,6 @@ To restore, apply level 0, level 1, …, level N in order; each incremental requ
 
 > For ZFS: [zrb](https://github.com/ziteh/zfs-remote-backup)
 
-## Installation
-
-```bash
-cargo build --release
-sudo install -m 755 target/release/bcb /usr/local/bin/bcb
-```
-
 ## Usage
 
 ```bash
@@ -100,9 +93,53 @@ AWS S3 Glacier objects **require** retrieval before download.
 `bcb restore` requests retrieval for the next batch, downloads whatever is currently retrievable, and exits — re-run until it prints `restore complete`. Exit code 2 means in progress, exit 0 means done, so a scheduler can just retry. A failed part download is logged and skipped; the next run retries it.
 
 - `--restore-tier` / `--restore-days`: retrieval speed/cost and how long a retrieved copy stays downloadable.
-- `s3.restore.expected_download_kbps` / `s3.restore.lead_days`: pace retrieval to available bandwidth instead of requesting everything at once. With pacing on, `--restore-days` must exceed the lead window by at least a day.
+- `s3.restore.expected_download_kbps` / `s3.restore.lead_days`: pace retrieval to available bandwidth instead of requesting everything at once. `expected_download_kbps` is in kilobit/s (e.g. the download number your ISP advertises); when unsure, a conservative (lower) estimate is safer. With pacing on, `--restore-days` must exceed the lead window by at least a day.
 - Restore levels in order onto the same target (level 0 first); each incremental needs its parent already restored.
 - If wrapped in a systemd timer, add `SuccessExitStatus=2` or every in-progress retry is treated as a failure.
+
+```mermaid
+gantt
+    title Retrieval pipeline (lead_days = 2, restore-days = 4)
+    dateFormat  YYYY-MM-DD
+    axisFormat  %m/%d
+    tickInterval 1day
+
+    section Wave 1
+    Retrieval        :active, w1req, 2024-01-01, 2d
+    Data available   :        w1valid, 2024-01-03, 4d
+    Download         :done,   w1dl,  2024-01-03, 1d
+
+    section Wave 2
+    Retrieval        :active, w2req, 2024-01-02, 2d
+    Data available   :        w2valid, 2024-01-04, 4d
+    Download         :done,   w2dl,  2024-01-04, 1d
+
+    section Wave 3
+    Retrieval        :active, w3req, 2024-01-03, 2d
+    Data available   :        w3valid, 2024-01-05, 4d
+    Download         :done,   w3dl,  2024-01-05, 1d
+```
+
+```mermaid
+gantt
+    title Out of time to finish downloading
+    dateFormat  YYYY-MM-DD
+    axisFormat  %m/%d
+    tickInterval 1day
+
+    section 1st retrieval
+    Retrieval #1               :active, req1, 2024-01-01, 2d
+    Data available             :        valid1, 2024-01-03, 4d
+    Download (Interrupted)     :crit,   dl1, 2024-01-06, 2d
+    Retrieved copy expired      :milestone, exp1, 2024-01-07, 0d
+
+    section 2nd retrieval (auto)
+    Retrieval #2               :active, req2, 2024-01-07, 2d
+    Data available             :        valid2, 2024-01-09, 4d
+    Resume Download            :done,   dl2, 2024-01-09, 1d
+```
+
+> Waves above are illustrative; actual requests are paced by a rolling byte budget (lead_days x expected_download_kbps), not fixed daily batches.
 
 ## Retention
 
@@ -114,7 +151,7 @@ Leave `manifest` objects unexpired. Don't expire a level that a later incrementa
 
 ## Documentation
 
-- [Periodic backup example](docs/periodic-backup-example.md) — btrbk config, systemd units, failure alerting
+- [Periodic backup example](docs/periodic-backup-example.md) — btrbk config, systemd units, failure alerting (ready-to-copy files in [contrib/](contrib/README.md))
 - [Restore drill runbook](docs/restore-drill-runbook.md)
 
 ## Development
