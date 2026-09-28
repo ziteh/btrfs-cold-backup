@@ -9,7 +9,7 @@ use crate::{
     crypto::{blake3_file, decrypt_file},
     manifest::{Backup, parse_backup},
     remote::{RestoreStatus, RestoreStatusDetail},
-    state::{PartDownloadState, RestorePartState, RestoreState, read_restore_state},
+    state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
         BYTES_PER_KBPS, IO_BUF_SIZE, compact_to_iso, s3_backup_key, s3_manifest_key,
         sanitize_subvolume_path,
@@ -335,14 +335,8 @@ async fn load_or_fetch_manifest<R: RemoteBackend>(
 }
 
 /// Resumes the state file only if it belongs to this exact manifest; otherwise starts fresh.
-fn load_or_init_state(
-    state_path: &Path,
-    backup: &Backup,
-    task_name: &str,
-    level: u32,
-    timestamp: &str,
-) -> Result<RestoreState> {
-    if let Some(state) = read_restore_state(state_path)?
+fn load_or_init_state(state_path: &Path, backup: &Backup) -> Result<RestoreState> {
+    if let Some(state) = read_state::<RestoreState>(state_path)?
         && state.manifest_blake3 == backup.blake3
     {
         tracing::info!("resuming from existing restore state");
@@ -351,10 +345,6 @@ fn load_or_init_state(
 
     tracing::info!("starting fresh restore");
     let mut state = RestoreState {
-        task_name: task_name.to_string(),
-        level,
-        timestamp: timestamp.to_string(),
-        snapshot_name: backup.snapshot_name.clone(),
         manifest_blake3: backup.blake3.clone(),
         parts: backup
             .parts
@@ -758,7 +748,7 @@ pub async fn restore_task<R: RemoteBackend>(
     .await?;
 
     let state_path = restore_state_file(&work_dir);
-    let state = load_or_init_state(&state_path, &backup, &task.name, level, &timestamp)?;
+    let state = load_or_init_state(&state_path, &backup)?;
 
     let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);
     let remaining_bytes: u64 = state

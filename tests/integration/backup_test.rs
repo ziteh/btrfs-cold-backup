@@ -1867,10 +1867,6 @@ async fn restore_should_resume_partially_downloaded_part() {
         },
     );
     let mut seeded = RestoreState {
-        task_name: task.name.clone(),
-        level: 0,
-        timestamp: "2026-06-02T00:00".to_string(),
-        snapshot_name: backup_manifest.snapshot_name.clone(),
         manifest_blake3: stream_hash,
         parts,
         stream_verified: false,
@@ -1998,10 +1994,6 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
         },
     );
     let mut seeded = RestoreState {
-        task_name: task.name.clone(),
-        level: 0,
-        timestamp: "2026-06-02T00:00".to_string(),
-        snapshot_name: backup_manifest.snapshot_name.clone(),
         manifest_blake3: "irrelevant".to_string(),
         parts,
         stream_verified: false,

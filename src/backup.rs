@@ -10,7 +10,7 @@ use crate::{
         Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo, parse_backup,
         parse_latest,
     },
-    state::{BackupState, UploadedPart, read_backup_state},
+    state::{BackupState, UploadedPart, read_state},
     util::{
         IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, fsync_dir,
         s3_backup_key, s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path,
@@ -68,7 +68,7 @@ impl PersistentState {
     /// Refuses to replace another level's unfinished backup: starting fresh would silently
     /// discard its uploaded parts and leave that level without a backup.
     fn load_or_init(path: PathBuf, task_name: &str, level: u32) -> Result<Self> {
-        let inner = match read_backup_state(&path)? {
+        let inner = match read_state::<BackupState>(&path)? {
             Some(s) if s.level == level => {
                 tracing::info!("resuming from existing backup state");
                 s

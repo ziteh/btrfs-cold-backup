@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -56,10 +57,6 @@ pub struct RestorePartState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RestoreState {
-    pub task_name: String,
-    pub level: u32,
-    pub timestamp: String,
-    pub snapshot_name: String,
     pub manifest_blake3: String,
     pub parts: BTreeMap<String, RestorePartState>,
     pub stream_verified: bool,
@@ -77,19 +74,17 @@ impl RestoreState {
     }
 }
 
-pub fn read_restore_state(path: &Path) -> Result<Option<RestoreState>> {
+/// Loads a state file, or returns None when there is none yet.
+pub fn read_state<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_yaml::from_slice(&bytes)?)),
+        Ok(bytes) => serde_yaml::from_slice(&bytes).map(Some).with_context(|| {
+            format!(
+                "failed to parse state file {path:?}; if it is damaged (e.g. empty after a \
+                 power loss), delete it to start over"
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-pub fn read_backup_state(path: &Path) -> Result<Option<BackupState>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_yaml::from_slice(&bytes)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e).with_context(|| format!("failed to read state file {path:?}")),
     }
 }
 
@@ -144,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_read_state_not_found() {
-        let result = read_backup_state(Path::new("/nonexistent/path/backup_state.yaml"));
+        let result = read_state::<BackupState>(Path::new("/nonexistent/path/backup_state.yaml"));
         assert!(result.unwrap().is_none());
     }
 
@@ -169,9 +164,45 @@ mod tests {
         };
 
         state.save(&path).unwrap();
-        let loaded = read_backup_state(&path).unwrap().unwrap();
+        let loaded: BackupState = read_state(&path).unwrap().unwrap();
         assert_eq!(state.snapshot_name, loaded.snapshot_name);
         assert_eq!(state.output_dir, loaded.output_dir);
         assert_eq!(state.stream_hash, loaded.stream_hash);
+    }
+
+    #[test]
+    fn test_read_state_error_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore_state.yaml");
+        std::fs::write(&path, b"").unwrap();
+
+        let err = format!("{:#}", read_state::<RestoreState>(&path).unwrap_err());
+        assert!(
+            err.contains("restore_state.yaml"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// State files written before a field was removed must still load.
+    #[test]
+    fn test_read_state_ignores_removed_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore_state.yaml");
+        std::fs::write(
+            &path,
+            "task_name: movies\n\
+             level: 0\n\
+             timestamp: 2026-06-02T14:30\n\
+             snapshot_name: bcb_level0.20260602T1430\n\
+             manifest_blake3: abc\n\
+             parts: {}\n\
+             stream_verified: false\n\
+             receive_completed: false\n\
+             last_updated: 0\n",
+        )
+        .unwrap();
+
+        let state: RestoreState = read_state(&path).unwrap().unwrap();
+        assert_eq!(state.manifest_blake3, "abc");
     }
 }
