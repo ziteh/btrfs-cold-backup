@@ -27,7 +27,7 @@ pub async fn list_backups<R: RemoteBackend>(
 
     let mut entries: Vec<BackupEntry> = keys
         .iter()
-        .filter(|k| k.ends_with("task_manifest.yaml"))
+        .filter(|k| k.ends_with("/manifest.yaml"))
         .filter_map(|k| parse_entry(k))
         .collect();
 
@@ -44,27 +44,24 @@ mod tests {
 
     #[test]
     fn test_parse_entry_valid_key() {
-        let entry =
-            parse_entry("backups/manifests/mnt_data/bcb_level0_202606021430/task_manifest.yaml")
-                .unwrap();
+        let entry = parse_entry("backups/manifests/mnt_data/bcb_level0_202606021430/manifest.yaml")
+            .unwrap();
         assert_eq!(entry.level, 0);
-        assert_eq!(entry.timestamp, "2026-06-02T14:30:00Z");
+        assert_eq!(entry.timestamp, "2026-06-02T14:30");
     }
 
     #[test]
     fn test_parse_entry_higher_level() {
         let entry =
-            parse_entry("backups/manifests/mnt_data/bcb_level12_202612251015/task_manifest.yaml")
+            parse_entry("backups/manifests/mnt_data/bcb_level12_202612251015/manifest.yaml")
                 .unwrap();
         assert_eq!(entry.level, 12);
     }
 
     #[test]
     fn test_parse_entry_rejects_unrelated_keys() {
-        assert!(parse_entry("backups/manifests/mnt_data/last_backup_manifest.yaml").is_none());
-        assert!(
-            parse_entry("backups/manifests/mnt_data/bcb_levelX_bad/task_manifest.yaml").is_none()
-        );
+        assert!(parse_entry("backups/manifests/mnt_data/latest.yaml").is_none());
+        assert!(parse_entry("backups/manifests/mnt_data/bcb_levelX_bad/manifest.yaml").is_none());
         assert!(parse_entry("unrelated/key").is_none());
     }
 
@@ -89,9 +86,9 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "manifests/mnt_data/bcb_level1_202606031000/task_manifest.yaml".to_string(),
-                "manifests/mnt_data/bcb_level0_202606021430/task_manifest.yaml".to_string(),
-                "manifests/mnt_data/last_backup_manifest.yaml".to_string(),
+                "manifests/mnt_data/bcb_level1_202606031000/manifest.yaml".to_string(),
+                "manifests/mnt_data/bcb_level0_202606021430/manifest.yaml".to_string(),
+                "manifests/mnt_data/latest.yaml".to_string(),
             ])
         });
 

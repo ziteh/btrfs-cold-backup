@@ -65,24 +65,31 @@ fn btrfs_subvolume_delete(path: &Path) {
 }
 
 #[tokio::test]
-async fn subvolume_exists_should_return_true_for_btrfs_subvolume() {
+async fn subvolume_uuids_should_link_snapshot_to_its_source() {
     let Some(mount) = btrfs_mount() else { return };
-    let dir = test_dir(&mount, "exists-true");
+    let dir = test_dir(&mount, "uuids");
     let subvol = dir.join("subvol");
+    let snap = dir.join("snap");
     btrfs_subvolume_create(&subvol);
+    btrfs_snapshot(&subvol, &snap);
 
     let driver = BtrfsDriver;
-    assert!(driver.subvolume_exists(&subvol).await.unwrap());
+    let source = driver.subvolume_uuids(&subvol).await.unwrap();
+    let snapshot = driver.subvolume_uuids(&snap).await.unwrap();
+    assert!(source.parent_uuid.is_none());
+    assert_ne!(snapshot.uuid, source.uuid);
+    assert_eq!(snapshot.parent_uuid.as_deref(), Some(source.uuid.as_str()));
 
+    btrfs_subvolume_delete(&snap);
     btrfs_subvolume_delete(&subvol);
 }
 
 #[tokio::test]
-async fn subvolume_exists_should_return_false_for_missing_path() {
+async fn subvolume_uuids_should_fail_for_missing_path() {
     let Some(mount) = btrfs_mount() else { return };
     let driver = BtrfsDriver;
     let missing = mount.join("does-not-exist-subvol");
-    assert!(!driver.subvolume_exists(&missing).await.unwrap());
+    assert!(driver.subvolume_uuids(&missing).await.is_err());
 }
 
 #[tokio::test]

@@ -67,7 +67,7 @@ tasks:
   - name: example_task # Letters, digits, '.', '_' and '-' only: it becomes a directory name
     description: Example backup task
     subvolume: /mnt/data
-    snapshot_dir: /mnt/.snapshots
+    snapshot_dir: /mnt/.snapshots # Must not be shared with another enabled task
     enabled: true
 ```
 
@@ -82,7 +82,9 @@ bcb_level<N>.<YYYYMMDD>T<hhmm>
 ```
 
 - `bcb backup --level N` picks the newest matching snapshot.
-- A level-N (N > 0) backup requires the level-(N-1) parent snapshot from the last backup, and the level-N snapshot must be newer.
+- The snapshot must have been taken from the task's `subvolume` (btrfs Parent UUID), and a level-N parent is matched by UUID, not just name. A replaced source (e.g. new disk) fails until a level 0 backup starts a new chain.
+- Timestamps (snapshot names, `--date`, manifests) are the snapshot's local time with no zone. On a host that observes DST, the hour repeated when clocks fall back can make a newer snapshot sort as older, or collide with an existing name; run bcb on a host without DST.
+- A level-N (N > 0) backup requires the level-(N-1) parent snapshot from the latest backup, and the level-N snapshot must be newer.
 - btrbk's same-minute suffix (`_<n>`) is not supported; bcb fails naming the snapshot, delete or rename it.
 - Backups are idempotent: a completed snapshot is skipped, an interrupted one resumes. Tasks run sequentially; one failing task doesn't block the others.
 
@@ -140,6 +142,16 @@ gantt
 ```
 
 > Waves above are illustrative; actual requests are paced by a rolling byte budget (lead_days x expected_download_kbps), not fixed daily batches.
+
+## S3 Layout
+
+```text
+<prefix>backup-data/<subvolume>/bcb_level<N>_<YYYYMMDDhhmm>/snapshot.part-NNNNNN.age
+<prefix>manifests/<subvolume>/bcb_level<N>_<YYYYMMDDhhmm>/manifest.yaml
+<prefix>manifests/<subvolume>/latest.yaml
+```
+
+`<subvolume>` is the subvolume path with `/` replaced by `_`. `manifest.yaml` describes one backup; `latest.yaml` records the newest backup of each level, which the next incremental uses as its parent. Both carry a `format_version`, and bcb refuses a manifest whose major version it doesn't know.
 
 ## Retention
 

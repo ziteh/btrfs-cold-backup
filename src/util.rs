@@ -48,7 +48,7 @@ pub fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// Parses a compact date/time into ISO 8601.
+/// Parses a compact date/time into ISO 8601 (`YYYY-MM-DDTHH:MM`, local time, no zone).
 pub fn compact_to_iso(s: &str) -> Result<String> {
     // btrbk appends `_<n>` when it creates two snapshots of the same subvolume within one
     // minute. bcb does not back those up (see snapshot_timestamp), so there is never a
@@ -65,7 +65,7 @@ pub fn compact_to_iso(s: &str) -> Result<String> {
 
     if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) {
         Ok(format!(
-            "{}-{}-{}T{}:{}:00Z",
+            "{}-{}-{}T{}:{}",
             &s[0..4],
             &s[4..6],
             &s[6..8],
@@ -73,7 +73,7 @@ pub fn compact_to_iso(s: &str) -> Result<String> {
             &s[10..12]
         ))
     } else if s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()) {
-        Ok(format!("{}-{}-{}T00:00:00Z", &s[0..4], &s[4..6], &s[6..8]))
+        Ok(format!("{}-{}-{}T00:00", &s[0..4], &s[4..6], &s[6..8]))
     } else {
         Err(anyhow!("date must be YYYYMMDD or YYYYMMDDHHMM, got: {s}"))
     }
@@ -139,7 +139,7 @@ pub fn s3_manifest_key(
     timestamp: &str,
 ) -> String {
     let dir_name = task_dir_name(level, timestamp);
-    format!("{prefix}manifests/{sanitized_subvol}/{dir_name}/task_manifest.yaml")
+    format!("{prefix}manifests/{sanitized_subvol}/{dir_name}/manifest.yaml")
 }
 
 pub fn state_path(base_dir: &Path, sanitized_subvol: &str) -> PathBuf {
@@ -159,8 +159,8 @@ pub fn backup_output_dir(
     base_dir.join("task").join(sanitized_subvol).join(dir_name)
 }
 
-pub fn s3_last_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
-    format!("{prefix}manifests/{sanitized_subvol}/last_backup_manifest.yaml")
+pub fn s3_latest_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
+    format!("{prefix}manifests/{sanitized_subvol}/latest.yaml")
 }
 
 #[cfg(test)]
@@ -212,35 +212,35 @@ mod tests {
 
     #[test]
     fn test_task_dir_name_level_zero() {
-        let result = task_dir_name(0, "2026-06-02T14:30:00Z");
+        let result = task_dir_name(0, "2026-06-02T14:30");
         assert_eq!(result, "bcb_level0_202606021430");
     }
 
     #[test]
     fn test_task_dir_name_level_one() {
-        let result = task_dir_name(1, "2026-06-02T14:30:00Z");
+        let result = task_dir_name(1, "2026-06-02T14:30");
         assert_eq!(result, "bcb_level1_202606021430");
     }
 
     #[test]
     fn test_task_dir_name_different_date() {
-        let result = task_dir_name(2, "2025-12-25T10:15:30Z");
+        let result = task_dir_name(2, "2025-12-25T10:15");
         assert_eq!(result, "bcb_level2_202512251015");
     }
 
     #[test]
     fn test_task_dir_name_same_day_different_time() {
-        let a = task_dir_name(0, "2026-06-25T08:00:00Z");
-        let b = task_dir_name(0, "2026-06-25T20:00:00Z");
+        let a = task_dir_name(0, "2026-06-25T08:00");
+        let b = task_dir_name(0, "2026-06-25T20:00");
         assert_ne!(a, b);
     }
 
     #[test]
     fn test_task_dir_name_parse_round_trip() {
-        let dir = task_dir_name(3, "2026-06-02T14:30:00Z");
+        let dir = task_dir_name(3, "2026-06-02T14:30");
         let (level, timestamp) = parse_task_dir_name(&dir).unwrap();
         assert_eq!(level, 3);
-        assert_eq!(timestamp, "2026-06-02T14:30:00Z");
+        assert_eq!(timestamp, "2026-06-02T14:30");
     }
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_s3_backup_key() {
-        let key = s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z", "000000");
+        let key = s3_backup_key("backups/", "mnt_data", 0, "2026-06-02T14:30", "000000");
         assert_eq!(
             key,
             "backups/backup-data/mnt_data/bcb_level0_202606021430/snapshot.part-000000.age"
@@ -270,7 +270,7 @@ mod tests {
             "backups/",
             "mnt_data_movies",
             1,
-            "2026-06-02T15:00:00Z",
+            "2026-06-02T15:00",
             "000004",
         );
         assert_eq!(
@@ -281,30 +281,27 @@ mod tests {
 
     #[test]
     fn test_s3_manifest_key() {
-        let key = s3_manifest_key("backups/", "mnt_data", 0, "2026-06-02T14:30:00Z");
+        let key = s3_manifest_key("backups/", "mnt_data", 0, "2026-06-02T14:30");
         assert_eq!(
             key,
-            "backups/manifests/mnt_data/bcb_level0_202606021430/task_manifest.yaml"
+            "backups/manifests/mnt_data/bcb_level0_202606021430/manifest.yaml"
         );
     }
 
     #[test]
-    fn test_s3_last_manifest_key() {
-        let key = s3_last_manifest_key("backups/", "mnt_data");
-        assert_eq!(key, "backups/manifests/mnt_data/last_backup_manifest.yaml");
+    fn test_s3_latest_manifest_key() {
+        let key = s3_latest_manifest_key("backups/", "mnt_data");
+        assert_eq!(key, "backups/manifests/mnt_data/latest.yaml");
     }
 
     #[test]
     fn test_compact_to_iso_12() {
-        assert_eq!(
-            compact_to_iso("202606021430").unwrap(),
-            "2026-06-02T14:30:00Z"
-        );
+        assert_eq!(compact_to_iso("202606021430").unwrap(), "2026-06-02T14:30");
     }
 
     #[test]
     fn test_compact_to_iso_8() {
-        assert_eq!(compact_to_iso("20260602").unwrap(), "2026-06-02T00:00:00Z");
+        assert_eq!(compact_to_iso("20260602").unwrap(), "2026-06-02T00:00");
     }
 
     #[test]
@@ -321,16 +318,16 @@ mod tests {
 
     #[test]
     fn test_s3_keys_no_path_collision() {
-        let backup_key = s3_backup_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z", "000000");
-        let manifest_key = s3_manifest_key("prefix/", "sub", 0, "2026-06-02T14:30:00Z");
-        let last_key = s3_last_manifest_key("prefix/", "sub");
+        let backup_key = s3_backup_key("prefix/", "sub", 0, "2026-06-02T14:30", "000000");
+        let manifest_key = s3_manifest_key("prefix/", "sub", 0, "2026-06-02T14:30");
+        let latest_key = s3_latest_manifest_key("prefix/", "sub");
 
         assert_ne!(backup_key, manifest_key);
-        assert_ne!(backup_key, last_key);
-        assert_ne!(manifest_key, last_key);
+        assert_ne!(backup_key, latest_key);
+        assert_ne!(manifest_key, latest_key);
         assert!(backup_key.contains("backup-data"));
         assert!(manifest_key.contains("manifests"));
-        assert!(last_key.contains("manifests"));
+        assert!(latest_key.contains("manifests"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     Config, RemoteBackend, Task,
     crypto::{blake3_file, decrypt_file},
-    manifest::Backup,
+    manifest::{Backup, parse_backup},
     remote::{RestoreStatus, RestoreStatusDetail},
     state::{PartDownloadState, RestorePartState, RestoreState, read_restore_state},
     util::{
@@ -301,7 +301,7 @@ async fn load_or_fetch_manifest<R: RemoteBackend>(
     retrieval: &RetrievalOptions,
 ) -> Result<Backup> {
     if let Ok(bytes) = tokio::fs::read(cache_path).await {
-        return Ok(serde_yaml::from_slice(&bytes)?);
+        return parse_backup(&bytes);
     }
 
     // The manifest may itself be archived. Both NotRequested (needs a retrieval kicked off)
@@ -327,7 +327,7 @@ async fn load_or_fetch_manifest<R: RemoteBackend>(
 
     let bytes = remote.download(manifest_key).await?;
     // Parse before caching so a corrupt download is never persisted.
-    let backup: Backup = serde_yaml::from_slice(&bytes)?;
+    let backup = parse_backup(&bytes)?;
     let tmp = cache_path.with_extension("yaml.tmp");
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, cache_path).await?;

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use crate::{
     Config, RemoteBackend, Task,
     list::list_backups,
-    manifest::Backup,
+    manifest::parse_backup,
     util::{now_unix, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
 
@@ -48,8 +48,8 @@ pub async fn verify_task<R: RemoteBackend>(
     for entry in &entries {
         let manifest_key =
             s3_manifest_key(&config.s3.prefix, &sanitized, entry.level, &entry.timestamp);
-        let backup: Backup = match remote.download(&manifest_key).await {
-            Ok(bytes) => match serde_yaml::from_slice(&bytes) {
+        let backup = match remote.download(&manifest_key).await {
+            Ok(bytes) => match parse_backup(&bytes) {
                 Ok(b) => b,
                 Err(e) => {
                     issues.push(VerifyIssue {
@@ -155,7 +155,7 @@ pub async fn verify_task<R: RemoteBackend>(
 mod tests {
     use super::*;
     use crate::config::S3StorageClass;
-    use crate::manifest::{PartInfo, SystemInfo};
+    use crate::manifest::{Backup, PartInfo, SystemInfo};
     use crate::remote::{MockRemoteBackend, ObjectMetadata};
     use std::path::PathBuf;
 
@@ -192,11 +192,14 @@ mod tests {
 
     fn backup_with_one_part(size_bytes: u64) -> Backup {
         Backup {
-            timestamp: "2026-06-02T14:30:00Z".to_string(),
+            format_version: crate::manifest::FORMAT_VERSION.to_string(),
+            timestamp: "2026-06-02T14:30".to_string(),
             created_at: now_unix(),
             level: 0,
             snapshot_name: "bcb_level0.20260602T1430".to_string(),
             parent_snapshot: None,
+            source_uuid: "src-uuid".to_string(),
+            snapshot_uuid: "snap-uuid".to_string(),
             system: SystemInfo::default(),
             age_public_key: String::new(),
             total_size_bytes: size_bytes,
@@ -229,7 +232,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });
@@ -261,7 +264,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });
@@ -293,7 +296,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });
@@ -322,7 +325,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });
@@ -351,7 +354,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level1_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level1_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });
@@ -381,7 +384,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });
@@ -410,7 +413,7 @@ mod tests {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/task_manifest.yaml"
+                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
                     .to_string(),
             ])
         });

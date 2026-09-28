@@ -121,6 +121,9 @@ impl Config {
         // like /mnt/data/movies and /mnt/data_movies collide after sanitization and would
         // silently overwrite each other's backups.
         let mut sanitized_subvols: HashMap<String, &str> = HashMap::new();
+        // Snapshot selection only looks at names, so two tasks sharing a snapshot_dir would
+        // each back up the other's snapshots. Collecting components ignores trailing slashes.
+        let mut snapshot_dirs: HashMap<PathBuf, &str> = HashMap::new();
         for task in &self.tasks {
             if !task_names.insert(&task.name) {
                 return Err(anyhow!("duplicate task name: {}", task.name));
@@ -163,6 +166,15 @@ impl Config {
                          path sanitization)",
                         other,
                         task.name
+                    ));
+                }
+                let snapshot_dir: PathBuf = task.snapshot_dir.components().collect();
+                if let Some(other) = snapshot_dirs.insert(snapshot_dir, &task.name) {
+                    return Err(anyhow!(
+                        "tasks '{}' and '{}' share snapshot_dir {:?}",
+                        other,
+                        task.name,
+                        task.snapshot_dir
                     ));
                 }
             }
@@ -311,6 +323,21 @@ mod tests {
         second.subvolume = PathBuf::from("/mnt/data_movies");
         config.tasks.push(second);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_duplicate_snapshot_dir_rejected() {
+        let mut config = valid_config();
+        let mut second = config.tasks[0].clone();
+        second.name = "other".to_string();
+        second.subvolume = PathBuf::from("/mnt/other");
+        second.snapshot_dir = PathBuf::from("/mnt/snapshots/");
+        config.tasks.push(second);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("share snapshot_dir"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

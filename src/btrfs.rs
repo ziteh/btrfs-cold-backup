@@ -18,7 +18,35 @@ pub trait BtrfsOps: Send + Sync {
         parent: &Path,
         snapshot: &Path,
     ) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
-    async fn subvolume_exists(&self, path: &Path) -> Result<bool>;
+    async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubvolumeUuids {
+    pub uuid: String,
+    /// UUID of the subvolume this one was snapshotted from; None if it is not a snapshot.
+    pub parent_uuid: Option<String>,
+}
+
+/// Parses `btrfs subvolume show` output. `Received UUID:` and `Parent UUID:` lines are
+/// distinguished from `UUID:` by matching each line's full label.
+fn parse_subvolume_uuids(show_output: &str) -> Result<SubvolumeUuids> {
+    let mut uuid = None;
+    let mut parent_uuid = None;
+    for line in show_output.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("UUID:") {
+            uuid = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("Parent UUID:") {
+            parent_uuid = Some(v.trim());
+        }
+    }
+    let uuid = match uuid {
+        Some(u) if u != "-" => u.to_string(),
+        _ => return Err(anyhow!("no UUID in btrfs subvolume show output")),
+    };
+    let parent_uuid = parent_uuid.filter(|p| *p != "-").map(str::to_string);
+    Ok(SubvolumeUuids { uuid, parent_uuid })
 }
 
 // Reads btrfs-send stdout; after EOF, blocks until the child exits and propagates
@@ -190,12 +218,56 @@ impl BtrfsOps for BtrfsDriver {
         ])
     }
 
-    async fn subvolume_exists(&self, path: &Path) -> Result<bool> {
+    async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids> {
         let output = Command::new("btrfs")
             .args(["subvolume", "show", path_to_str(path, "path")?])
             .output()
             .await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "{path:?} is not a btrfs subvolume: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        parse_subvolume_uuids(&String::from_utf8_lossy(&output.stdout))
+            .map_err(|e| anyhow!("{path:?}: {e}"))
+    }
+}
 
-        Ok(output.status.success())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SNAPSHOT_SHOW: &str = "\
+/mnt/.snapshots/bcb_level0.20260602T1430
+\tName: \t\t\tbcb_level0.20260602T1430
+\tUUID: \t\t\t1c2d3e4f-0000-0000-0000-000000000002
+\tParent UUID: \t\t1c2d3e4f-0000-0000-0000-000000000001
+\tReceived UUID: \t\t1c2d3e4f-0000-0000-0000-000000000009
+\tFlags: \t\t\treadonly
+";
+
+    #[test]
+    fn test_parse_subvolume_uuids_snapshot() {
+        let uuids = parse_subvolume_uuids(SNAPSHOT_SHOW).unwrap();
+        assert_eq!(uuids.uuid, "1c2d3e4f-0000-0000-0000-000000000002");
+        assert_eq!(
+            uuids.parent_uuid.as_deref(),
+            Some("1c2d3e4f-0000-0000-0000-000000000001")
+        );
+    }
+
+    #[test]
+    fn test_parse_subvolume_uuids_dash_parent_is_none() {
+        let out = "\tUUID: \t\t\tabc\n\tParent UUID: \t\t-\n\tReceived UUID: \t\t-\n";
+        let uuids = parse_subvolume_uuids(out).unwrap();
+        assert_eq!(uuids.uuid, "abc");
+        assert!(uuids.parent_uuid.is_none());
+    }
+
+    #[test]
+    fn test_parse_subvolume_uuids_missing_uuid_is_err() {
+        assert!(parse_subvolume_uuids("\tParent UUID: \t\tabc\n").is_err());
+        assert!(parse_subvolume_uuids("\tUUID: \t\t\t-\n").is_err());
     }
 }

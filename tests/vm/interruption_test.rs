@@ -661,7 +661,7 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
     // state directly (real file, no mocking involved) to confirm the kill actually landed
     // mid-part rather than after it had already finished.
     let restore_work_dir = fixture.work_dir.join(format!(
-        "restore-{}-level0-2026-06-01T00:00:00Z",
+        "restore-{}-level0-2026-06-01T00:00",
         fixture.task_name
     ));
     let state: btrfs_cold_backup::RestoreState = serde_yaml::from_str(

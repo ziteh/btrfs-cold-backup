@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use btrfs_cold_backup::{
     BtrfsOps, Config, ObjectMetadata, RemoteBackend, RestoreConfig, RestoreStatus,
-    RestoreStatusDetail, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, Task,
+    RestoreStatusDetail, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, SubvolumeUuids,
+    Task,
     backup::backup_task,
-    manifest::{LatestBackup, LatestByLevel},
+    manifest::{FORMAT_VERSION, LatestBackup, LatestManifest},
     restore::restore_task,
 };
 use mockall::mock;
@@ -19,7 +20,7 @@ mock! {
         async fn list_snapshots(&self, snapshot_dir: &Path) -> Result<Vec<String>>;
         async fn send_full(&self, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
         async fn send_incremental(&self, parent: &Path, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
-        async fn subvolume_exists(&self, path: &Path) -> Result<bool>;
+        async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids>;
     }
 }
 
@@ -83,16 +84,43 @@ fn fake_stream() -> Box<dyn AsyncRead + Send + Unpin> {
     Box::new(Cursor::new(b"btrfs send data".to_vec()))
 }
 
-fn last_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
-    let mut last = LatestByLevel::new();
-    last.insert(
+const SOURCE_UUID: &str = "movies-subvol-uuid";
+
+fn snap_uuid(snapshot_name: &str) -> String {
+    format!("uuid-{snapshot_name}")
+}
+
+/// movies_task's subvolume has SOURCE_UUID; any other path is a snapshot of it whose UUID is
+/// snap_uuid(file name).
+fn btrfs_with_uuids() -> MockBtrfs {
+    let mut btrfs = MockBtrfs::new();
+    btrfs.expect_subvolume_uuids().returning(|path| {
+        Ok(if path == movies_task().subvolume {
+            SubvolumeUuids {
+                uuid: SOURCE_UUID.to_string(),
+                parent_uuid: None,
+            }
+        } else {
+            SubvolumeUuids {
+                uuid: snap_uuid(path.file_name().unwrap().to_str().unwrap()),
+                parent_uuid: Some(SOURCE_UUID.to_string()),
+            }
+        })
+    });
+    btrfs
+}
+
+fn latest_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
+    let mut latest = LatestManifest::new(SOURCE_UUID.to_string());
+    latest.levels.insert(
         level,
         LatestBackup {
-            timestamp: "2026-06-01T14:30:00Z".to_string(),
+            timestamp: "2026-06-01T14:30".to_string(),
             snapshot_name: snapshot_name.to_string(),
+            snapshot_uuid: snap_uuid(snapshot_name),
         },
     );
-    serde_yaml::to_string(&last).unwrap().into_bytes()
+    serde_yaml::to_string(&latest).unwrap().into_bytes()
 }
 
 /// Full level-0 backup: find snapshot, send_full, encrypt, upload, write manifests.
@@ -103,7 +131,7 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
     let task = movies_task();
     let snap = "bcb_level0.20260602T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![snap.to_string()]));
@@ -113,11 +141,11 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
     // no previous backup, and no manifest for this snapshot yet
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_upload_file()
@@ -145,7 +173,7 @@ async fn backup_should_fail_when_no_matching_snapshot() {
     let config = test_config(work_dir.path());
     let task = movies_task();
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs.expect_list_snapshots().returning(|_| Ok(vec![]));
 
     // no expectations set — any remote call would panic
@@ -155,17 +183,17 @@ async fn backup_should_fail_when_no_matching_snapshot() {
     assert!(result.is_err(), "should fail with no matching snapshot");
 }
 
-/// A corrupted last-backup manifest must fail loudly rather than being silently reset to
+/// A corrupted latest manifest must fail loudly rather than being silently reset to
 /// empty — a silent reset would drop other levels' entries and break their incremental
 /// chains without warning.
 #[tokio::test]
-async fn backup_should_fail_when_last_manifest_is_corrupt() {
+async fn backup_should_fail_when_latest_manifest_is_corrupt() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
     let snap = "bcb_level0.20260602T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![snap.to_string()]));
@@ -174,16 +202,16 @@ async fn backup_should_fail_when_last_manifest_is_corrupt() {
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
-        .returning(|_| Ok(b"[not, a, valid, last-manifest, mapping]".to_vec()));
+        .withf(|key| key.contains("latest.yaml"))
+        .returning(|_| Ok(b"[not, a, valid, latest-manifest, mapping]".to_vec()));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
@@ -191,12 +219,12 @@ async fn backup_should_fail_when_last_manifest_is_corrupt() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("failed to parse last manifest"),
+        err.to_string().contains("failed to parse latest manifest"),
         "unexpected error: {err}"
     );
 }
 
-/// Level-1 incremental backup: read parent from last manifest, use send_incremental.
+/// Level-1 incremental backup: read parent from latest manifest, use send_incremental.
 #[tokio::test]
 async fn level1_incremental_should_use_level0_as_parent() {
     let work_dir = tempfile::tempdir().unwrap();
@@ -205,7 +233,7 @@ async fn level1_incremental_should_use_level0_as_parent() {
     let parent = "bcb_level0.20260601T1430";
     let snap = "bcb_level1.20260602T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
@@ -214,19 +242,19 @@ async fn level1_incremental_should_use_level0_as_parent() {
         .withf(move |p, _| p.ends_with(parent))
         .returning(|_, _| Ok(fake_stream()));
 
-    let manifest_bytes = last_manifest_yaml(parent, 0);
+    let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
@@ -241,7 +269,7 @@ async fn level1_incremental_should_use_level0_as_parent() {
 }
 
 /// Level-2 incremental backup: the chain logic must not be special-cased to just level 0/1 —
-/// a level-2 backup reads its parent from the last manifest's level-1 entry the same way a
+/// a level-2 backup reads its parent from the latest manifest's level-1 entry the same way a
 /// level-1 backup reads its level-0 entry.
 #[tokio::test]
 async fn level2_incremental_should_use_level1_as_parent() {
@@ -256,7 +284,7 @@ async fn level2_incremental_should_use_level1_as_parent() {
     let parent = "bcb_level1.20260601T1430";
     let snap = "bcb_level2.20260602T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
@@ -265,19 +293,19 @@ async fn level2_incremental_should_use_level1_as_parent() {
         .withf(move |p, _| p.ends_with(parent))
         .returning(|_, _| Ok(fake_stream()));
 
-    let manifest_bytes = last_manifest_yaml(parent, 1);
+    let manifest_bytes = latest_manifest_yaml(parent, 1);
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
     remote
         .expect_upload_file()
@@ -306,7 +334,7 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
     let parent = "bcb_level0.20260601T1430";
     let snap = "bcb_level1.20260602T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
@@ -314,19 +342,19 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
         .expect_send_incremental()
         .returning(|_, _| Ok(fake_stream()));
 
-    let manifest_bytes = last_manifest_yaml(parent, 0);
+    let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
     // No upload_file/upload_bytes expectations: the storage-class lookup must fail before
     // ever calling upload_file (any such call would itself be a test failure).
@@ -341,14 +369,14 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
     );
 }
 
-/// Level-1 backup must be rejected when no last manifest exists on remote (level 0 never ran).
+/// Level-1 backup must be rejected when no latest manifest exists on remote (level 0 never ran).
 #[tokio::test]
 async fn level1_should_fail_when_no_remote_level0_exists() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(|_| Ok(vec!["bcb_level1.20260602T1430".to_string()]));
@@ -356,11 +384,11 @@ async fn level1_should_fail_when_no_remote_level0_exists() {
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(false)); // no level-0 backup
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
 
     let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
@@ -376,25 +404,25 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
     let parent = "bcb_level0.20260601T1430";
     let snap = "bcb_level1.20260602T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     // parent snapshot has been deleted locally
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![snap.to_string()]));
 
-    let manifest_bytes = last_manifest_yaml(parent, 0);
+    let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
 
     let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
@@ -416,10 +444,13 @@ async fn restore_should_fail_on_blake3_mismatch() {
 
     // manifest hash intentionally does not match the actual bytes
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -444,7 +475,7 @@ async fn restore_should_fail_on_blake3_mismatch() {
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_download_range_to_file()
@@ -476,22 +507,265 @@ async fn backup_should_skip_already_completed_backup() {
     let config = test_config(work_dir.path());
     let task = movies_task();
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(|_| Ok(vec!["bcb_level0.20260602T1430".to_string()]));
 
+    let manifest = backup_manifest_yaml("bcb_level0.20260602T1430", SOURCE_UUID);
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(true));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(move |_| Ok(manifest.clone()));
 
     let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
     assert!(
         result.expect("skip must not be an error").is_none(),
         "completed backup must be skipped"
     );
+}
+
+fn backup_manifest_yaml(snapshot_name: &str, source_uuid: &str) -> Vec<u8> {
+    use btrfs_cold_backup::manifest::{Backup, SystemInfo};
+    let backup = Backup {
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
+        created_at: 0,
+        level: 0,
+        snapshot_name: snapshot_name.to_string(),
+        parent_snapshot: None,
+        source_uuid: source_uuid.to_string(),
+        snapshot_uuid: snap_uuid(snapshot_name),
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: 0,
+        blake3: String::new(),
+        parts: vec![],
+    };
+    serde_yaml::to_string(&backup).unwrap().into_bytes()
+}
+
+/// A manifest at this snapshot's key that records another source means the bucket/prefix is
+/// shared with something else; treating it as "already backed up" would silently leave this
+/// snapshot without a backup.
+#[tokio::test]
+async fn skip_should_fail_when_existing_manifest_is_from_another_source() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+
+    let mut btrfs = btrfs_with_uuids();
+    btrfs
+        .expect_list_snapshots()
+        .returning(|_| Ok(vec!["bcb_level0.20260602T1430".to_string()]));
+
+    let manifest = backup_manifest_yaml("bcb_level0.20260602T1430", "someone-else-uuid");
+    let mut remote = MockRemote::new();
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(|_| Ok(true));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(move |_| Ok(manifest.clone()));
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another host"), "unexpected error: {err}");
+}
+
+/// snapshot_dir pointing at another subvolume's snapshots must fail before any S3 call.
+#[tokio::test]
+async fn backup_should_fail_when_snapshot_parent_uuid_mismatches() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+
+    let mut btrfs = MockBtrfs::new();
+    btrfs
+        .expect_list_snapshots()
+        .returning(|_| Ok(vec!["bcb_level0.20260602T1430".to_string()]));
+    btrfs.expect_subvolume_uuids().returning(|path| {
+        Ok(SubvolumeUuids {
+            uuid: path.display().to_string(),
+            parent_uuid: Some("other-subvol-uuid".to_string()),
+        })
+    });
+
+    // No remote expectations: the mismatch must be caught before touching S3.
+    let remote = MockRemote::new();
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("was not taken from"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Remote mock for a level-1 backup whose latest manifest is `latest`.
+fn remote_with_latest(latest: Vec<u8>) -> MockRemote {
+    let mut remote = MockRemote::new();
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("latest.yaml"))
+        .returning(|_| Ok(true));
+    remote
+        .expect_exists()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(|_| Ok(false));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("latest.yaml"))
+        .returning(move |_| Ok(latest.clone()));
+    remote
+}
+
+#[tokio::test]
+async fn level1_should_fail_when_latest_manifest_is_from_another_source() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let parent = "bcb_level0.20260601T1430";
+
+    let mut btrfs = btrfs_with_uuids();
+    btrfs.expect_list_snapshots().returning(move |_| {
+        Ok(vec![
+            parent.to_string(),
+            "bcb_level1.20260602T1430".to_string(),
+        ])
+    });
+
+    let mut latest = LatestManifest::new("replaced-disk-uuid".to_string());
+    latest.levels.insert(
+        0,
+        LatestBackup {
+            timestamp: "2026-06-01T14:30".to_string(),
+            snapshot_name: parent.to_string(),
+            snapshot_uuid: snap_uuid(parent),
+        },
+    );
+    let remote = remote_with_latest(serde_yaml::to_string(&latest).unwrap().into_bytes());
+
+    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("level 0 backup"), "unexpected error: {err}");
+}
+
+/// A local snapshot that merely shares the parent's name (e.g. recreated after deletion) is
+/// not the stream the remote chain was built on; sending against it would produce an
+/// incremental that can't be applied on restore.
+#[tokio::test]
+async fn level1_should_fail_when_local_parent_uuid_mismatches() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let parent = "bcb_level0.20260601T1430";
+
+    let mut btrfs = MockBtrfs::new();
+    btrfs.expect_list_snapshots().returning(move |_| {
+        Ok(vec![
+            parent.to_string(),
+            "bcb_level1.20260602T1430".to_string(),
+        ])
+    });
+    btrfs.expect_subvolume_uuids().returning(move |path| {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        Ok(if path == movies_task().subvolume {
+            SubvolumeUuids {
+                uuid: SOURCE_UUID.to_string(),
+                parent_uuid: None,
+            }
+        } else if name == parent {
+            SubvolumeUuids {
+                uuid: "recreated-parent-uuid".to_string(),
+                parent_uuid: Some(SOURCE_UUID.to_string()),
+            }
+        } else {
+            SubvolumeUuids {
+                uuid: snap_uuid(name),
+                parent_uuid: Some(SOURCE_UUID.to_string()),
+            }
+        })
+    });
+    let remote = remote_with_latest(latest_manifest_yaml(parent, 0));
+
+    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("different snapshot"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A level 0 of a replaced source starts a new chain: the old latest manifest's entries (all
+/// levels) belong to the previous source and must not survive.
+#[tokio::test]
+async fn level0_of_new_source_should_replace_latest_manifest() {
+    use std::sync::{Arc, Mutex};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let snap = "bcb_level0.20260701T0100";
+
+    let mut btrfs = btrfs_with_uuids();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![snap.to_string()]));
+    btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
+
+    let mut old = LatestManifest::new("old-disk-uuid".to_string());
+    old.levels.insert(
+        0,
+        LatestBackup {
+            timestamp: "2026-01-01T01:00".to_string(),
+            snapshot_name: "bcb_level0.20260101T0100".to_string(),
+            snapshot_uuid: "old-snap-uuid".to_string(),
+        },
+    );
+    let old_yaml = serde_yaml::to_string(&old).unwrap().into_bytes();
+
+    let uploaded: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let uploaded_clone = uploaded.clone();
+    let mut remote = remote_with_latest(old_yaml);
+    remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_upload_bytes()
+        .withf(|key, _, _, _| key.contains("/manifest.yaml"))
+        .returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_upload_bytes()
+        .withf(|key, _, _, _| key.contains("latest.yaml"))
+        .returning(move |_, data, _, _| {
+            *uploaded_clone.lock().unwrap() = Some(data);
+            Ok(())
+        });
+
+    backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect("level 0 backup should succeed")
+        .expect("must not be skipped");
+
+    let bytes = uploaded.lock().unwrap().clone().unwrap();
+    let latest = btrfs_cold_backup::manifest::parse_latest(&bytes).unwrap();
+    assert_eq!(latest.source_uuid, SOURCE_UUID);
+    assert_eq!(latest.levels.len(), 1);
+    assert_eq!(latest.levels[&0].snapshot_uuid, snap_uuid(snap));
 }
 
 /// Regression test: bcb identifies a backup down to the minute, so btrbk's same-minute
@@ -504,7 +778,7 @@ async fn same_minute_snapshot_should_fail_loudly_not_be_silently_skipped() {
     let config = test_config(work_dir.path());
     let task = movies_task();
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs.expect_list_snapshots().returning(|_| {
         Ok(vec![
             "bcb_level0.20260602T1430".to_string(),
@@ -523,44 +797,47 @@ async fn same_minute_snapshot_should_fail_loudly_not_be_silently_skipped() {
 }
 
 /// Regression test: completing a new level-0 backup must drop any deeper level's entry from
-/// the last-backup manifest. Those entries point at an incremental chain built on the
+/// the latest manifest. Those entries point at an incremental chain built on the
 /// snapshot this run just superseded; left in place, a later level-N (N > 0) backup could
 /// silently chain onto a stale parent instead of failing loudly and asking for a fresh one.
 #[tokio::test]
-async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_last_manifest() {
+async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_latest_manifest() {
     use std::sync::{Arc, Mutex};
 
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(|_| Ok(vec!["bcb_level0.20260701T0100".to_string()]));
     btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
 
-    // Existing last manifest carries stale level 1 and level 2 entries from an older chain.
-    let mut stale_last = LatestByLevel::new();
-    stale_last.insert(
+    // Existing latest manifest carries stale level 1 and level 2 entries from an older chain.
+    let mut stale_last = LatestManifest::new(SOURCE_UUID.to_string());
+    stale_last.levels.insert(
         0,
         LatestBackup {
-            timestamp: "2026-01-01T01:00:00Z".to_string(),
+            timestamp: "2026-01-01T01:00".to_string(),
             snapshot_name: "bcb_level0.20260101T0100".to_string(),
+            snapshot_uuid: snap_uuid("bcb_level0.20260101T0100"),
         },
     );
-    stale_last.insert(
+    stale_last.levels.insert(
         1,
         LatestBackup {
-            timestamp: "2026-01-07T03:00:00Z".to_string(),
+            timestamp: "2026-01-07T03:00".to_string(),
             snapshot_name: "bcb_level1.20260107T0300".to_string(),
+            snapshot_uuid: snap_uuid("bcb_level1.20260107T0300"),
         },
     );
-    stale_last.insert(
+    stale_last.levels.insert(
         2,
         LatestBackup {
-            timestamp: "2026-01-14T03:00:00Z".to_string(),
+            timestamp: "2026-01-14T03:00".to_string(),
             snapshot_name: "bcb_level2.20260114T0300".to_string(),
+            snapshot_uuid: snap_uuid("bcb_level2.20260114T0300"),
         },
     );
     let stale_last_yaml = serde_yaml::to_string(&stale_last).unwrap().into_bytes();
@@ -571,24 +848,24 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_last_man
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(stale_last_yaml.clone()));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote
         .expect_upload_bytes()
-        .withf(|key, _, _, _| key.contains("task_manifest"))
+        .withf(|key, _, _, _| key.contains("/manifest.yaml"))
         .returning(|_, _, _, _| Ok(()));
     remote
         .expect_upload_bytes()
-        .withf(|key, _, _, _| key.contains("last_backup_manifest"))
+        .withf(|key, _, _, _| key.contains("latest.yaml"))
         .returning(move |_, data, _, _| {
             *uploaded_last_clone.lock().unwrap() = Some(data);
             Ok(())
@@ -603,18 +880,18 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_last_man
         .lock()
         .unwrap()
         .clone()
-        .expect("last manifest must be re-uploaded");
-    let uploaded: LatestByLevel = serde_yaml::from_slice(&uploaded_bytes).unwrap();
+        .expect("latest manifest must be re-uploaded");
+    let uploaded = btrfs_cold_backup::manifest::parse_latest(&uploaded_bytes).unwrap();
     assert!(
-        uploaded.contains_key(&0),
+        uploaded.levels.contains_key(&0),
         "new level 0 entry must be present"
     );
     assert!(
-        !uploaded.contains_key(&1),
+        !uploaded.levels.contains_key(&1),
         "stale level 1 entry must be pruned after a new level 0 backup"
     );
     assert!(
-        !uploaded.contains_key(&2),
+        !uploaded.levels.contains_key(&2),
         "stale level 2 entry must be pruned after a new level 0 backup"
     );
 }
@@ -627,27 +904,27 @@ async fn level1_should_fail_when_snapshot_not_newer_than_parent() {
     let config = test_config(work_dir.path());
     let task = movies_task();
     let parent = "bcb_level0.20260601T1430";
-    // level-1 snapshot predates the level-0 parent recorded in the last manifest
+    // level-1 snapshot predates the level-0 parent recorded in the latest manifest
     let snap = "bcb_level1.20260501T1430";
 
-    let mut btrfs = MockBtrfs::new();
+    let mut btrfs = btrfs_with_uuids();
     btrfs
         .expect_list_snapshots()
         .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
 
-    let manifest_bytes = last_manifest_yaml(parent, 0);
+    let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(true));
     remote
         .expect_exists()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| Ok(false));
     remote
         .expect_download()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
 
     let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
@@ -689,7 +966,9 @@ async fn resume_should_skip_already_uploaded_parts() {
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        timestamp: "2026-06-02T14:30".to_string(),
         output_dir: output_dir.clone(),
         stream_hash: Some("streamhash".to_string()),
         total_parts: Some(2),
@@ -713,7 +992,7 @@ async fn resume_should_skip_already_uploaded_parts() {
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(false));
 
     let backup = backup_task(&config, &task, 0, &btrfs, &remote)
@@ -762,7 +1041,9 @@ async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        timestamp: "2026-06-02T14:30".to_string(),
         output_dir: output_dir.clone(),
         stream_hash: Some("streamhash".to_string()),
         total_parts: Some(1),
@@ -794,7 +1075,7 @@ async fn encrypt_should_discard_and_redo_truncated_age_file_from_interrupted_run
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
     remote
         .expect_exists()
-        .withf(|key| key.contains("last_backup_manifest"))
+        .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(false));
 
     let backup = backup_task(&config, &task, 0, &btrfs, &remote)
@@ -848,7 +1129,9 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        timestamp: "2026-06-02T14:30".to_string(),
         output_dir: output_dir.clone(),
         stream_hash: Some("streamhash".to_string()),
         total_parts: Some(2),
@@ -882,10 +1165,13 @@ async fn restore_should_request_retrieval_for_archived_objects() {
 
     // Create a simple manifest with one part
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -910,7 +1196,7 @@ async fn restore_should_request_retrieval_for_archived_objects() {
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_request_restore()
@@ -964,10 +1250,13 @@ async fn restore_should_fail_before_receive_on_stream_mismatch() {
 
     // ...but a manifest whose whole-stream hash does not match the decrypted content.
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -992,7 +1281,7 @@ async fn restore_should_fail_before_receive_on_stream_mismatch() {
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_download_range_to_file()
@@ -1041,10 +1330,13 @@ async fn default_config_should_still_request_retrieval_for_all_archived_parts() 
     let target_dir = work_dir.path().join("restore_target");
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1069,7 +1361,7 @@ async fn default_config_should_still_request_retrieval_for_all_archived_parts() 
 
     let mut remote = MockRemote::new();
     remote.expect_restore_status_detail().returning(|key| {
-        if key.contains("task_manifest") {
+        if key.contains("/manifest.yaml") {
             Ok(RestoreStatusDetail {
                 status: RestoreStatus::Ready,
                 expires_at: None,
@@ -1083,7 +1375,7 @@ async fn default_config_should_still_request_retrieval_for_all_archived_parts() 
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_request_restore()
@@ -1181,10 +1473,13 @@ async fn resume_after_stream_verified_should_retry_receive_not_silently_succeed(
         .unwrap();
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1211,7 +1506,7 @@ async fn resume_after_stream_verified_should_retry_receive_not_silently_succeed(
     // work dir instead of re-fetching it from S3 (whose retrieved copy may have expired).
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .times(1)
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
@@ -1295,10 +1590,13 @@ async fn restore_should_resume_partially_downloaded_part() {
         .unwrap();
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1319,7 +1617,7 @@ async fn restore_should_resume_partially_downloaded_part() {
     let half = encrypted_bytes.len() as u64 / 2;
     let restore_dir = work_dir
         .path()
-        .join("restore-movies-level0-2026-06-02T00:00:00Z");
+        .join("restore-movies-level0-2026-06-02T00:00");
     std::fs::create_dir_all(&restore_dir).unwrap();
     std::fs::write(
         restore_dir.join("part-000000.age"),
@@ -1340,7 +1638,7 @@ async fn restore_should_resume_partially_downloaded_part() {
     let mut seeded = RestoreState {
         task_name: task.name.clone(),
         level: 0,
-        timestamp: "2026-06-02T00:00:00Z".to_string(),
+        timestamp: "2026-06-02T00:00".to_string(),
         snapshot_name: backup_manifest.snapshot_name.clone(),
         manifest_blake3: stream_hash,
         parts,
@@ -1362,7 +1660,7 @@ async fn restore_should_resume_partially_downloaded_part() {
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     // Only the missing byte range may be fetched — exactly once, starting at the saved
     // offset. Any request for start == 0 would mean the resume was lost.
@@ -1428,10 +1726,13 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     let target_dir = work_dir.path().join("restore_target");
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1452,7 +1753,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     // reports NotRequested for it, not Ready).
     let restore_dir = work_dir
         .path()
-        .join("restore-movies-level0-2026-06-02T00:00:00Z");
+        .join("restore-movies-level0-2026-06-02T00:00");
     std::fs::create_dir_all(&restore_dir).unwrap();
     let mut parts = BTreeMap::new();
     parts.insert(
@@ -1468,7 +1769,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     let mut seeded = RestoreState {
         task_name: task.name.clone(),
         level: 0,
-        timestamp: "2026-06-02T00:00:00Z".to_string(),
+        timestamp: "2026-06-02T00:00".to_string(),
         snapshot_name: backup_manifest.snapshot_name.clone(),
         manifest_blake3: "irrelevant".to_string(),
         parts,
@@ -1482,7 +1783,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
 
     let mut remote = MockRemote::new();
     remote.expect_restore_status_detail().returning(|key| {
-        let status = if key.contains("task_manifest") {
+        let status = if key.contains("/manifest.yaml") {
             RestoreStatus::Ready
         } else {
             RestoreStatus::NotRequested
@@ -1494,7 +1795,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     // The request must go out despite the budget being far smaller than the part.
     remote
@@ -1575,10 +1876,13 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
         .unwrap();
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1608,7 +1912,7 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
 
     let mut remote = MockRemote::new();
     remote.expect_restore_status_detail().returning(|key| {
-        let status = if key.contains("task_manifest") || key.contains("000000") {
+        let status = if key.contains("/manifest.yaml") || key.contains("000000") {
             RestoreStatus::Ready
         } else {
             RestoreStatus::NotRequested
@@ -1620,7 +1924,7 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_download_range_to_file()
@@ -1681,10 +1985,13 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
     let target_dir = work_dir.path().join("restore_target");
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1702,7 +2009,7 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
 
     let mut remote = MockRemote::new();
     remote.expect_restore_status_detail().returning(|key| {
-        let status = if key.contains("task_manifest") {
+        let status = if key.contains("/manifest.yaml") {
             RestoreStatus::Ready
         } else {
             RestoreStatus::NotRequested
@@ -1714,7 +2021,7 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     // Despite the budget being far smaller than the part, exactly one request must go out —
     // not zero (the stall) and not a loop requesting it repeatedly within the same run.
@@ -1775,10 +2082,13 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
         .unwrap();
 
     let backup_manifest = Backup {
-        timestamp: "2026-06-02T14:30:00Z".to_string(),
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
         level: 0,
         snapshot_name: "bcb_level0.20260602T1430".to_string(),
         parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
         age_public_key: String::new(),
@@ -1810,7 +2120,7 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
     });
     remote
         .expect_download()
-        .withf(|key| key.contains("task_manifest"))
+        .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest_yaml.clone()));
     remote
         .expect_download_range_to_file()

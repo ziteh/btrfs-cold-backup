@@ -6,11 +6,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     BtrfsOps, Config, RemoteBackend, Task,
     crypto::{blake3_file, encrypt_file},
-    manifest::{Backup, LatestBackup, LatestByLevel, PartInfo, SystemInfo},
+    manifest::{
+        Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo, parse_backup,
+        parse_latest,
+    },
     state::{BackupState, UploadedPart, read_backup_state},
     util::{
         IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, s3_backup_key,
-        s3_last_manifest_key, s3_manifest_key, sanitize_subvolume_path, state_path,
+        s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path, state_path,
     },
 };
 
@@ -46,7 +49,7 @@ fn snapshot_timestamp(name: &str) -> Result<String> {
         return Err(err());
     }
     Ok(format!(
-        "{}-{}-{}T{}:{}:00Z",
+        "{}-{}-{}T{}:{}",
         &date[0..4],
         &date[4..6],
         &date[6..8],
@@ -85,32 +88,48 @@ struct BackupPlan {
     snapshot_name: String,
     timestamp: String,
     parent_snapshot: Option<String>,
+    source_uuid: String,
+    snapshot_uuid: String,
     output_dir: PathBuf,
     manifest_key: String,
 }
 
-/// Determines the incremental parent for a level > 0 backup from the last manifest;
-/// level 0 has none.
-async fn resolve_parent<R: RemoteBackend>(
+/// Determines the incremental parent for a level > 0 backup from the latest manifest;
+/// level 0 has none. The parent is matched by UUID, not just name, so a same-named snapshot
+/// of another subvolume can't silently become the base of an incremental.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
+    btrfs: &B,
     remote: &R,
-    last_key: &str,
+    task: &Task,
+    latest_key: &str,
     snapshots: &[String],
     level: u32,
     snapshot_name: &str,
     timestamp: &str,
+    source_uuid: &str,
 ) -> Result<Option<String>> {
     if level == 0 {
         return Ok(None);
     }
-    if !remote.exists(last_key).await? {
+    if !remote.exists(latest_key).await? {
         return Err(anyhow!(
             "no previous backup; level {level} requires a prior level 0 backup"
         ));
     }
-    let last: LatestByLevel = serde_yaml::from_slice(&remote.download(last_key).await?)?;
-    let parent = last.get(&(level - 1)).ok_or_else(|| {
+    let latest = parse_latest(&remote.download(latest_key).await?)
+        .map_err(|e| anyhow!("failed to parse latest manifest {latest_key}: {e}"))?;
+    if latest.source_uuid != source_uuid {
+        return Err(anyhow!(
+            "latest manifest {latest_key} belongs to subvolume UUID {}, but {:?} is \
+             {source_uuid}; if the source was replaced, start a new chain with a level 0 backup",
+            latest.source_uuid,
+            task.subvolume
+        ));
+    }
+    let parent = latest.levels.get(&(level - 1)).ok_or_else(|| {
         anyhow!(
-            "no level {} entry in last manifest; run a level {} backup first",
+            "no level {} entry in latest manifest; run a level {} backup first",
             level - 1,
             level - 1
         )
@@ -119,6 +138,18 @@ async fn resolve_parent<R: RemoteBackend>(
         return Err(anyhow!(
             "parent snapshot '{}' not found locally",
             parent.snapshot_name
+        ));
+    }
+    let local_parent = btrfs
+        .subvolume_uuids(&task.snapshot_dir.join(&parent.snapshot_name))
+        .await?;
+    if local_parent.uuid != parent.snapshot_uuid {
+        return Err(anyhow!(
+            "local snapshot '{}' has UUID {}, but the backed-up parent of that name has {}; \
+             it is a different snapshot and cannot serve as the incremental base",
+            parent.snapshot_name,
+            local_parent.uuid,
+            parent.snapshot_uuid
         ));
     }
     if timestamp <= parent.timestamp.as_str() {
@@ -150,6 +181,8 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
             snapshot_name: state.inner.snapshot_name.clone(),
             timestamp,
             parent_snapshot: state.inner.parent_snapshot.clone(),
+            source_uuid: state.inner.source_uuid.clone(),
+            snapshot_uuid: state.inner.snapshot_uuid.clone(),
             output_dir: state.inner.output_dir.clone(),
         }));
     }
@@ -163,25 +196,56 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
         .clone();
     let timestamp = snapshot_timestamp(&snapshot_name)?;
 
+    let source = btrfs.subvolume_uuids(&task.subvolume).await?;
+    let snapshot = btrfs
+        .subvolume_uuids(&task.snapshot_dir.join(&snapshot_name))
+        .await?;
+    if snapshot.parent_uuid.as_deref() != Some(source.uuid.as_str()) {
+        return Err(anyhow!(
+            "snapshot '{snapshot_name}' was not taken from {:?} (its Parent UUID is {}, the \
+             subvolume's UUID is {}); check that snapshot_dir holds this subvolume's snapshots",
+            task.subvolume,
+            snapshot.parent_uuid.as_deref().unwrap_or("-"),
+            source.uuid
+        ));
+    }
+
     // A manifest already on remote means this snapshot is fully backed up: skip rather than
     // redo it — overwriting archived objects incurs minimum-storage-duration charges, and a
     // skip keeps re-runs idempotent so one completed task never blocks the others.
     let manifest_key = s3_manifest_key(&config.s3.prefix, &sanitized, level, &timestamp);
     if remote.exists(&manifest_key).await? {
+        let existing = parse_backup(&remote.download(&manifest_key).await?)
+            .map_err(|e| anyhow!("failed to parse manifest {manifest_key}: {e}"))?;
+        if existing.source_uuid != source.uuid || existing.snapshot_uuid != snapshot.uuid {
+            return Err(anyhow!(
+                "manifest {manifest_key} records a different snapshot (subvolume UUID {}, \
+                 snapshot UUID {}) than local '{snapshot_name}' (subvolume UUID {}, snapshot \
+                 UUID {}); s3.bucket/s3.prefix may be wrong, or another host writes to the \
+                 same location",
+                existing.source_uuid,
+                existing.snapshot_uuid,
+                source.uuid,
+                snapshot.uuid
+            ));
+        }
         tracing::info!(
             "snapshot '{snapshot_name}' is already backed up at level {level}, skipping"
         );
         return Ok(None);
     }
 
-    let last_key = s3_last_manifest_key(&config.s3.prefix, &sanitized);
+    let latest_key = s3_latest_manifest_key(&config.s3.prefix, &sanitized);
     let parent_snapshot = resolve_parent(
+        btrfs,
         remote,
-        &last_key,
+        task,
+        &latest_key,
         &snapshots,
         level,
         &snapshot_name,
         &timestamp,
+        &source.uuid,
     )
     .await?;
     let output_dir = backup_output_dir(&config.base_dir, &sanitized, level, &timestamp);
@@ -190,6 +254,8 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     state.inner.level = level;
     state.inner.snapshot_name = snapshot_name.clone();
     state.inner.parent_snapshot = parent_snapshot.clone();
+    state.inner.source_uuid = source.uuid.clone();
+    state.inner.snapshot_uuid = snapshot.uuid.clone();
     state.inner.timestamp = timestamp.clone();
     state.inner.output_dir = output_dir.clone();
     state.save()?;
@@ -198,6 +264,8 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
         snapshot_name,
         timestamp,
         parent_snapshot,
+        source_uuid: source.uuid,
+        snapshot_uuid: snapshot.uuid,
         output_dir,
         manifest_key,
     }))
@@ -518,11 +586,14 @@ async fn build_manifest(
     parts.sort_by(|a, b| a.index.cmp(&b.index));
 
     Backup {
+        format_version: FORMAT_VERSION.to_string(),
         timestamp: plan.timestamp.clone(),
         created_at: crate::util::now_unix(),
         level,
         snapshot_name: plan.snapshot_name.clone(),
         parent_snapshot: plan.parent_snapshot.clone(),
+        source_uuid: plan.source_uuid.clone(),
+        snapshot_uuid: plan.snapshot_uuid.clone(),
         system: SystemInfo {
             os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             btrfs_version: crate::btrfs::btrfs_version().await,
@@ -546,29 +617,48 @@ async fn publish_latest<R: RemoteBackend>(
     level: u32,
     plan: &BackupPlan,
 ) -> Result<()> {
-    let last_key = s3_last_manifest_key(&config.s3.prefix, sanitized);
-    let mut latest: LatestByLevel = if remote.exists(&last_key).await? {
-        // A corrupted last manifest must not be silently reset: dropping other levels'
+    let latest_key = s3_latest_manifest_key(&config.s3.prefix, sanitized);
+    let existing = if remote.exists(&latest_key).await? {
+        // A corrupted latest manifest must not be silently reset: dropping other levels'
         // entries would break subsequent incremental backups without warning.
-        serde_yaml::from_slice(&remote.download(&last_key).await?).map_err(|e| {
-            anyhow!("failed to parse last manifest {last_key}: {e}; repair or delete it manually")
-        })?
+        Some(parse_latest(&remote.download(&latest_key).await?).map_err(|e| {
+            anyhow!("failed to parse latest manifest {latest_key}: {e}; repair or delete it manually")
+        })?)
     } else {
-        LatestByLevel::default()
+        None
     };
 
-    latest.retain(|&existing_level, _| existing_level <= level);
-    latest.insert(
+    // resolve_parent rejects a foreign latest manifest for level > 0, so a mismatch here is
+    // a level 0 backup of a replaced source, which starts a new chain.
+    let mut latest = match existing {
+        Some(l) if l.source_uuid == plan.source_uuid => l,
+        Some(l) => {
+            tracing::warn!(
+                "latest manifest {latest_key} was for subvolume UUID {}, replacing it with a \
+                 new chain for {}",
+                l.source_uuid,
+                plan.source_uuid
+            );
+            LatestManifest::new(plan.source_uuid.clone())
+        }
+        None => LatestManifest::new(plan.source_uuid.clone()),
+    };
+
+    latest
+        .levels
+        .retain(|&existing_level, _| existing_level <= level);
+    latest.levels.insert(
         level,
         LatestBackup {
             timestamp: plan.timestamp.clone(),
             snapshot_name: plan.snapshot_name.clone(),
+            snapshot_uuid: plan.snapshot_uuid.clone(),
         },
     );
 
     remote
         .upload_bytes(
-            &last_key,
+            &latest_key,
             serde_yaml::to_string(&latest)?.into_bytes(),
             &config.s3.storage_class.manifest,
             "bcb-backup-level=manifest",
@@ -665,7 +755,7 @@ mod tests {
     #[test]
     fn test_snapshot_timestamp_valid_name() {
         let ts = snapshot_timestamp("bcb_level1.20260602T1430").unwrap();
-        assert_eq!(ts, "2026-06-02T14:30:00Z");
+        assert_eq!(ts, "2026-06-02T14:30");
     }
 
     #[test]

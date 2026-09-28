@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
-use crate::{BtrfsOps, Config, RemoteBackend};
+use crate::{BtrfsOps, Config, RemoteBackend, Task};
 
 /// Verifies the external executables bcb shells out to are present on PATH.
 pub fn check_binaries() -> Result<()> {
@@ -45,13 +45,10 @@ pub async fn check<B: BtrfsOps, R: RemoteBackend>(
         if !task.enabled {
             continue;
         }
-        if !btrfs.subvolume_exists(&task.subvolume).await? {
-            return Err(anyhow!(
-                "task '{}': subvolume {:?} does not exist",
-                task.name,
-                task.subvolume
-            ));
-        }
+        let source = btrfs
+            .subvolume_uuids(&task.subvolume)
+            .await
+            .map_err(|e| anyhow!("task '{}': {e}", task.name))?;
         match tokio::fs::metadata(&task.snapshot_dir).await {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => {
@@ -69,6 +66,7 @@ pub async fn check<B: BtrfsOps, R: RemoteBackend>(
                 ));
             }
         }
+        check_newest_snapshot_origin(btrfs, task, &source.uuid).await?;
     }
 
     remote.verify_credentials().await?;
@@ -76,10 +74,41 @@ pub async fn check<B: BtrfsOps, R: RemoteBackend>(
     Ok(())
 }
 
+/// Catches a snapshot_dir that holds another subvolume's snapshots before a backup does.
+async fn check_newest_snapshot_origin<B: BtrfsOps>(
+    btrfs: &B,
+    task: &Task,
+    source_uuid: &str,
+) -> Result<()> {
+    let snapshots = btrfs.list_snapshots(&task.snapshot_dir).await?;
+    // Names are bcb_level<N>.<timestamp>; compare by timestamp so level doesn't dominate.
+    let Some(newest) = snapshots
+        .iter()
+        .max_by_key(|s| s.split_once('.').map(|(_, ts)| ts))
+    else {
+        return Ok(());
+    };
+    let snapshot = btrfs
+        .subvolume_uuids(&task.snapshot_dir.join(newest))
+        .await
+        .map_err(|e| anyhow!("task '{}': {e}", task.name))?;
+    if snapshot.parent_uuid.as_deref() != Some(source_uuid) {
+        return Err(anyhow!(
+            "task '{}': snapshot '{newest}' was not taken from {:?} (its Parent UUID is {}, the \
+             subvolume's UUID is {source_uuid}); check that snapshot_dir holds this subvolume's \
+             snapshots",
+            task.name,
+            task.subvolume,
+            snapshot.parent_uuid.as_deref().unwrap_or("-"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::btrfs::MockBtrfsOps;
+    use crate::btrfs::{MockBtrfsOps, SubvolumeUuids};
     use crate::config::{S3Config, S3StorageClass, Task};
     use crate::remote::MockRemoteBackend;
     use std::os::unix::fs::PermissionsExt;
@@ -169,16 +198,66 @@ mod tests {
         assert!(check(&config, &btrfs, &remote).await.is_err());
     }
 
+    const SOURCE_UUID: &str = "src-uuid";
+
+    /// The subvolume has SOURCE_UUID; every snapshot's parent is `snapshot_parent`.
+    fn btrfs_with_snapshots(snapshots: &[&str], snapshot_parent: &'static str) -> MockBtrfsOps {
+        let snapshots: Vec<String> = snapshots.iter().map(|s| s.to_string()).collect();
+        let mut btrfs = MockBtrfsOps::new();
+        btrfs
+            .expect_list_snapshots()
+            .returning(move |_| Ok(snapshots.clone()));
+        btrfs.expect_subvolume_uuids().returning(move |path| {
+            Ok(if path == Path::new("/mnt/data") {
+                SubvolumeUuids {
+                    uuid: SOURCE_UUID.to_string(),
+                    parent_uuid: None,
+                }
+            } else {
+                SubvolumeUuids {
+                    uuid: format!("uuid-of-{}", path.display()),
+                    parent_uuid: Some(snapshot_parent.to_string()),
+                }
+            })
+        });
+        btrfs
+    }
+
     #[tokio::test]
     async fn test_check_fails_when_subvolume_missing() {
         let config = valid_config(PathBuf::from("/mnt/snapshots"));
 
         let mut btrfs = MockBtrfsOps::new();
-        btrfs.expect_subvolume_exists().returning(|_| Ok(false));
+        btrfs
+            .expect_subvolume_uuids()
+            .returning(|_| Err(anyhow::anyhow!("\"/mnt/data\" is not a btrfs subvolume")));
         let remote = MockRemoteBackend::new();
 
         let err = check(&config, &btrfs, &remote).await.unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
+        assert!(err.to_string().contains("not a btrfs subvolume"));
+    }
+
+    #[tokio::test]
+    async fn test_check_fails_when_newest_snapshot_is_from_another_subvolume() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path().to_path_buf());
+
+        let btrfs = btrfs_with_snapshots(
+            &["bcb_level1.20260602T1430", "bcb_level0.20260603T1430"],
+            "other-subvol-uuid",
+        );
+        let remote = MockRemoteBackend::new();
+
+        let err = check(&config, &btrfs, &remote).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was not taken from"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("bcb_level0.20260603T1430"),
+            "not the newest: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -201,8 +280,7 @@ mod tests {
         std::fs::write(&not_a_dir, b"oops").unwrap();
         let config = valid_config(not_a_dir);
 
-        let mut btrfs = MockBtrfsOps::new();
-        btrfs.expect_subvolume_exists().returning(|_| Ok(true));
+        let btrfs = btrfs_with_snapshots(&[], SOURCE_UUID);
         let remote = MockRemoteBackend::new();
 
         let err = check(&config, &btrfs, &remote).await.unwrap_err();
@@ -213,8 +291,7 @@ mod tests {
     async fn test_check_fails_when_snapshot_dir_missing() {
         let config = valid_config(PathBuf::from("/nonexistent/snapshot/dir/for/bcb/test"));
 
-        let mut btrfs = MockBtrfsOps::new();
-        btrfs.expect_subvolume_exists().returning(|_| Ok(true));
+        let btrfs = btrfs_with_snapshots(&[], SOURCE_UUID);
         let remote = MockRemoteBackend::new();
 
         let err = check(&config, &btrfs, &remote).await.unwrap_err();
@@ -226,8 +303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = valid_config(dir.path().to_path_buf());
 
-        let mut btrfs = MockBtrfsOps::new();
-        btrfs.expect_subvolume_exists().returning(|_| Ok(true));
+        let btrfs = btrfs_with_snapshots(&["bcb_level0.20260602T1430"], SOURCE_UUID);
         let mut remote = MockRemoteBackend::new();
         remote.expect_verify_credentials().returning(|| Ok(()));
 
@@ -239,8 +315,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = valid_config(dir.path().to_path_buf());
 
-        let mut btrfs = MockBtrfsOps::new();
-        btrfs.expect_subvolume_exists().returning(|_| Ok(true));
+        let btrfs = btrfs_with_snapshots(&[], SOURCE_UUID);
         let mut remote = MockRemoteBackend::new();
         remote
             .expect_verify_credentials()

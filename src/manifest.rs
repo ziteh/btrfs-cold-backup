@@ -1,5 +1,10 @@
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+
+/// Shared by [`Backup`] and [`LatestManifest`]. Readers reject any other major version; a
+/// minor bump may only add fields that have a serde default, so older readers still parse it.
+pub const FORMAT_VERSION: &str = "1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartInfo {
@@ -19,12 +24,17 @@ pub struct SystemInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Backup {
+    pub format_version: String,
     pub timestamp: String,
     /// Unix time when the backup ran (`timestamp` is the snapshot's, not the run's).
     pub created_at: i64,
     pub level: u32,
     pub snapshot_name: String,
     pub parent_snapshot: Option<String>,
+    /// btrfs UUID of the backed-up subvolume.
+    pub source_uuid: String,
+    /// btrfs UUID of the snapshot that was sent.
+    pub snapshot_uuid: String,
     pub system: SystemInfo,
     pub age_public_key: String,
     pub total_size_bytes: u64,
@@ -36,124 +46,147 @@ pub struct Backup {
 pub struct LatestBackup {
     pub timestamp: String,
     pub snapshot_name: String,
+    pub snapshot_uuid: String,
 }
 
-/// The newest backup of each level, keyed by level. Callers rely on the key being the level:
-/// completing a level-N backup drops every entry above N, whose incremental chain it voided.
-pub type LatestByLevel = HashMap<u32, LatestBackup>;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatestManifest {
+    pub format_version: String,
+    pub source_uuid: String,
+    /// The newest backup of each level, keyed by level. Callers rely on the key being the
+    /// level: completing a level-N backup drops every entry above N, whose incremental chain
+    /// it voided.
+    pub levels: BTreeMap<u32, LatestBackup>,
+}
+
+impl LatestManifest {
+    pub fn new(source_uuid: String) -> Self {
+        Self {
+            format_version: FORMAT_VERSION.to_string(),
+            source_uuid,
+            levels: BTreeMap::new(),
+        }
+    }
+}
+
+// Probed before the full parse so a manifest from an unknown major version is reported as
+// such, not as whatever field mismatch that version happens to trip first.
+#[derive(Deserialize)]
+struct VersionProbe {
+    format_version: Option<String>,
+}
+
+fn major(version: &str) -> &str {
+    version.split('.').next().unwrap_or(version)
+}
+
+fn check_format_version(bytes: &[u8]) -> Result<()> {
+    let probe: VersionProbe = serde_yaml::from_slice(bytes)?;
+    let version = probe
+        .format_version
+        .ok_or_else(|| anyhow!("manifest has no format_version"))?;
+    if major(&version) != major(FORMAT_VERSION) {
+        return Err(anyhow!(
+            "manifest format_version {version} is not supported (this bcb reads {}.x)",
+            major(FORMAT_VERSION)
+        ));
+    }
+    Ok(())
+}
+
+pub fn parse_backup(bytes: &[u8]) -> Result<Backup> {
+    check_format_version(bytes)?;
+    Ok(serde_yaml::from_slice(bytes)?)
+}
+
+pub fn parse_latest(bytes: &[u8]) -> Result<LatestManifest> {
+    check_format_version(bytes)?;
+    Ok(serde_yaml::from_slice(bytes)?)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_part_info_serialize_deserialize() {
-        let part = PartInfo {
-            index: "000000".to_string(),
-            size_bytes: 1024,
-            blake3: "abc123".to_string(),
-        };
-        let yaml = serde_yaml::to_string(&part).unwrap();
-        let deserialized: PartInfo = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(part, deserialized);
-    }
-
-    #[test]
-    fn test_backup_serialize_deserialize() {
-        let backup = Backup {
-            timestamp: "2026-06-02T14:30:00Z".to_string(),
-            level: 0,
-            snapshot_name: "bcb_level0.20260602T1430".to_string(),
-            parent_snapshot: None,
+    fn sample_backup(level: u32, parent: Option<&str>) -> Backup {
+        Backup {
+            format_version: FORMAT_VERSION.to_string(),
+            timestamp: "2026-06-02T14:30".to_string(),
             created_at: 0,
+            level,
+            snapshot_name: format!("bcb_level{level}.20260602T1430"),
+            parent_snapshot: parent.map(str::to_string),
+            source_uuid: "src-uuid".to_string(),
+            snapshot_uuid: "snap-uuid".to_string(),
             system: SystemInfo::default(),
             age_public_key: String::new(),
-            total_size_bytes: 5120,
+            total_size_bytes: 1024,
             blake3: "def456".to_string(),
-            parts: vec![
-                PartInfo {
-                    index: "000000".to_string(),
-                    size_bytes: 1024,
-                    blake3: "part1".to_string(),
-                },
-                PartInfo {
-                    index: "000001".to_string(),
-                    size_bytes: 1024,
-                    blake3: "part2".to_string(),
-                },
-            ],
-        };
-        let yaml = serde_yaml::to_string(&backup).unwrap();
-        let deserialized: Backup = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(backup, deserialized);
-    }
-
-    #[test]
-    fn test_backup_with_parent() {
-        let backup = Backup {
-            timestamp: "2026-06-02T15:30:00Z".to_string(),
-            level: 1,
-            snapshot_name: "bcb_level1.20260602T1530".to_string(),
-            parent_snapshot: Some("bcb_level0.20260602T1430".to_string()),
-            created_at: 0,
-            system: SystemInfo::default(),
-            age_public_key: String::new(),
-            total_size_bytes: 2048,
-            blake3: "ghi789".to_string(),
             parts: vec![PartInfo {
                 index: "000000".to_string(),
-                size_bytes: 2048,
-                blake3: "incr_part1".to_string(),
+                size_bytes: 1024,
+                blake3: "part1".to_string(),
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn test_backup_round_trip() {
+        let backup = sample_backup(1, Some("bcb_level0.20260601T1430"));
         let yaml = serde_yaml::to_string(&backup).unwrap();
-        let deserialized: Backup = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(backup, deserialized);
-        assert_eq!(
-            deserialized.parent_snapshot,
-            Some("bcb_level0.20260602T1430".to_string())
+        assert_eq!(parse_backup(yaml.as_bytes()).unwrap(), backup);
+    }
+
+    #[test]
+    fn test_backup_null_parent_round_trip() {
+        let backup = sample_backup(0, None);
+        let yaml = serde_yaml::to_string(&backup).unwrap();
+        assert!(
+            parse_backup(yaml.as_bytes())
+                .unwrap()
+                .parent_snapshot
+                .is_none()
         );
     }
 
     #[test]
-    fn test_last_serialize_deserialize() {
-        let mut last: LatestByLevel = HashMap::new();
-        last.insert(
+    fn test_latest_round_trip() {
+        let mut latest = LatestManifest::new("src-uuid".to_string());
+        latest.levels.insert(
             0,
             LatestBackup {
-                timestamp: "2026-06-02T14:30:00Z".to_string(),
+                timestamp: "2026-06-02T14:30".to_string(),
                 snapshot_name: "bcb_level0.20260602T1430".to_string(),
+                snapshot_uuid: "snap-uuid".to_string(),
             },
         );
-        last.insert(
-            1,
-            LatestBackup {
-                timestamp: "2026-06-02T15:30:00Z".to_string(),
-                snapshot_name: "bcb_level1.20260602T1530".to_string(),
-            },
-        );
-        let yaml = serde_yaml::to_string(&last).unwrap();
-        let deserialized: LatestByLevel = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(last, deserialized);
+        let yaml = serde_yaml::to_string(&latest).unwrap();
+        assert_eq!(parse_latest(yaml.as_bytes()).unwrap(), latest);
     }
 
     #[test]
-    fn test_backup_null_parent_roundtrip() {
-        let backup = Backup {
-            timestamp: "2026-06-02T14:30:00Z".to_string(),
-            level: 0,
-            snapshot_name: "bcb_level0.20260602T1430".to_string(),
-            parent_snapshot: None,
-            created_at: 0,
-            system: SystemInfo::default(),
-            age_public_key: String::new(),
-            total_size_bytes: 5120,
-            blake3: "def456".to_string(),
-            parts: vec![],
-        };
-        let yaml = serde_yaml::to_string(&backup).unwrap();
-        let deserialized: Backup = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(backup.parent_snapshot, deserialized.parent_snapshot);
-        assert!(deserialized.parent_snapshot.is_none());
+    fn test_parse_accepts_newer_minor_with_unknown_field() {
+        let mut backup = sample_backup(0, None);
+        backup.format_version = format!("{}.99", major(FORMAT_VERSION));
+        let mut yaml = serde_yaml::to_string(&backup).unwrap();
+        yaml.push_str("added_in_minor: true\n");
+        assert!(parse_backup(yaml.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_major_version() {
+        let yaml = "format_version: '999.0'\nsomething_else: 1\n";
+        let err = parse_backup(yaml.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("not supported"), "unexpected error: {err}");
+        assert!(parse_latest(yaml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_missing_format_version() {
+        let mut value = serde_yaml::to_value(sample_backup(0, None)).unwrap();
+        value.as_mapping_mut().unwrap().remove("format_version");
+        let yaml = serde_yaml::to_string(&value).unwrap();
+        let err = parse_backup(yaml.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("no format_version"), "unexpected error: {err}");
     }
 }
