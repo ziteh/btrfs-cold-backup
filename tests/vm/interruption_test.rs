@@ -247,10 +247,12 @@ fn no_process_matches(pgrep_args: &[&str]) -> bool {
 }
 
 /// Polls until no btrfs-send process remains, or returns false on timeout.
-fn wait_no_orphan_children(timeout: Duration) -> bool {
+// Matches on this fixture's snapshot dir, since other tests run btrfs send concurrently.
+fn wait_no_orphan_children(snap_dir: &Path, timeout: Duration) -> bool {
+    let pattern = format!("btrfs.*send.*{}", snap_dir.display());
     let deadline = Instant::now() + timeout;
     loop {
-        if no_process_matches(&["-f", "btrfs.*send"]) {
+        if no_process_matches(&["-f", &pattern]) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -508,7 +510,7 @@ async fn kill_during_send_then_resume_should_leave_no_orphan_children() {
     child.wait().unwrap();
 
     assert!(
-        wait_no_orphan_children(Duration::from_secs(5)),
+        wait_no_orphan_children(&fixture.snap_dir, Duration::from_secs(5)),
         "btrfs send processes survived the parent's SIGKILL"
     );
 

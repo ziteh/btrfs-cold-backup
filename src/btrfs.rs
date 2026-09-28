@@ -60,6 +60,8 @@ struct BtrfsStream {
     status_rx: oneshot::Receiver<io::Result<(ExitStatus, Vec<u8>)>>,
     _kill_tx: oneshot::Sender<()>,
     stdout_done: bool,
+    // The oneshot panics if polled again after completing, and readers may hit EOF twice.
+    exited: bool,
 }
 
 impl Unpin for BtrfsStream {}
@@ -104,19 +106,23 @@ impl AsyncRead for BtrfsStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        if this.stdout_done {
-            return Self::poll_exit(&mut this.status_rx, cx);
+        if this.exited {
+            return Poll::Ready(Ok(()));
         }
-
-        let filled_before = buf.filled().len();
-        let result = this.stdout.as_mut().poll_read(cx, buf);
-        match result {
-            Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
-                this.stdout_done = true;
-                Self::poll_exit(&mut this.status_rx, cx)
+        if !this.stdout_done {
+            let filled_before = buf.filled().len();
+            match this.stdout.as_mut().poll_read(cx, buf) {
+                Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
+                    this.stdout_done = true;
+                }
+                other => return other,
             }
-            other => other,
         }
+        let result = Self::poll_exit(&mut this.status_rx, cx);
+        if result.is_ready() {
+            this.exited = true;
+        }
+        result
     }
 }
 
@@ -174,6 +180,7 @@ fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
         status_rx,
         _kill_tx: kill_tx,
         stdout_done: false,
+        exited: false,
     }))
 }
 
@@ -280,11 +287,32 @@ mod tests {
             status_rx,
             _kill_tx: kill_tx,
             stdout_done: false,
+            exited: false,
         };
 
         let mut buf = Vec::new();
         assert!(stream.read_to_end(&mut buf).await.is_err());
         child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_after_eof_stays_at_eof() {
+        let mut child = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
+        let (status_tx, status_rx) = oneshot::channel();
+        let status = child.wait().await.unwrap();
+        status_tx.send(Ok((status, Vec::new()))).unwrap();
+        let (kill_tx, _kill_rx) = oneshot::channel();
+        let mut stream = BtrfsStream {
+            stdout: Box::pin(child.stdout.take().unwrap()),
+            status_rx,
+            _kill_tx: kill_tx,
+            stdout_done: false,
+            exited: false,
+        };
+
+        let mut buf = [0u8; 8];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
     }
 
     #[test]
