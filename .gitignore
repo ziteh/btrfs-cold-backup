@@ -12,6 +12,7 @@ logs/
 *.log
 .env
 .env.local
+*.local.*
 
 # OS
 .DS_Store
