@@ -34,7 +34,7 @@ async fn multi_part_backup_and_restore_should_round_trip() {
             "--task",
             &fixture.task_name,
         ])
-        .env("BCB_TEST_SPLIT_SIZE", "4M")
+        .env("BCB_TEST_SPLIT_SIZE", (4 * 1024 * 1024).to_string())
         .output()
         .unwrap();
     assert!(

@@ -311,15 +311,21 @@ async fn test_pause_during_send() {
 #[cfg(not(debug_assertions))]
 async fn test_pause_during_send() {}
 
-// Test-only override so multi-part backups can be exercised without multi-GiB fixtures.
+const SPLIT_PART_SIZE: u64 = 3 * 1024 * 1024 * 1024;
+
+// Test-only override (in bytes) so multi-part backups can be exercised without multi-GiB
+// fixtures.
 #[cfg(debug_assertions)]
-fn split_part_size() -> String {
-    std::env::var("BCB_TEST_SPLIT_SIZE").unwrap_or_else(|_| "3G".to_string())
+fn split_part_size() -> u64 {
+    std::env::var("BCB_TEST_SPLIT_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SPLIT_PART_SIZE)
 }
 
 #[cfg(not(debug_assertions))]
-fn split_part_size() -> String {
-    "3G".to_string()
+fn split_part_size() -> u64 {
+    SPLIT_PART_SIZE
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -351,11 +357,19 @@ async fn snapshot_size_bytes(path: &Path) -> Result<u64> {
         .map_err(|e| anyhow!("failed to parse du output '{size_str}' for {:?}: {e}", path))
 }
 
-fn ensure_enough_space(available: u64, required: u64, snapshot_path: &Path) -> Result<()> {
+/// One part more than the snapshot is needed: while a part is encrypted, its raw file and its
+/// `.age` file exist side by side.
+fn ensure_enough_space(
+    available: u64,
+    snapshot_size: u64,
+    part_size: u64,
+    snapshot_path: &Path,
+) -> Result<()> {
+    let required = snapshot_size + part_size;
     if available < required {
         return Err(anyhow!(
             "insufficient free space for base_dir: {:.1} GiB available, ~{:.1} GiB needed \
-             (estimated from the size of {:?}); free up space or point base_dir at a larger \
+             (estimated from the size of {:?} plus one part); free up space or point base_dir at a larger \
              filesystem before retrying",
             available as f64 / GIB,
             required as f64 / GIB,
@@ -371,7 +385,7 @@ fn ensure_enough_space(available: u64, required: u64, snapshot_path: &Path) -> R
 /// or an unsupported flag on a non-Linux `du`), so a failure to estimate only skips the
 /// check — it must never block a backup that might otherwise have succeeded.
 async fn check_available_space(snapshot_path: &Path, output_dir: &Path) -> Result<()> {
-    let required = match snapshot_size_bytes(snapshot_path).await {
+    let snapshot_size = match snapshot_size_bytes(snapshot_path).await {
         Ok(size) => size,
         Err(e) => {
             tracing::warn!("could not estimate snapshot size, skipping free-space check: {e}");
@@ -380,7 +394,7 @@ async fn check_available_space(snapshot_path: &Path, output_dir: &Path) -> Resul
     };
     // output_dir was just created under base_dir, so it's on the same filesystem.
     let available = available_space_bytes(output_dir)?;
-    ensure_enough_space(available, required, snapshot_path)
+    ensure_enough_space(available, snapshot_size, split_part_size(), snapshot_path)
 }
 
 async fn send_and_split<B: BtrfsOps>(
@@ -401,6 +415,25 @@ async fn send_and_split<B: BtrfsOps>(
     }
     tokio::fs::create_dir_all(output_dir).await?;
 
+    let result = send_into_parts(btrfs, task, snapshot_name, parent, output_dir, state).await;
+    // Without a recorded stream hash the next run starts over anyway; left behind, the parts
+    // would take space from the tasks that run after this one.
+    if result.is_err()
+        && let Err(e) = tokio::fs::remove_dir_all(output_dir).await
+    {
+        tracing::warn!("failed to clean up output dir {:?}: {e}", output_dir);
+    }
+    result
+}
+
+async fn send_into_parts<B: BtrfsOps>(
+    btrfs: &B,
+    task: &Task,
+    snapshot_name: &str,
+    parent: &Option<String>,
+    output_dir: &Path,
+    state: &mut PersistentState,
+) -> Result<String> {
     let snapshot_path = task.snapshot_dir.join(snapshot_name);
     check_available_space(&snapshot_path, output_dir).await?;
 
@@ -421,7 +454,7 @@ async fn send_and_split<B: BtrfsOps>(
     split_cmd
         .args([
             "-b",
-            &split_part_size(),
+            &split_part_size().to_string(),
             "-d",
             "-a",
             "6",
@@ -438,22 +471,28 @@ async fn send_and_split<B: BtrfsOps>(
     let mut split_child = split_cmd.spawn()?;
     test_pause_during_send().await;
 
-    let hash = {
+    // A failed write usually means split itself failed (e.g. ENOSPC), and then the write
+    // error is only a broken pipe; split's stderr below holds the actual cause.
+    let (hash, write_err) = {
         let mut split_stdin = split_child
             .stdin
             .take()
             .ok_or_else(|| anyhow!("failed to open split stdin"))?;
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; IO_BUF_SIZE];
+        let mut write_err = None;
         loop {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
-            split_stdin.write_all(&buf[..n]).await?;
+            if let Err(e) = split_stdin.write_all(&buf[..n]).await {
+                write_err = Some(e);
+                break;
+            }
         }
-        hasher.finalize().to_hex().to_string()
+        (hasher.finalize().to_hex().to_string(), write_err)
     };
 
     let split_out = split_child.wait_with_output().await?;
@@ -462,6 +501,9 @@ async fn send_and_split<B: BtrfsOps>(
             "split failed: {}",
             String::from_utf8_lossy(&split_out.stderr).trim()
         ));
+    }
+    if let Some(e) = write_err {
+        return Err(anyhow!("failed to write the send stream to split: {e}"));
     }
 
     // The state saved below claims these parts exist; after a power loss they must too.
@@ -852,17 +894,23 @@ mod tests {
 
     #[test]
     fn test_ensure_enough_space_sufficient_is_ok() {
-        assert!(ensure_enough_space(100, 50, Path::new("/snap")).is_ok());
+        assert!(ensure_enough_space(100, 50, 10, Path::new("/snap")).is_ok());
     }
 
     #[test]
-    fn test_ensure_enough_space_exactly_equal_is_ok() {
-        assert!(ensure_enough_space(50, 50, Path::new("/snap")).is_ok());
+    fn test_ensure_enough_space_exactly_snapshot_plus_part_is_ok() {
+        assert!(ensure_enough_space(60, 50, 10, Path::new("/snap")).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_enough_space_room_for_snapshot_only_is_err() {
+        assert!(ensure_enough_space(59, 50, 10, Path::new("/snap")).is_err());
+        assert!(ensure_enough_space(50, 50, 10, Path::new("/snap")).is_err());
     }
 
     #[test]
     fn test_ensure_enough_space_insufficient_is_err() {
-        let err = ensure_enough_space(10, 50, Path::new("/snap")).unwrap_err();
+        let err = ensure_enough_space(10, 50, 10, Path::new("/snap")).unwrap_err();
         assert!(err.to_string().contains("insufficient free space"));
     }
 }

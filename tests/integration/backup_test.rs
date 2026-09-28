@@ -166,6 +166,56 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
     assert!(backup.parent_snapshot.is_none());
 }
 
+struct FailingReader;
+
+impl AsyncRead for FailingReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::other("send died")))
+    }
+}
+
+/// A send that fails partway must not leave its parts behind to take space from the tasks
+/// that run after it.
+#[tokio::test]
+async fn failed_send_should_remove_output_dir() {
+    use tokio::io::AsyncReadExt;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let snap = "bcb_level0.20260602T1430";
+
+    let mut btrfs = btrfs_with_uuids();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(vec![snap.to_string()]));
+    btrfs.expect_send_full().returning(|_| {
+        Ok(Box::new(
+            Cursor::new(b"partial stream".to_vec()).chain(FailingReader),
+        ))
+    });
+
+    let mut remote = MockRemote::new();
+    remote.expect_exists().returning(|_| Ok(false));
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("send died"), "unexpected error: {err}");
+    assert!(
+        !work_dir
+            .path()
+            .join("task/mnt_data_movies/bcb_level0_202606021430")
+            .exists(),
+        "output_dir must be removed after a failed send"
+    );
+}
+
 /// When no snapshot exists for the requested level, backup must return an error without calling remote.
 #[tokio::test]
 async fn backup_should_fail_when_no_matching_snapshot() {
