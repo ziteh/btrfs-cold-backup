@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::util::now_unix;
+use crate::util::{now_unix, write_atomic};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadedPart {
@@ -31,10 +31,7 @@ pub struct BackupState {
 impl BackupState {
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.last_updated = now_unix();
-        let tmp = path.with_extension("yaml.tmp");
-        std::fs::write(&tmp, serde_yaml::to_string(self)?.as_bytes())?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_atomic(path, serde_yaml::to_string(self)?.as_bytes())
     }
 }
 
@@ -77,10 +74,7 @@ pub struct RestoreState {
 impl RestoreState {
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.last_updated = now_unix();
-        let tmp = path.with_extension("yaml.tmp");
-        std::fs::write(&tmp, serde_yaml::to_string(self)?.as_bytes())?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_atomic(path, serde_yaml::to_string(self)?.as_bytes())
     }
 }
 

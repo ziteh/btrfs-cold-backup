@@ -41,6 +41,31 @@ pub fn available_space_bytes(path: &Path) -> Result<u64> {
     Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
+/// Makes renames, creations and deletions of entries in `dir` durable.
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Replaces `path` so that after a crash it holds either the old or the new content in full.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fsync_dir(parent)?;
+    Ok(())
+}
+
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -328,6 +353,16 @@ mod tests {
         assert!(backup_key.contains("backup-data"));
         assert!(manifest_key.contains("manifests"));
         assert!(latest_key.contains("manifests"));
+    }
+
+    #[test]
+    fn test_write_atomic_replaces_content_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.yaml");
+        write_atomic(&path, b"old").unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

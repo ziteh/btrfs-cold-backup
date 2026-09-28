@@ -12,8 +12,9 @@ use crate::{
     },
     state::{BackupState, UploadedPart, read_backup_state},
     util::{
-        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, s3_backup_key,
-        s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path, state_path,
+        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir, fsync_dir,
+        s3_backup_key, s3_latest_manifest_key, s3_manifest_key, sanitize_subvolume_path,
+        state_path,
     },
 };
 
@@ -440,7 +441,14 @@ async fn send_and_split<B: BtrfsOps>(
         ));
     }
 
-    let total_parts = collect_disk_parts(output_dir).await?.len() as u32;
+    // The state saved below claims these parts exist; after a power loss they must too.
+    let parts = collect_disk_parts(output_dir).await?;
+    for suffix in &parts {
+        let part = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{suffix}"));
+        tokio::fs::File::open(&part).await?.sync_all().await?;
+    }
+    fsync_dir(output_dir)?;
+    let total_parts = parts.len() as u32;
 
     state.inner.total_parts = Some(total_parts);
     state.inner.stream_hash = Some(hash.clone());
@@ -504,6 +512,8 @@ async fn encrypt_and_upload_part<R: RemoteBackend>(
     }
     if !enc_path.exists() {
         encrypt_file(&raw_path, &enc_path, &config.age_public_key).await?;
+        // The .age entry must be durable before the raw part it replaces disappears.
+        fsync_dir(output_dir)?;
         if let Err(e) = tokio::fs::remove_file(&raw_path).await {
             tracing::warn!("failed to remove raw part {:?}: {e}", raw_path);
         }

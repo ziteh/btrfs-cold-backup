@@ -57,6 +57,7 @@ pub async fn encrypt_file(input: &Path, output: &Path, public_key_str: &str) -> 
         writer
             .finish()
             .map_err(|e| anyhow!("failed to finalize encryption: {e}"))?;
+        output_file.sync_all()?;
 
         Ok(())
     })
