@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -187,7 +188,10 @@ async fn abort_existing_multipart_uploads(client: &Client, bucket: &str, key: &s
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!("failed to list multipart uploads for {key}: {e}");
+                tracing::warn!(
+                    "failed to list multipart uploads for {key}: {}",
+                    DisplayErrorContext(&e)
+                );
                 return;
             }
         };
@@ -208,7 +212,8 @@ async fn abort_existing_multipart_uploads(client: &Client, bucket: &str, key: &s
                 .await
             {
                 tracing::warn!(
-                    "failed to abort orphaned multipart upload {upload_id} for {key}: {e}"
+                    "failed to abort orphaned multipart upload {upload_id} for {key}: {}",
+                    DisplayErrorContext(&e)
                 );
             }
         }
@@ -246,7 +251,12 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
         .tagging(tags)
         .send()
         .await
-        .map_err(|e| anyhow!("create_multipart_upload failed: {e}"))?
+        .map_err(|e| {
+            anyhow!(
+                "create_multipart_upload failed: {}",
+                DisplayErrorContext(&e)
+            )
+        })?
         .upload_id()
         .ok_or_else(|| anyhow!("create_multipart_upload returned no upload_id"))?
         .to_string();
@@ -281,7 +291,12 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
                 )))
                 .send()
                 .await
-                .map_err(|e| anyhow!("upload_part {part_number} failed: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "upload_part {part_number} failed: {}",
+                        DisplayErrorContext(&e)
+                    )
+                })?;
 
             let etag = resp
                 .e_tag()
@@ -316,7 +331,12 @@ async fn multipart_upload<R: tokio::io::AsyncRead + Unpin>(
                 )
                 .send()
                 .await
-                .map_err(|e| anyhow!("complete_multipart_upload failed: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "complete_multipart_upload failed: {}",
+                        DisplayErrorContext(&e)
+                    )
+                })?;
             Ok(())
         }
         Err(e) => {
@@ -349,7 +369,7 @@ impl RemoteBackend for S3Backend {
             .body(ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| anyhow!("S3 put_object failed: {e}"))?;
+            .map_err(|e| anyhow!("S3 put_object failed: {}", DisplayErrorContext(&e)))?;
         Ok(())
     }
 
@@ -393,7 +413,10 @@ impl RemoteBackend for S3Backend {
                 if matches!(e.as_service_error(), Some(HeadObjectError::NotFound(_))) {
                     Ok(false)
                 } else {
-                    Err(anyhow!("S3 head_object failed: {e}"))
+                    Err(anyhow!(
+                        "S3 head_object failed: {}",
+                        DisplayErrorContext(&e)
+                    ))
                 }
             }
         }
@@ -407,13 +430,18 @@ impl RemoteBackend for S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| anyhow!("S3 get_object failed: {e}"))?;
+            .map_err(|e| anyhow!("S3 get_object failed: {}", DisplayErrorContext(&e)))?;
 
         let bytes = resp
             .body
             .collect()
             .await
-            .map_err(|e| anyhow!("failed to read S3 response body: {e}"))?
+            .map_err(|e| {
+                anyhow!(
+                    "failed to read S3 response body: {}",
+                    DisplayErrorContext(&e)
+                )
+            })?
             .into_bytes();
 
         Ok(bytes.to_vec())
@@ -435,7 +463,12 @@ impl RemoteBackend for S3Backend {
             .range(&range)
             .send()
             .await
-            .map_err(|e| anyhow!("S3 get_object with range failed: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "S3 get_object with range failed: {}",
+                    DisplayErrorContext(&e)
+                )
+            })?;
 
         let mut body = resp.body.into_async_read();
         let mut file = if start == 0 {
@@ -465,7 +498,12 @@ impl RemoteBackend for S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| anyhow!("S3 head_object failed for {key}: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "S3 head_object failed for {key}: {}",
+                    DisplayErrorContext(&e)
+                )
+            })?;
 
         let archived = matches!(
             resp.storage_class(),
@@ -495,7 +533,12 @@ impl RemoteBackend for S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| anyhow!("S3 head_object failed for {key}: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "S3 head_object failed for {key}: {}",
+                    DisplayErrorContext(&e)
+                )
+            })?;
 
         let size_bytes = resp.content_length().unwrap_or(0).max(0) as u64;
         // HeadObject omits x-amz-storage-class entirely for the default STANDARD class.
@@ -539,7 +582,10 @@ impl RemoteBackend for S3Backend {
                     Some("RestoreAlreadyInProgress") | Some("ObjectAlreadyInActiveTierError") => {
                         Ok(())
                     }
-                    _ => Err(anyhow!("S3 restore_object failed for {key}: {e}")),
+                    _ => Err(anyhow!(
+                        "S3 restore_object failed for {key}: {}",
+                        DisplayErrorContext(&e)
+                    )),
                 }
             }
         }
@@ -551,7 +597,7 @@ impl RemoteBackend for S3Backend {
             .bucket(&self.bucket)
             .send()
             .await
-            .map_err(|e| anyhow!("cannot access S3 bucket: {e}"))?;
+            .map_err(|e| anyhow!("cannot access S3 bucket: {}", DisplayErrorContext(&e)))?;
 
         // head_bucket only proves read access; backups need write, delete, and tagging, so
         // probe with a throwaway object under the configured prefix, tagged the same way a
@@ -567,14 +613,14 @@ impl RemoteBackend for S3Backend {
             .tagging("bcb-backup-level=check")
             .send()
             .await
-            .map_err(|e| anyhow!("cannot write to S3 bucket: {e}"))?;
+            .map_err(|e| anyhow!("cannot write to S3 bucket: {}", DisplayErrorContext(&e)))?;
         self.client
             .delete_object()
             .bucket(&self.bucket)
             .key(&probe_key)
             .send()
             .await
-            .map_err(|e| anyhow!("cannot delete from S3 bucket: {e}"))?;
+            .map_err(|e| anyhow!("cannot delete from S3 bucket: {}", DisplayErrorContext(&e)))?;
 
         Ok(())
     }
@@ -597,7 +643,7 @@ impl RemoteBackend for S3Backend {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| anyhow!("S3 list_objects_v2 failed: {e}"))?;
+                .map_err(|e| anyhow!("S3 list_objects_v2 failed: {}", DisplayErrorContext(&e)))?;
 
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
