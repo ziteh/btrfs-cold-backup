@@ -6,7 +6,8 @@ enforces Glacier's access restrictions or retrieval scheduling — every test ta
 
 - `request_restore` actually issuing `RestoreObject` with `GlacierJobParameters.tier`
 - `restore_status_detail` parsing a real `x-amz-restore` response header
-- AWS's `RestoreAlreadyInProgress` / `ObjectAlreadyInActiveTierError` error handling on repeat calls
+- AWS's `RestoreAlreadyInProgress` / `ObjectAlreadyInActiveTierError` error handling when a
+  retrieval starts between bcb's status check and its request
 - the retrieval-wave/budget scheduling in `restore.rs` behaving correctly under the real ~12h
   Standard-tier SLA
 
@@ -39,6 +40,9 @@ not optional.
   - `BCB_TEST_PART_CHUNK_SIZE` (see `part_chunk_size` in `src/restore.rs`) — same idea for
     download chunking.
 
+  Both must be plain byte counts: bcb panics on a value it can't parse rather than silently
+  falling back to full-size parts.
+
   Multiple parts matter here because each is retrieved and expires independently — a single-part
   drill wouldn't exercise that scheduling at all.
 - **Retrieval tier: Standard.** Deep Archive only supports Standard (~12h) and Bulk (~48h);
@@ -63,30 +67,42 @@ not optional.
 
 4. **`bcb backup --level 0`** — confirms all parts upload and the manifest is written.
 
-5. **`bcb restore ...` immediately** — expect exit code 2 (retrieval in progress), and confirm
+5. **`bcb restore ...` with a wrong private key** (e.g. a fresh one from `bcb genkey`) — expect
+   exit code 1 with an error that the backup was encrypted to another key, and no
+   `requesting retrieval` lines in the log: the key is checked before any retrieval is requested.
+
+6. **`bcb restore ...` immediately** — expect exit code 2 (retrieval in progress), and confirm
    from logs that `RestoreObject` was actually called.
 
-6. **Wait ~12 hours** (Standard tier SLA). During the wait, call `bcb restore` again a few times
+7. **Wait ~12 hours** (Standard tier SLA). During the wait, call `bcb restore` again a few times
    and check that:
-   - a repeat call handles `RestoreAlreadyInProgress` correctly (no duplicate retrieval request,
-     no hard failure);
-   - if there's more than one part, retrieval requests go out in scheduled waves rather than all
-     at once.
+   - a repeat call logs no `requesting retrieval` line for parts already in progress: bcb HEADs
+     every part first and requests retrieval only for those not yet requested. AWS's
+     `RestoreAlreadyInProgress` only shows up if a retrieval starts between that HEAD and the
+     request, and is treated as success;
+   - if there's more than one part and `s3.restore.expected_download_kbps` is set, retrieval
+     requests go out in scheduled waves rather than all at once (without it bcb warns and
+     requests every part at once);
+   - with the network cut (e.g. the S3 endpoint blocked), `bcb restore` exits 1, not 2, since no
+     status check or download got through.
 
-7. **After the SLA window, call `bcb restore` again** — expect exit code 0 (`restore complete`).
+8. **After the SLA window, call `bcb restore` again** — expect exit code 0 (`restore complete`).
+   A run where only some part downloads fail still exits 2, and the next run retries them.
 
-8. **Compare results**: `diff -r` the restored subvolume against the original — they must be
+9. **Compare results**: `diff -r` the restored subvolume against the original — they must be
    byte-identical. Cross-check with `bcb verify` or a manual blake3 hash comparison.
 
-9. **Clean up**: delete the drill bucket, the IAM policy, and the local test subvolume. Note the
-   180-day DEEP_ARCHIVE minimum-storage early-deletion fee applies (negligible at this data size,
-   see Cost above) — this is expected, not a bug.
+10. **Clean up**: delete the drill bucket, the IAM policy, and the local test subvolume. Note the
+    180-day DEEP_ARCHIVE minimum-storage early-deletion fee applies (negligible at this data
+    size, see Cost above) — this is expected, not a bug.
 
 ## What counts as success
 
 - `diff -r` shows no differences between the restored and original subvolume.
 - Exit codes follow the README's documented sequence: `backup` succeeds with 0, `restore`
   returns 2 while retrieval is pending, and 0 once it's ready.
+- A wrong private key fails before any retrieval is requested, and a run with the network cut
+  exits 1.
 - The observed behavior for `RestoreAlreadyInProgress` handling, wave scheduling, and
   expiry-date parsing matches what `src/remote.rs` and `src/restore.rs` are written to do. Any
   mismatch is a real bug — fix it and add a corresponding mock-based test case so it's covered
