@@ -221,7 +221,9 @@ async fn download_part_with_resume<R: RemoteBackend>(
 /// The returned map is what this run acts on; the persisted per-part states are also
 /// refreshed as an informational cache (a part with byte progress keeps its
 /// `PartiallyDownloaded` offset — the live status alone decides whether it can be resumed
-/// now). Parts whose status check failed are absent from the map and skipped this run.
+/// now). Parts whose status check failed are absent from the map and skipped this run; if
+/// every check failed, e.g. with the network down, this fails instead so the run exits 1
+/// rather than reporting progress it never makes.
 async fn fetch_live_statuses<R: RemoteBackend>(
     remote: &R,
     keys_by_index: &HashMap<String, String>,
@@ -243,14 +245,14 @@ async fn fetch_live_statuses<R: RemoteBackend>(
             async move {
                 let key = match key {
                     Some(k) => k,
-                    None => return (index, None),
+                    None => return (index, Err(anyhow!("no S3 key for part"))),
                 };
 
                 match remote.restore_status_detail(&key).await {
-                    Ok(detail) => (index, Some(detail)),
+                    Ok(detail) => (index, Ok(detail)),
                     Err(e) => {
                         tracing::warn!("failed to check status for part {}: {}", index, e);
-                        (index, None)
+                        (index, Err(e))
                     }
                 }
             }
@@ -260,10 +262,21 @@ async fn fetch_live_statuses<R: RemoteBackend>(
         .await;
 
     let mut live = HashMap::new();
+    let mut first_failure = None;
     for (index, detail) in results {
-        if let Some(detail) = detail {
-            live.insert(index, detail);
+        match detail {
+            Ok(detail) => {
+                live.insert(index, detail);
+            }
+            Err(e) => {
+                first_failure.get_or_insert(e);
+            }
         }
+    }
+    if live.is_empty()
+        && let Some(e) = first_failure
+    {
+        return Err(e.context("every part status check failed this run"));
     }
 
     Ok(live)
@@ -542,6 +555,11 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
     /// Downloads every part whose retrieved copy is live right now — including parts left
     /// half-downloaded by an interrupted run — earliest expiry first, so copies about to
     /// lapse are saved before the others. Returns how many parts failed to download.
+    ///
+    /// A remote failure skips just that part, but fails the run when no part this run
+    /// tried got through, so a lasting outage exits 1 instead of reporting progress
+    /// forever. A local error (disk full, permissions) fails the run at once: it would hit
+    /// every other part too.
     async fn download_ready_parts(
         &mut self,
         live: &HashMap<String, RestoreStatusDetail>,
@@ -565,6 +583,8 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
         let download_started_at = std::time::Instant::now();
         let mut downloaded_bytes = 0u64;
         let mut parts_failed = 0usize;
+        let mut parts_succeeded = 0usize;
+        let mut first_failure = None;
         for (part_idx, _) in downloadable {
             let (expected_blake3, size_bytes) = match self.state.parts.get(&part_idx) {
                 Some(part) => (part.blake3.clone(), part.size_bytes),
@@ -593,12 +613,16 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             )
             .await
             {
+                if e.chain().any(|c| c.is::<std::io::Error>()) {
+                    return Err(e.context(format!("download of part {part_idx} failed")));
+                }
                 tracing::warn!(
                     "download of part {} failed, continuing with remaining parts: {}",
                     part_idx,
                     e
                 );
                 parts_failed += 1;
+                first_failure.get_or_insert(e);
                 continue;
             }
 
@@ -622,6 +646,15 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             part.download_state = PartDownloadState::Downloaded;
             self.state.save(&self.state_path)?;
             downloaded_bytes += size_bytes;
+            parts_succeeded += 1;
+        }
+
+        if parts_succeeded == 0
+            && let Some(e) = first_failure
+        {
+            return Err(e.context(format!(
+                "all {parts_failed} part download(s) attempted this run failed"
+            )));
         }
 
         if downloaded_bytes > 0 {

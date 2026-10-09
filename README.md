@@ -97,7 +97,7 @@ bcb_level<N>.<YYYYMMDD>T<hhmm>
 
 AWS S3 Glacier objects **require** retrieval before download.
 
-`bcb restore` requests retrieval for the next batch, downloads whatever is currently retrievable, and exits — re-run until it prints `restore complete`. Exit code 2 means in progress, exit 0 means done, so a scheduler can just retry. A failed part download is logged and skipped; the next run retries it.
+`bcb restore` requests retrieval for the next batch, downloads whatever is currently retrievable, and exits — re-run until it prints `restore complete`. Exit code 2 means in progress, exit 0 means done, so a scheduler can just retry. A part that fails on the S3 side is logged and skipped; the next run retries it. The run exits 1 instead on a local error (e.g. a full disk or a permission problem), or when every part status check or download it attempted failed (e.g. the network is down), so a scheduler alerts.
 
 - `--restore-tier` / `--restore-days`: retrieval speed/cost and how long a retrieved copy stays downloadable.
 - `s3.restore.expected_download_kbps` / `s3.restore.lead_days`: pace retrieval to available bandwidth instead of requesting everything at once. `expected_download_kbps` is in kilobit/s (e.g. the download number your ISP advertises); when unsure, a conservative (lower) estimate is safer. With pacing on, `--restore-days` must exceed the lead window by at least a day.

@@ -2633,6 +2633,137 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
     assert_eq!(progress.parts_total, 2);
 }
 
+/// Restore of a two-part backup whose parts both have a retrieved copy. `status` answers
+/// each part's status check and `download` each range request, by part key.
+async fn restore_two_parts(
+    work_dir: &Path,
+    status: fn(&str) -> Result<RestoreStatusDetail>,
+    download: fn(&str, &Path) -> Result<()>,
+) -> Result<btrfs_cold_backup::restore::RestoreProgress> {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+
+    let config = test_config(work_dir);
+    let part = |index: &str| PartInfo {
+        index: index.to_string(),
+        size_bytes: 10,
+        blake3: "parthash".to_string(),
+    };
+    let backup_manifest = Backup {
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: 20,
+        blake3: "streamhash".to_string(),
+        parts: vec![part("000000"), part("000001")],
+    };
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote
+        .expect_restore_status_detail()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(|_| {
+            Ok(RestoreStatusDetail {
+                status: RestoreStatus::Ready,
+                expires_at: None,
+            })
+        });
+    remote.expect_restore_status_detail().returning(status);
+    remote
+        .expect_download()
+        .returning(move |_| Ok(manifest_yaml.clone()));
+    remote
+        .expect_download_range_to_file()
+        .returning(move |key, _, _, path| download(key, path));
+
+    restore_task(
+        &config,
+        &movies_task(),
+        0,
+        "20260602",
+        &work_dir.join("restore_target"),
+        "AGE-SECRET-KEY-1FAKE",
+        &retrieval(),
+        &remote,
+    )
+    .await
+}
+
+fn ready(_: &str) -> Result<RestoreStatusDetail> {
+    Ok(RestoreStatusDetail {
+        status: RestoreStatus::Ready,
+        expires_at: None,
+    })
+}
+
+/// A local error such as a full disk would fail every other part the same way, so it must
+/// fail the run at once instead of being skipped like a remote failure.
+#[tokio::test]
+async fn local_error_during_download_should_fail_the_run() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let err = restore_two_parts(work_dir.path(), ready, |key, path| {
+        if key.contains("000000") {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
+        }
+        std::fs::write(path, b"0123456789")?;
+        Ok(())
+    })
+    .await
+    .expect_err("a local error must fail the run");
+    assert!(
+        err.to_string().contains("000000"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !work_dir
+            .path()
+            .join("restore/mnt_data_movies/bcb_level0_202606020000/part-000001.age")
+            .exists(),
+        "no other part may be tried after a local error"
+    );
+}
+
+/// With every attempted download failing (e.g. the network is down), reporting in progress
+/// would let a scheduler retry forever without alerting.
+#[tokio::test]
+async fn all_part_downloads_failing_should_fail_the_run() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let err = restore_two_parts(work_dir.path(), ready, |_, _| {
+        Err(anyhow::anyhow!("connection lost"))
+    })
+    .await
+    .expect_err("a run with no successful download must fail");
+    assert!(
+        format!("{err:#}").contains("connection lost"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn all_part_status_checks_failing_should_fail_the_run() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let err = restore_two_parts(
+        work_dir.path(),
+        |_| Err(anyhow::anyhow!("connection lost")),
+        |_, _| panic!("nothing may be downloaded"),
+    )
+    .await
+    .expect_err("a run with no successful status check must fail");
+    assert!(
+        format!("{err:#}").contains("connection lost"),
+        "unexpected error: {err:#}"
+    );
+}
+
 /// With pacing enabled, retrieved copies must live long enough for the paced download to
 /// reach them; otherwise every wave tail expires and gets re-requested at full per-GB
 /// retrieval cost. Such a configuration must be rejected before any S3 call is made.

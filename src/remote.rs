@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::DisplayErrorContext;
@@ -9,10 +9,10 @@ use aws_sdk_s3::types::{
     Tier,
 };
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::S3Config;
-use crate::util::BYTES_PER_KBPS;
+use crate::util::{BYTES_PER_KBPS, IO_BUF_SIZE};
 
 const PART_SIZE: usize = 64 * 1024 * 1024;
 
@@ -470,11 +470,13 @@ impl RemoteBackend for S3Backend {
                 )
             })?;
 
+        // Local file errors keep their std::io::Error so callers can tell them from remote
+        // ones; a body read error is remote, so it is flattened into a message.
         let mut body = resp.body.into_async_read();
         let mut file = if start == 0 {
             tokio::fs::File::create(path)
                 .await
-                .map_err(|e| anyhow!("failed to create {:?}: {e}", path))?
+                .with_context(|| format!("failed to create {path:?}"))?
         } else {
             tokio::fs::OpenOptions::new()
                 .write(true)
@@ -482,11 +484,21 @@ impl RemoteBackend for S3Backend {
                 .create(false)
                 .open(path)
                 .await
-                .map_err(|e| anyhow!("failed to open {:?}: {e}", path))?
+                .with_context(|| format!("failed to open {path:?}"))?
         };
-        tokio::io::copy(&mut body, &mut file)
-            .await
-            .map_err(|e| anyhow!("failed to write range to {:?}: {e}", path))?;
+        let write_err = || format!("failed to write range to {path:?}");
+        let mut buf = vec![0u8; IO_BUF_SIZE];
+        loop {
+            let n = body
+                .read(&mut buf)
+                .await
+                .map_err(|e| anyhow!("failed to read S3 response body for {key}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).await.with_context(write_err)?;
+        }
+        file.flush().await.with_context(write_err)?;
         Ok(())
     }
 
