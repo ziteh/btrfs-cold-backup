@@ -600,17 +600,10 @@ async fn verify_pending_parts(state: &mut PersistentState, output_dir: &Path) ->
     ))
 }
 
-async fn upload_part<R: RemoteBackend>(
-    remote: &R,
-    part_index: &str,
-    output_dir: &Path,
-    sanitized: &str,
-    level: u32,
-    timestamp: &str,
-    config: &Config,
-) -> Result<()> {
-    let enc_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}.age"));
-    let storage_class = config
+/// The storage class for a level's parts. Looked up before any work starts too, so a missing
+/// entry fails at once instead of after a send that can take hours.
+pub(crate) fn storage_class_for(config: &Config, level: u32) -> Result<&str> {
+    config
         .s3
         .storage_class
         .backup_data
@@ -622,7 +615,20 @@ async fn upload_part<R: RemoteBackend>(
                  (s3.storage_class.backup_data has {} entries)",
                 config.s3.storage_class.backup_data.len()
             )
-        })?;
+        })
+}
+
+async fn upload_part<R: RemoteBackend>(
+    remote: &R,
+    part_index: &str,
+    output_dir: &Path,
+    sanitized: &str,
+    level: u32,
+    timestamp: &str,
+    config: &Config,
+) -> Result<()> {
+    let enc_path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{part_index}.age"));
+    let storage_class = storage_class_for(config, level)?;
     let part_key = s3_backup_key(&config.s3.prefix, sanitized, level, timestamp, part_index);
     remote
         .upload_file(
@@ -741,6 +747,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     btrfs: &B,
     remote: &R,
 ) -> Result<Option<Backup>> {
+    storage_class_for(config, level)?;
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let state_file = backup_state_path(&config.base_dir, &sanitized);
     tokio::fs::create_dir_all(state_file.parent().unwrap()).await?;

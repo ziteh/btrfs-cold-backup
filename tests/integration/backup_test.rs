@@ -503,34 +503,11 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
     // Only level 0 has a configured storage class.
     config.s3.storage_class.backup_data = vec!["STANDARD".to_string()];
     let task = movies_task();
-    let parent = "bcb_level0.20260601T1430";
-    let snap = "bcb_level1.20260602T1430";
 
-    let mut btrfs = btrfs_with_uuids();
-    btrfs
-        .expect_list_snapshots()
-        .returning(move |_| Ok(vec![parent.to_string(), snap.to_string()]));
-    btrfs
-        .expect_send_incremental()
-        .returning(|_, _| Ok(fake_stream()));
-
-    let manifest_bytes = latest_manifest_yaml(parent, 0);
-    let mut remote = MockRemote::new();
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
-    remote
-        .expect_exists()
-        .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
-    remote
-        .expect_download()
-        .withf(|key| key.contains("latest.yaml"))
-        .returning(move |_| Ok(manifest_bytes.clone()));
-    expect_ancestors(&mut remote, |_| Ok(Some(ANCESTOR_PART_SIZE)));
-    // No upload_file/upload_bytes expectations: the storage-class lookup must fail before
-    // ever calling upload_file (any such call would itself be a test failure).
+    // No expectations: the missing entry must fail before any btrfs send or S3 call, not
+    // after a send that can take hours.
+    let btrfs = MockBtrfs::new();
+    let remote = MockRemote::new();
 
     let err = backup_task(&config, &task, 1, &btrfs, &remote)
         .await
