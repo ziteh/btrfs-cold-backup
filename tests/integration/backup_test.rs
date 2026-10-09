@@ -655,6 +655,20 @@ async fn restore_should_fail_on_blake3_mismatch() {
     )
     .await;
     assert!(result.is_err(), "restore should fail on BLAKE3 mismatch");
+    // The bad download is discarded so the next run starts the part over.
+    let state: btrfs_cold_backup::RestoreState = serde_yaml::from_slice(
+        &std::fs::read(
+            work_dir
+                .path()
+                .join("restore/mnt_data_movies/bcb_level0_202606020000/state.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.parts["000000"].download_state,
+        btrfs_cold_backup::PartDownloadState::NotDownloaded
+    );
 }
 
 /// A completed backup (manifest already on remote) must be skipped, not re-run and
@@ -1810,12 +1824,10 @@ async fn restore_should_bail_cleanly_when_manifest_retrieval_in_progress() {
     );
 }
 
-/// Regression test for the "false completion" bug: `stream_verified` and `receive_completed`
-/// must be tracked as two separate flags. If a run persists `stream_verified = true` but then
-/// fails (or is killed) before `btrfs receive` completes, a resumed run must actually retry
-/// the receive step — not silently return success because the hash was already verified.
+/// A run whose `btrfs receive` failed after the stream verified must make the next run retry
+/// the receive, not report success because the parts were already checked.
 #[tokio::test]
-async fn resume_after_stream_verified_should_retry_receive_not_silently_succeed() {
+async fn resume_after_failed_receive_should_retry_receive_not_silently_succeed() {
     use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
     use secrecy::ExposeSecret;
 
@@ -1904,8 +1916,7 @@ async fn resume_after_stream_verified_should_retry_receive_not_silently_succeed(
     .expect_err("btrfs receive must fail in this non-btrfs test environment");
 
     // Second run (simulating a re-run after the first crashed/failed): must retry the
-    // receive step again, not silently report success just because stream_verified was
-    // already persisted as true.
+    // receive step again.
     let second_err = restore_task(
         &config,
         &task,
@@ -2008,7 +2019,6 @@ async fn restore_should_resume_partially_downloaded_part() {
     let mut seeded = RestoreState {
         manifest_blake3: stream_hash,
         parts,
-        stream_verified: false,
         receive_completed: false,
         last_updated: 0,
     };
@@ -2063,7 +2073,118 @@ async fn restore_should_resume_partially_downloaded_part() {
         PartDownloadState::Downloaded,
         "resumed part must reach Downloaded"
     );
-    assert!(state.stream_verified, "stream must verify after resume");
+    assert!(
+        restore_dir.join("part-000000.age").exists(),
+        "the verified part must be kept for the receive to be retried"
+    );
+}
+
+/// A part damaged on disk after its download check (power loss, bit rot) must be caught
+/// before receive and cost only that part's download, reported as in progress.
+#[tokio::test]
+async fn part_damaged_before_finalize_should_be_reset_for_download() {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+    use btrfs_cold_backup::{PartDownloadState, RestorePartState, RestoreState};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let target_dir = work_dir.path().join("restore_target");
+
+    let restore_dir = work_dir
+        .path()
+        .join("restore/mnt_data_movies/bcb_level0_202606020000");
+    std::fs::create_dir_all(&restore_dir).unwrap();
+    let mut parts = Vec::new();
+    for (index, bytes) in [("000000", &b"intact part"[..]), ("000001", b"damaged part")] {
+        std::fs::write(restore_dir.join(format!("part-{index}.age")), bytes).unwrap();
+        parts.push(PartInfo {
+            index: index.to_string(),
+            size_bytes: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+        });
+    }
+    std::fs::write(restore_dir.join("part-000001.age"), b"damaged pa!t").unwrap();
+
+    let backup_manifest = Backup {
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
+        level: 0,
+        snapshot_name: "bcb_level0.20260602T1430".to_string(),
+        parent_snapshot: None,
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: String::new(),
+        total_size_bytes: parts.iter().map(|p| p.size_bytes).sum(),
+        blake3: "streamhash".to_string(),
+        parts: parts.clone(),
+    };
+    let mut seeded = RestoreState {
+        manifest_blake3: backup_manifest.blake3.clone(),
+        parts: parts
+            .iter()
+            .map(|p| {
+                (
+                    p.index.clone(),
+                    RestorePartState {
+                        size_bytes: p.size_bytes,
+                        blake3: p.blake3.clone(),
+                        download_state: PartDownloadState::Downloaded,
+                    },
+                )
+            })
+            .collect(),
+        ..Default::default()
+    };
+    seeded.save(&restore_dir.join("state.yaml")).unwrap();
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    // Nothing is pending, so no part status checks or downloads may happen this run.
+    let mut remote = MockRemote::new();
+    remote
+        .expect_restore_status_detail()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(|_| {
+            Ok(RestoreStatusDetail {
+                status: RestoreStatus::Ready,
+                expires_at: None,
+            })
+        });
+    remote
+        .expect_download()
+        .returning(move |_| Ok(manifest_yaml.clone()));
+
+    let progress = restore_task(
+        &config,
+        &task,
+        0,
+        "20260602",
+        &target_dir,
+        "AGE-SECRET-KEY-1FAKE",
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect("a damaged part must be reported as in progress, not as a failure");
+
+    assert!(!progress.completed);
+    assert_eq!(progress.parts_downloaded, 1);
+    let state: RestoreState =
+        serde_yaml::from_str(&std::fs::read_to_string(restore_dir.join("state.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state.parts["000001"].download_state,
+        PartDownloadState::NotDownloaded
+    );
+    assert_eq!(
+        state.parts["000000"].download_state,
+        PartDownloadState::Downloaded
+    );
+    assert!(!target_dir.exists(), "nothing may reach btrfs receive");
 }
 
 /// A partially-downloaded part whose retrieved copy expired (live status falls back to
@@ -2132,7 +2253,6 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
     let mut seeded = RestoreState {
         manifest_blake3: "irrelevant".to_string(),
         parts,
-        stream_verified: false,
         receive_completed: false,
         last_updated: 0,
     };

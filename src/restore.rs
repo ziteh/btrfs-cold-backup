@@ -1,18 +1,18 @@
+use age::x25519;
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     Config, RemoteBackend, Task,
-    crypto::{blake3_file, decrypt_file},
+    crypto::{blake3_file, decrypt_to_writer},
     manifest::{Backup, parse_backup},
     remote::{RestoreStatus, RestoreStatusDetail},
     state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
-        BYTES_PER_KBPS, IO_BUF_SIZE, compact_to_iso, restore_state_path, restore_work_dir,
-        s3_backup_key, s3_manifest_key, sanitize_subvolume_path,
+        BYTES_PER_KBPS, compact_to_iso, restore_state_path, restore_work_dir, s3_backup_key,
+        s3_manifest_key, sanitize_subvolume_path,
     },
 };
 
@@ -93,70 +93,59 @@ fn daily_budget_bytes(expected_download_kbps: u64) -> u64 {
     (expected_download_kbps as f64 * BYTES_PER_KBPS * 86400.0) as u64
 }
 
-async fn pipe_to_btrfs_receive(dec_paths: &[std::path::PathBuf], target_dir: &Path) -> Result<()> {
+/// Decrypts `enc_paths` in order into `out`, reassembling the send stream. Blocking.
+fn decrypt_parts(
+    enc_paths: &[PathBuf],
+    identity: &x25519::Identity,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    for path in enc_paths {
+        decrypt_to_writer(path, identity, out)?;
+    }
+    Ok(())
+}
+
+async fn stream_hash(enc_paths: Vec<PathBuf>, identity: x25519::Identity) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut hasher = blake3::Hasher::new();
+        decrypt_parts(&enc_paths, &identity, &mut hasher)?;
+        Ok(hasher.finalize().to_hex().to_string())
+    })
+    .await?
+}
+
+/// Decrypts the parts straight into `btrfs receive`, so no plaintext touches the disk.
+async fn pipe_to_btrfs_receive(
+    enc_paths: Vec<PathBuf>,
+    identity: x25519::Identity,
+    target_dir: &Path,
+) -> Result<()> {
     tokio::fs::create_dir_all(target_dir).await?;
-    let target_str = target_dir
-        .to_str()
-        .ok_or_else(|| anyhow!("target_dir contains invalid UTF-8"))?;
-
-    let mut child = tokio::process::Command::new("btrfs")
-        .args(["receive", target_str])
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-
-    {
+    let target_dir = target_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut child = std::process::Command::new("btrfs")
+            .arg("receive")
+            .arg(&target_dir)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| anyhow!("failed to open btrfs receive stdin"))?;
-        let mut buf = vec![0u8; IO_BUF_SIZE];
-        for dec_path in dec_paths {
-            let mut f = tokio::fs::File::open(dec_path).await?;
-            loop {
-                let n = f.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                stdin.write_all(&buf[..n]).await?;
-            }
-            // Deliberately not deleted here: if btrfs receive or the subvolume verification
-            // that follows fails, a retry needs these files still present. The caller deletes
-            // the whole work dir only once the receive is fully verified.
+        let written = decrypt_parts(&enc_paths, &identity, &mut stdin);
+        // Closing stdin is the end of the stream for receive.
+        drop(stdin);
+
+        // Checked first: a receive that died makes the write fail too, and its stderr says why.
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("btrfs receive failed: {}", stderr.trim()));
         }
-    }
-
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("btrfs receive failed: {}", stderr.trim()));
-    }
-
-    Ok(())
-}
-
-/// Verifies the whole-stream BLAKE3 across the decrypted parts in order.
-async fn verify_stream_hash(dec_paths: &[std::path::PathBuf], expected: &str) -> Result<()> {
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; IO_BUF_SIZE];
-    for dec_path in dec_paths {
-        let mut f = tokio::fs::File::open(dec_path).await?;
-        loop {
-            let n = f.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-    }
-    let actual = hasher.finalize().to_hex().to_string();
-    if actual != expected {
-        return Err(anyhow!(
-            "stream BLAKE3 mismatch: expected {expected}, got {actual}"
-        ));
-    }
-    Ok(())
+        written
+    })
+    .await?
 }
 
 /// Downloads a single part in `chunk_size` ranges, persisting progress to `RestoreState`
@@ -350,7 +339,6 @@ fn load_or_init_state(state_path: &Path, backup: &Backup) -> Result<RestoreState
                 )
             })
             .collect(),
-        stream_verified: false,
         receive_completed: false,
         last_updated: 0,
     };
@@ -434,45 +422,41 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             .await?;
         let parts_failed = self.download_ready_parts(&live).await?;
 
-        let parts_total = self.state.parts.len();
-        let parts_downloaded = self
-            .state
-            .parts
-            .values()
-            .filter(|p| matches!(p.download_state, PartDownloadState::Downloaded))
-            .count();
-
-        if parts_downloaded < parts_total {
-            let bytes_remaining: u64 = self
-                .state
-                .parts
-                .values()
-                .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
-                .map(|p| p.size_bytes)
-                .sum();
+        let progress = self.progress();
+        if progress.parts_downloaded < progress.parts_total {
             tracing::info!(
                 "waiting for retrievals: {}/{} parts downloaded, {} download failures this run, {} bytes ready, {} bytes in progress",
-                parts_downloaded,
-                parts_total,
+                progress.parts_downloaded,
+                progress.parts_total,
                 parts_failed,
                 ready_bytes,
                 in_progress_bytes,
             );
-            return Ok(RestoreProgress {
-                completed: false,
-                parts_downloaded,
-                parts_total,
-                bytes_remaining,
-            });
+            return Ok(progress);
         }
 
-        self.finalize().await?;
+        if !self.finalize().await? {
+            return Ok(self.progress());
+        }
         Ok(RestoreProgress {
             completed: true,
-            parts_downloaded,
-            parts_total,
-            bytes_remaining: 0,
+            ..progress
         })
+    }
+
+    fn progress(&self) -> RestoreProgress {
+        let pending = || {
+            self.state
+                .parts
+                .values()
+                .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
+        };
+        RestoreProgress {
+            completed: false,
+            parts_downloaded: self.state.parts.len() - pending().count(),
+            parts_total: self.state.parts.len(),
+            bytes_remaining: pending().map(|p| p.size_bytes).sum(),
+        }
     }
 
     /// Requests retrievals BEFORE downloading: requests are instant while draining the ready
@@ -619,8 +603,15 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             }
 
             let actual_hash = blake3_file(&enc_path).await?;
+            let part = self
+                .state
+                .parts
+                .get_mut(&part_idx)
+                .ok_or_else(|| anyhow!("unknown part index {part_idx}"))?;
             if actual_hash != expected_blake3 {
+                part.download_state = PartDownloadState::NotDownloaded;
                 let _ = tokio::fs::remove_file(&enc_path).await;
+                self.state.save(&self.state_path)?;
                 return Err(anyhow!(
                     "BLAKE3 mismatch for part {}: expected {}, got {}",
                     part_idx,
@@ -628,14 +619,7 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
                     actual_hash
                 ));
             }
-
-            let dec_path = self.work_dir.join(format!("part-{part_idx}.btrfs"));
-            decrypt_file(&enc_path, &dec_path, self.private_key).await?;
-            let _ = tokio::fs::remove_file(&enc_path).await;
-
-            if let Some(part) = self.state.parts.get_mut(&part_idx) {
-                part.download_state = PartDownloadState::Downloaded;
-            }
+            part.download_state = PartDownloadState::Downloaded;
             self.state.save(&self.state_path)?;
             downloaded_bytes += size_bytes;
         }
@@ -654,31 +638,69 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
         Ok(parts_failed)
     }
 
-    /// All parts are downloaded: verify the reassembled stream, pipe it into `btrfs receive`
-    /// and clean up. `stream_verified` and `receive_completed` are two separate flags (not
-    /// one "did the final step" flag) so a crash between the hash check and the receive step
-    /// doesn't cause a resumed run to skip re-attempting receive — that would report success
-    /// without ever writing the subvolume.
-    async fn finalize(&mut self) -> Result<()> {
-        let mut dec_paths = Vec::new();
-        for part in &self.backup.parts {
-            let dec_path = self.work_dir.join(format!("part-{}.btrfs", part.index));
-            match tokio::fs::metadata(&dec_path).await {
-                Ok(_) => dec_paths.push(dec_path),
-                Err(_) => return Err(anyhow!("decrypted part {} not found", part.index)),
-            }
-        }
-
-        if !self.state.stream_verified {
-            tracing::info!("verifying stream hash");
-            verify_stream_hash(&dec_paths, &self.backup.blake3).await?;
-            self.state.stream_verified = true;
-            self.state.save(&self.state_path)?;
-        }
-
+    /// All parts are downloaded: verify them, pipe the decrypted stream into `btrfs receive`
+    /// and clean up. Every run re-verifies from the `.age` files, since those are all that is
+    /// kept on disk. Returns false if a part was damaged on disk since its download; it is
+    /// reset for the next run to download again.
+    async fn finalize(&mut self) -> Result<bool> {
         if !self.state.receive_completed {
+            let enc_paths: Vec<PathBuf> = self
+                .backup
+                .parts
+                .iter()
+                .map(|p| self.work_dir.join(format!("part-{}.age", p.index)))
+                .collect();
+
+            // A power loss or bit rot after the download check must cost one part's
+            // download, not fail the restore.
+            let mut damaged = Vec::new();
+            for (part, path) in self.backup.parts.iter().zip(&enc_paths) {
+                let intact = match blake3_file(path).await {
+                    Ok(hash) => hash == part.blake3,
+                    Err(e)
+                        if e.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        false
+                    }
+                    Err(e) => return Err(e),
+                };
+                if !intact {
+                    damaged.push(part.index.clone());
+                }
+            }
+            if !damaged.is_empty() {
+                for index in &damaged {
+                    if let Some(part) = self.state.parts.get_mut(index) {
+                        part.download_state = PartDownloadState::NotDownloaded;
+                    }
+                }
+                self.state.save(&self.state_path)?;
+                tracing::warn!(
+                    "parts {damaged:?} no longer match their BLAKE3 on disk; they will be \
+                     downloaded again"
+                );
+                return Ok(false);
+            }
+
+            let identity: x25519::Identity = self
+                .private_key
+                .parse()
+                .map_err(|e| anyhow!("invalid age private key: {e}"))?;
+
+            // Every part checked out, so a mismatch here is a bug on the backup side, which
+            // downloading again cannot fix.
+            tracing::info!("verifying stream hash");
+            let actual = stream_hash(enc_paths.clone(), identity.clone()).await?;
+            if actual != self.backup.blake3 {
+                return Err(anyhow!(
+                    "stream BLAKE3 mismatch: expected {}, got {actual}",
+                    self.backup.blake3
+                ));
+            }
+
             tracing::info!("piping to btrfs receive");
-            pipe_to_btrfs_receive(&dec_paths, self.target_dir).await?;
+            pipe_to_btrfs_receive(enc_paths, identity, self.target_dir).await?;
 
             let snapshot_path = self.target_dir.join(&self.backup.snapshot_name);
             let verify = tokio::process::Command::new("btrfs")
@@ -706,7 +728,7 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             );
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 

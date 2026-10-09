@@ -1,7 +1,7 @@
 use age::secrecy::SecretString;
 use age::x25519;
 use anyhow::{Result, anyhow};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use tokio::task;
 
@@ -73,21 +73,29 @@ pub async fn decrypt_file(input: &Path, output: &Path, private_key_str: &str) ->
         let identity: x25519::Identity = private_key
             .parse()
             .map_err(|e| anyhow!("invalid age private key: {e}"))?;
-
-        let input_file = std::io::BufReader::new(std::fs::File::open(&input_buf)?);
-
-        let decryptor = age::Decryptor::new_buffered(input_file)
-            .map_err(|e| anyhow!("failed to create decryptor: {e}"))?;
-
-        let mut reader = decryptor
-            .decrypt(std::iter::once(&identity as &dyn age::Identity))
-            .map_err(|e| anyhow!("decryption failed: {e}"))?;
         let mut output_file = std::fs::File::create(&output_buf)?;
-        std::io::copy(&mut reader, &mut output_file)?;
-
-        Ok(())
+        decrypt_to_writer(&input_buf, &identity, &mut output_file)
     })
     .await?
+}
+
+/// Decrypts the age file `input` into `out`. Blocking.
+pub fn decrypt_to_writer(
+    input: &Path,
+    identity: &x25519::Identity,
+    out: &mut impl Write,
+) -> Result<()> {
+    let input_file = std::io::BufReader::new(std::fs::File::open(input)?);
+
+    let decryptor = age::Decryptor::new_buffered(input_file)
+        .map_err(|e| anyhow!("failed to create decryptor: {e}"))?;
+
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| anyhow!("decryption failed: {e}"))?;
+    std::io::copy(&mut reader, out)?;
+
+    Ok(())
 }
 
 /// Verifies a public/private age key pair can encrypt and decrypt together,

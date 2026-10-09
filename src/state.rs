@@ -40,9 +40,9 @@ impl BackupState {
 /// Persisted download progress of one restore part. Retrieval status is not tracked here:
 /// every run re-checks it live against S3.
 ///
-/// `Downloaded` means fully downloaded *and* hash-verified and decrypted, so it cannot be
-/// derived from a byte count: a run killed between the last byte and the hash check must
-/// resume, not be taken for complete.
+/// `Downloaded` means fully downloaded *and* hash-verified, so it cannot be derived from a
+/// byte count: a run killed between the last byte and the hash check must resume, not be
+/// taken for complete.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PartDownloadState {
     NotDownloaded,
@@ -61,10 +61,7 @@ pub struct RestorePartState {
 pub struct RestoreState {
     pub manifest_blake3: String,
     pub parts: BTreeMap<String, RestorePartState>,
-    pub stream_verified: bool,
     /// Whether `btrfs receive` has completed and the target subvolume was verified.
-    /// Tracked separately from `stream_verified` so a crash between the hash check and
-    /// the receive step doesn't cause a resumed run to silently skip re-attempting receive.
     pub receive_completed: bool,
     pub last_updated: i64,
 }
