@@ -102,6 +102,7 @@ AWS S3 Glacier objects **require** retrieval before download.
 - `--restore-tier` / `--restore-days`: retrieval speed/cost and how long a retrieved copy stays downloadable.
 - `s3.restore.expected_download_kbps` / `s3.restore.lead_days`: pace retrieval to available bandwidth instead of requesting everything at once. `expected_download_kbps` is in kilobit/s (e.g. the download number your ISP advertises); when unsure, a conservative (lower) estimate is safer. With pacing on, `--restore-days` must exceed the lead window by at least a day.
 - Restore levels in order onto the same target (level 0 first); each incremental needs its parent already restored.
+- Before requesting any retrieval, bcb checks that the private key matches the backup, that an incremental's parent is already on the target, and that base_dir has room for the parts still to download (plus the received snapshot when the target is on the same filesystem).
 - If wrapped in a systemd timer, add `SuccessExitStatus=2` or every in-progress retry is treated as a failure.
 
 ```mermaid

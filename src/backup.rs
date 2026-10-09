@@ -14,7 +14,7 @@ use crate::{
     },
     state::{BackupState, PartRecord, read_state},
     util::{
-        IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir,
+        GIB, IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir,
         backup_state_path, fsync_dir, s3_backup_key, s3_latest_manifest_key, s3_manifest_key,
         sanitize_subvolume_path,
     },
@@ -339,8 +339,6 @@ fn split_part_size() -> u64 {
 fn split_part_size() -> u64 {
     SPLIT_PART_SIZE
 }
-
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Estimates a snapshot's on-disk size via `du`, as an upper bound for the space a `btrfs
 /// send` of it (full or incremental) could require locally: exactly right for a full send,

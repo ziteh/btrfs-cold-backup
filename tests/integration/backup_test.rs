@@ -41,6 +41,19 @@ mock! {
     }
 }
 
+/// The key restores in these tests decrypt with; manifests record its public half.
+static TEST_IDENTITY: std::sync::LazyLock<age::x25519::Identity> =
+    std::sync::LazyLock::new(age::x25519::Identity::generate);
+
+fn test_private_key() -> String {
+    use secrecy::ExposeSecret;
+    TEST_IDENTITY.to_string().expose_secret().to_string()
+}
+
+fn test_public_key() -> String {
+    TEST_IDENTITY.to_public().to_string()
+}
+
 fn retrieval() -> RetrievalOptions {
     RetrievalOptions {
         days: 1,
@@ -49,7 +62,7 @@ fn retrieval() -> RetrievalOptions {
 }
 
 fn test_config(base_dir: &Path) -> Config {
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     Config {
         base_dir: base_dir.to_path_buf(),
         age_public_key: identity.to_public().to_string(),
@@ -317,7 +330,7 @@ fn expect_ancestors(remote: &mut MockRemote, part_size: fn(&str) -> Result<u64>)
                 source_uuid: SOURCE_UUID.to_string(),
                 snapshot_uuid: String::new(),
                 system: SystemInfo::default(),
-                age_public_key: String::new(),
+                age_public_key: test_public_key(),
                 total_size_bytes: ANCESTOR_PART_SIZE,
                 blake3: String::new(),
                 parts: vec![PartInfo {
@@ -612,7 +625,7 @@ async fn restore_should_fail_on_blake3_mismatch() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 10,
         blake3: "wrong_hash_that_will_never_match".to_string(),
         parts: vec![PartInfo {
@@ -649,7 +662,7 @@ async fn restore_should_fail_on_blake3_mismatch() {
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &retrieval(),
         &remote,
     )
@@ -715,7 +728,7 @@ fn backup_manifest_yaml(snapshot_name: &str, source_uuid: &str) -> Vec<u8> {
         source_uuid: source_uuid.to_string(),
         snapshot_uuid: snap_uuid(snapshot_name),
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 0,
         blake3: String::new(),
         parts: vec![],
@@ -1401,7 +1414,7 @@ async fn uploaded_part_should_decrypt_to_the_send_stream() {
     use std::sync::{Arc, Mutex};
 
     let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     let mut config = test_config(work_dir.path());
     config.age_public_key = identity.to_public().to_string();
     let task = movies_task();
@@ -1558,7 +1571,7 @@ async fn restore_should_request_retrieval_for_archived_objects() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 10,
         blake3: "wrong_hash".to_string(),
         parts: vec![PartInfo {
@@ -1593,7 +1606,7 @@ async fn restore_should_request_retrieval_for_archived_objects() {
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &retrieval(),
         &remote,
     )
@@ -1611,7 +1624,7 @@ async fn restore_should_fail_before_receive_on_stream_mismatch() {
     use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
 
     let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     let config = test_config(work_dir.path());
     let task = movies_task();
     let target_dir = work_dir.path().join("restore_target");
@@ -1643,7 +1656,7 @@ async fn restore_should_fail_before_receive_on_stream_mismatch() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: encrypted_bytes.len() as u64,
         blake3: "not_the_stream_hash".to_string(),
         parts: vec![PartInfo {
@@ -1723,7 +1736,7 @@ async fn default_config_should_still_request_retrieval_for_all_archived_parts() 
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 20,
         blake3: "irrelevant".to_string(),
         parts: vec![
@@ -1772,7 +1785,7 @@ async fn default_config_should_still_request_retrieval_for_all_archived_parts() 
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &retrieval(),
         &remote,
     )
@@ -1811,7 +1824,7 @@ async fn restore_should_bail_cleanly_when_manifest_retrieval_in_progress() {
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &retrieval(),
         &remote,
     )
@@ -1832,7 +1845,7 @@ async fn resume_after_failed_receive_should_retry_receive_not_silently_succeed()
     use secrecy::ExposeSecret;
 
     let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     let config = test_config(work_dir.path());
     let task = movies_task();
     let target_dir = work_dir.path().join("restore_target");
@@ -1864,7 +1877,7 @@ async fn resume_after_failed_receive_should_retry_receive_not_silently_succeed()
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: encrypted_bytes.len() as u64,
         blake3: stream_hash,
         parts: vec![PartInfo {
@@ -1948,7 +1961,7 @@ async fn restore_should_resume_partially_downloaded_part() {
     use std::collections::BTreeMap;
 
     let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     let config = test_config(work_dir.path());
     let task = movies_task();
     let target_dir = work_dir.path().join("restore_target");
@@ -1980,7 +1993,7 @@ async fn restore_should_resume_partially_downloaded_part() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: encrypted_bytes.len() as u64,
         blake3: stream_hash.clone(),
         parts: vec![PartInfo {
@@ -2116,7 +2129,7 @@ async fn part_damaged_before_finalize_should_be_reset_for_download() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: parts.iter().map(|p| p.size_bytes).sum(),
         blake3: "streamhash".to_string(),
         parts: parts.clone(),
@@ -2164,7 +2177,7 @@ async fn part_damaged_before_finalize_should_be_reset_for_download() {
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &retrieval(),
         &remote,
     )
@@ -2219,7 +2232,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 100,
         blake3: "irrelevant".to_string(),
         parts: vec![PartInfo {
@@ -2287,7 +2300,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &RetrievalOptions {
             days: 2,
             tier: "Standard".to_string(),
@@ -2322,7 +2335,7 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
     use secrecy::ExposeSecret;
 
     let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     let mut config = test_config(work_dir.path());
     // 1 kbps expected download; lead_days chosen so the buffer target is 15 bytes —
     // room for exactly one of the two 10-byte archived parts below.
@@ -2361,7 +2374,7 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: encrypted_bytes.len() as u64 + 20,
         blake3: "stream_hash_not_reached".to_string(),
         parts: vec![
@@ -2470,7 +2483,7 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 10,
         blake3: "irrelevant".to_string(),
         parts: vec![PartInfo {
@@ -2513,7 +2526,7 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &RetrievalOptions {
             days: 2,
             tier: "Standard".to_string(),
@@ -2537,7 +2550,7 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
     use secrecy::ExposeSecret;
 
     let work_dir = tempfile::tempdir().unwrap();
-    let identity = age::x25519::Identity::generate();
+    let identity = TEST_IDENTITY.clone();
     let config = test_config(work_dir.path());
     let task = movies_task();
     let target_dir = work_dir.path().join("restore_target");
@@ -2567,7 +2580,7 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: encrypted_bytes.len() as u64 + 10,
         blake3: "stream_hash_not_reached".to_string(),
         parts: vec![
@@ -2658,7 +2671,7 @@ async fn restore_two_parts(
         snapshot_uuid: snap_uuid("bcb_level0.20260602T1430"),
         created_at: 0,
         system: SystemInfo::default(),
-        age_public_key: String::new(),
+        age_public_key: test_public_key(),
         total_size_bytes: 20,
         blake3: "streamhash".to_string(),
         parts: vec![part("000000"), part("000001")],
@@ -2691,7 +2704,7 @@ async fn restore_two_parts(
         0,
         "20260602",
         &work_dir.join("restore_target"),
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &retrieval(),
         &remote,
     )
@@ -2764,6 +2777,145 @@ async fn all_part_status_checks_failing_should_fail_the_run() {
     );
 }
 
+/// Restore of a level 1 backup whose manifest and part are both readable, with `private_key`;
+/// `tweak` adjusts the manifest. No retrieval request is expected: any would fail the test.
+async fn restore_level1_without_requests(
+    work_dir: &Path,
+    private_key: &str,
+    tweak: fn(&mut btrfs_cold_backup::manifest::Backup),
+) -> Result<btrfs_cold_backup::restore::RestoreProgress> {
+    use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
+
+    let mut backup_manifest = Backup {
+        format_version: FORMAT_VERSION.to_string(),
+        timestamp: "2026-06-02T14:30".to_string(),
+        level: 1,
+        snapshot_name: "bcb_level1.20260602T1430".to_string(),
+        parent_snapshot: Some("bcb_level0.20260601T1430".to_string()),
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid("bcb_level1.20260602T1430"),
+        created_at: 0,
+        system: SystemInfo::default(),
+        age_public_key: test_public_key(),
+        total_size_bytes: 10,
+        blake3: "streamhash".to_string(),
+        parts: vec![PartInfo {
+            index: "000000".to_string(),
+            size_bytes: 10,
+            blake3: "parthash".to_string(),
+        }],
+    };
+    tweak(&mut backup_manifest);
+    let manifest_yaml = serde_yaml::to_string(&backup_manifest)
+        .unwrap()
+        .into_bytes();
+
+    let mut remote = MockRemote::new();
+    remote.expect_restore_status_detail().returning(|key| {
+        Ok(RestoreStatusDetail {
+            status: if key.contains("/manifest.yaml") {
+                RestoreStatus::Ready
+            } else {
+                RestoreStatus::NotRequested
+            },
+            expires_at: None,
+        })
+    });
+    remote
+        .expect_download()
+        .returning(move |_| Ok(manifest_yaml.clone()));
+
+    restore_task(
+        &test_config(work_dir),
+        &movies_task(),
+        1,
+        "20260602",
+        &work_dir.join("restore_target"),
+        private_key,
+        &retrieval(),
+        &remote,
+    )
+    .await
+}
+
+/// A key that can't decrypt the backup must be caught before any retrieval is paid for.
+#[tokio::test]
+async fn restore_with_wrong_private_key_should_fail_before_requesting_retrieval() {
+    use secrecy::ExposeSecret;
+
+    let work_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(
+        work_dir
+            .path()
+            .join("restore_target/bcb_level0.20260601T1430"),
+    )
+    .unwrap();
+    let other = age::x25519::Identity::generate().to_string();
+    let err = restore_level1_without_requests(work_dir.path(), other.expose_secret(), |_| {})
+        .await
+        .expect_err("a wrong key must fail the restore")
+        .to_string();
+    assert!(err.contains("encrypted to"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn restore_with_unparsable_private_key_should_fail_before_any_s3_call() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    // No expectations: any S3 call fails the test.
+    let remote = MockRemote::new();
+    let err = restore_task(
+        &config,
+        &movies_task(),
+        0,
+        "20260602",
+        &work_dir.path().join("restore_target"),
+        "not a key",
+        &retrieval(),
+        &remote,
+    )
+    .await
+    .expect_err("an unparsable key must fail the restore")
+    .to_string();
+    assert!(err.contains("private key"), "unexpected error: {err}");
+}
+
+/// An incremental can't be received without its parent, so the restore must say so before
+/// any retrieval is paid for.
+#[tokio::test]
+async fn restore_without_parent_on_target_should_fail_before_requesting_retrieval() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let err = restore_level1_without_requests(work_dir.path(), &test_private_key(), |_| {})
+        .await
+        .expect_err("a missing parent must fail the restore")
+        .to_string();
+    assert!(
+        err.contains("bcb_level0.20260601T1430") && err.contains("level 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn restore_without_enough_space_should_fail_before_requesting_retrieval() {
+    let work_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(
+        work_dir
+            .path()
+            .join("restore_target/bcb_level0.20260601T1430"),
+    )
+    .unwrap();
+    let err = restore_level1_without_requests(work_dir.path(), &test_private_key(), |b| {
+        b.parts[0].size_bytes = u64::MAX / 2;
+    })
+    .await
+    .expect_err("a part larger than the free space must fail the restore")
+    .to_string();
+    assert!(
+        err.contains("insufficient free space"),
+        "unexpected error: {err}"
+    );
+}
+
 /// With pacing enabled, retrieved copies must live long enough for the paced download to
 /// reach them; otherwise every wave tail expires and gets re-requested at full per-GB
 /// retrieval cost. Such a configuration must be rejected before any S3 call is made.
@@ -2791,7 +2943,7 @@ async fn restore_days_shorter_than_lead_window_should_be_rejected_before_any_s3_
         0,
         "20260602",
         &target_dir,
-        "AGE-SECRET-KEY-1FAKE",
+        &test_private_key(),
         &RetrievalOptions {
             days: 3,
             tier: "Bulk".to_string(),

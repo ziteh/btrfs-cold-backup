@@ -11,8 +11,8 @@ use crate::{
     remote::{RestoreStatus, RestoreStatusDetail},
     state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
-        BYTES_PER_KBPS, compact_to_iso, restore_state_path, restore_work_dir, s3_backup_key,
-        s3_manifest_key, sanitize_subvolume_path,
+        BYTES_PER_KBPS, GIB, available_space_bytes, compact_to_iso, restore_state_path,
+        restore_work_dir, s3_backup_key, s3_manifest_key, sanitize_subvolume_path,
     },
 };
 
@@ -399,7 +399,7 @@ struct RestoreRun<'a, R: RemoteBackend> {
     remote: &'a R,
     retrieval: &'a RetrievalOptions,
     target_dir: &'a Path,
-    private_key: &'a str,
+    identity: x25519::Identity,
     backup: Backup,
     part_keys: HashMap<String, String>,
     buffer_target: u64,
@@ -716,15 +716,10 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
                 return Ok(false);
             }
 
-            let identity: x25519::Identity = self
-                .private_key
-                .parse()
-                .map_err(|e| anyhow!("invalid age private key: {e}"))?;
-
             // Every part checked out, so a mismatch here is a bug on the backup side, which
             // downloading again cannot fix.
             tracing::info!("verifying stream hash");
-            let actual = stream_hash(enc_paths.clone(), identity.clone()).await?;
+            let actual = stream_hash(enc_paths.clone(), self.identity.clone()).await?;
             if actual != self.backup.blake3 {
                 return Err(anyhow!(
                     "stream BLAKE3 mismatch: expected {}, got {actual}",
@@ -733,7 +728,7 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             }
 
             tracing::info!("piping to btrfs receive");
-            pipe_to_btrfs_receive(enc_paths, identity, self.target_dir).await?;
+            pipe_to_btrfs_receive(enc_paths, self.identity.clone(), self.target_dir).await?;
 
             let snapshot_path = self.target_dir.join(&self.backup.snapshot_name);
             let verify = tokio::process::Command::new("btrfs")
@@ -765,6 +760,80 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
     }
 }
 
+/// Space the work dir's filesystem needs for the rest of a restore: the parts still to be
+/// downloaded (kept encrypted until the receive), plus the received snapshot when the target
+/// is on the same filesystem.
+fn required_restore_space(pending_part_bytes: u64, stream_bytes: u64, target_same_fs: bool) -> u64 {
+    pending_part_bytes + if target_same_fs { stream_bytes } else { 0 }
+}
+
+fn ensure_restore_space(available: u64, required: u64, work_dir: &Path) -> Result<()> {
+    if available < required {
+        return Err(anyhow!(
+            "insufficient free space for the restore work dir {work_dir:?}: {:.1} GiB \
+             available, ~{:.1} GiB needed; free up space or point base_dir at a larger \
+             filesystem before retrying",
+            available as f64 / GIB,
+            required as f64 / GIB,
+        ));
+    }
+    Ok(())
+}
+
+/// The device of `path`, or of its nearest existing ancestor if it doesn't exist yet.
+fn device_of(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::absolute(path)?;
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow!("no existing ancestor of {path:?}"))?;
+    Ok(std::fs::metadata(existing)?.dev())
+}
+
+/// Checks what would otherwise only fail after retrievals were paid for, or deep into a
+/// restore: the key, the parent snapshot an incremental needs, and local space.
+fn preflight(
+    backup: &Backup,
+    state: &RestoreState,
+    identity: &x25519::Identity,
+    level: u32,
+    target_dir: &Path,
+    work_dir: &Path,
+) -> Result<()> {
+    let public_key = identity.to_public().to_string();
+    if public_key != backup.age_public_key {
+        return Err(anyhow!(
+            "the private key belongs to {public_key}, but this backup was encrypted to {}; \
+             no retrieval was requested",
+            backup.age_public_key
+        ));
+    }
+
+    if let Some(parent) = &backup.parent_snapshot
+        && !target_dir.join(parent).exists()
+    {
+        return Err(anyhow!(
+            "parent snapshot '{parent}' not found in {target_dir:?}; restore the level {} \
+             backup it was built on first",
+            level.saturating_sub(1)
+        ));
+    }
+
+    let pending_part_bytes = state
+        .parts
+        .values()
+        .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
+        .map(|p| p.size_bytes)
+        .sum();
+    let required = required_restore_space(
+        pending_part_bytes,
+        backup.total_size_bytes,
+        device_of(target_dir)? == device_of(work_dir)?,
+    );
+    ensure_restore_space(available_space_bytes(work_dir)?, required, work_dir)
+}
+
 // The argument count is this function's public shape, as called from main.
 #[allow(clippy::too_many_arguments)]
 pub async fn restore_task<R: RemoteBackend>(
@@ -777,6 +846,9 @@ pub async fn restore_task<R: RemoteBackend>(
     retrieval: &RetrievalOptions,
     remote: &R,
 ) -> Result<RestoreProgress> {
+    let identity: x25519::Identity = private_key_str
+        .parse()
+        .map_err(|e| anyhow!("invalid age private key: {e}"))?;
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let timestamp = compact_to_iso(date)?;
     let buffer_target = retrieval_buffer_target(config, retrieval)?;
@@ -794,6 +866,7 @@ pub async fn restore_task<R: RemoteBackend>(
 
     let state_path = restore_state_path(&work_dir);
     let state = load_or_init_state(&state_path, &backup)?;
+    preflight(&backup, &state, &identity, level, target_dir, &work_dir)?;
 
     let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);
     let remaining_bytes: u64 = state
@@ -832,7 +905,7 @@ pub async fn restore_task<R: RemoteBackend>(
         remote,
         retrieval,
         target_dir,
-        private_key: private_key_str,
+        identity,
         backup,
         part_keys,
         buffer_target,
@@ -883,6 +956,25 @@ mod tests {
         let bytes: Vec<u8> = (start..=end).map(|i| i as u8).collect();
         file.write_all(&bytes)?;
         Ok(())
+    }
+
+    #[test]
+    fn required_restore_space_counts_the_receive_only_on_the_same_filesystem() {
+        assert_eq!(required_restore_space(10, 100, false), 10);
+        assert_eq!(required_restore_space(10, 100, true), 110);
+        assert_eq!(required_restore_space(0, 100, false), 0);
+    }
+
+    #[test]
+    fn ensure_restore_space_boundaries() {
+        let dir = Path::new("/work");
+        assert!(ensure_restore_space(50, 50, dir).is_ok());
+        assert!(ensure_restore_space(51, 50, dir).is_ok());
+        let err = ensure_restore_space(49, 50, dir).unwrap_err().to_string();
+        assert!(
+            err.contains("insufficient free space"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

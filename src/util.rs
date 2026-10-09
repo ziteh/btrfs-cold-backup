@@ -8,6 +8,8 @@ pub const SNAPSHOT_PART_PREFIX: &str = "snapshot.part-";
 /// Buffer size for streaming file/pipe IO.
 pub const IO_BUF_SIZE: usize = 64 * 1024;
 
+pub const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 /// Bytes per second per 1 kbps (kilobit/s = 1000 bits/s / 8 bits per byte).
 pub const BYTES_PER_KBPS: f64 = 1000.0 / 8.0;
 
