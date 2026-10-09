@@ -369,6 +369,12 @@ async fn snapshot_size_bytes(path: &Path) -> Result<u64> {
         .map_err(|e| anyhow!("failed to parse du output '{size_str}' for {:?}: {e}", path))
 }
 
+/// The send stream adds per-file metadata that `du` doesn't count, and age adds a tag per
+/// chunk and a header per part, so the estimate gets a margin on top.
+fn required_space(snapshot_size: u64) -> u64 {
+    snapshot_size + snapshot_size / 100
+}
+
 fn ensure_enough_space(available: u64, required: u64, snapshot_path: &Path) -> Result<()> {
     if available < required {
         return Err(anyhow!(
@@ -390,7 +396,7 @@ fn ensure_enough_space(available: u64, required: u64, snapshot_path: &Path) -> R
 /// check — it must never block a backup that might otherwise have succeeded.
 async fn check_available_space(snapshot_path: &Path, output_dir: &Path) -> Result<()> {
     let required = match snapshot_size_bytes(snapshot_path).await {
-        Ok(size) => size,
+        Ok(size) => required_space(size),
         Err(e) => {
             tracing::warn!("could not estimate snapshot size, skipping free-space check: {e}");
             return Ok(());
@@ -857,6 +863,11 @@ mod tests {
     #[test]
     fn test_ensure_enough_space_exactly_equal_is_ok() {
         assert!(ensure_enough_space(50, 50, Path::new("/snap")).is_ok());
+    }
+
+    #[test]
+    fn test_required_space_exceeds_snapshot_size() {
+        assert!(required_space(1 << 30) > 1 << 30);
     }
 
     #[test]
