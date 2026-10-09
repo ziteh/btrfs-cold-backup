@@ -73,6 +73,8 @@ tasks:
 
 `base_dir` is bcb's local working directory: it holds the lock file, resume state, daily log files, and the temporary encrypted parts during backup and the downloaded parts during restore. Its filesystem needs free space roughly equal to one full backup; bcb checks this before sending and refuses to start otherwise. bcb sets its permissions to 0700 on every run.
 
+`s3.upload_speed_limit_kbps` paces how fast bcb reads into each multipart part, but each part is then sent at line rate, so the uplink alternates between idle and saturated and the effective average stays below the limit. If the bursts disturb other traffic, shape the NAS's upload with router QoS or `tc` instead.
+
 Finish any unfinished backup or restore before upgrading bcb: a new version may not resume another version's local progress. When base_dir still holds files in an older local layout, bcb refuses to run and lists them; delete them once you've confirmed they're no longer needed.
 
 `backup_data` accepts STANDARD, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER and DEEP_ARCHIVE.
@@ -169,6 +171,8 @@ Leave `manifest` objects unexpired. Don't expire a level that a later incrementa
 
 Before an incremental backup, bcb HEADs every part of every lower level listed in `latest.yaml` and refuses to back up if any is missing or has the wrong size; run a level 0 backup to start a new chain.
 
+An incremental also needs its parent snapshot locally. With the contrib setup that parent is always the newest snapshot of the level below, which `snapshot_preserve_min latest` keeps and `bcb-run` only prunes after a successful backup. Pruning manually or changing those settings can delete it; the next incremental then fails and needs a level 0 backup.
+
 Before writing a backup's manifest, bcb HEADs every part of that backup; a part missing or of the wrong size is uploaded again on the next run.
 
 ## Documentation
@@ -195,14 +199,14 @@ The e2e and VM suites are compiled into the same `cargo test` run, but each test
 - [x] CI (GitHub Actions: test, clippy, fmt)
 - [x] Failure alerting (e.g. systemd OnFailure= notification unit)
 - [ ] Release packaging
-- [ ] Parallel part encryption/upload (worker pool)
-- [ ] Protect parent snapshots of incremental chains from deletion (no btrfs equivalent of `zfs hold`; likely needs a check against btrbk retention)
 - [ ] `restore --dry-run` and a `--force` passthrough for `btrfs receive`
 - [x] Resumable restore: keep downloaded parts across runs so an interrupted restore only fetches (and re-requests archive retrieval for) the missing parts
 - [x] `bcb verify`: audit chain completeness, part existence/size, storage class, and freshness without triggering an archive retrieval
 - [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents (retrieval cost/latency, so off by default; for periodic drills)
 - [ ] Add btrbk to VM for E2E testing
 - [ ] `--download-kbps` override `expected_download_kbps`
+- [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink instead of bursting each part
+- [ ] Simplify `resolve_parent`'s parameter list (derive keys from one context instead of passing them separately)
 
 ## License
 

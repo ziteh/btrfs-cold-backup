@@ -15,6 +15,8 @@ sudo systemctl enable --now bcb-backup@0.timer bcb-backup@1.timer
 Edit the `# EDIT:` lines in `contrib/btrbk/*.conf` (subvolume path), `contrib/bcb-notify`
 (where failures get sent), and `contrib/systemd/*.timer` (schedule) before enabling.
 
+`bcb-run` holds a lock for the whole run. A level 0 run waits for any run in progress; a higher level finding the lock held logs a skip and exits 0, so a multi-day level 0 doesn't turn every overlapping incremental into a failure alert. Both timers can be enabled from the start. A run that keeps getting skipped shows up in `bcb verify --max-age-days`.
+
 ## `snapshot_create` for incremental levels (level 1+)
 
 `bcb-level1.conf` ships with `snapshot_create always`. `onchange` is the alternative if the

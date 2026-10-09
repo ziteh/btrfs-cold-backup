@@ -3,6 +3,17 @@ set -euo pipefail
 LEVEL="$1"
 CONF="/etc/btrbk/bcb-level${LEVEL}.conf"
 
+# Serialize whole runs, before btrbk creates a snapshot that a busy bcb would never use.
+# Level 0 waits: skipping it would defer the next full backup by a whole schedule period.
+# Higher levels skip and exit 0, so overlapping a long level 0 doesn't raise a failure alert.
+exec 9>/run/lock/bcb-run.lock
+if [ "$LEVEL" -eq 0 ]; then
+    flock 9
+elif ! flock -n 9; then
+    echo "another bcb-run is in progress; skipping level $LEVEL"
+    exit 0
+fi
+
 btrbk -c "$CONF" snapshot
 bcb backup --level "$LEVEL"
 
