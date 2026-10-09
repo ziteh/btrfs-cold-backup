@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
-use crate::{BtrfsOps, Config, RemoteBackend, Task};
+use crate::{BtrfsOps, Config, RemoteBackend, Task, btrfs::ensure_snapshot_of};
 
 /// Verifies the external executables bcb shells out to are present on PATH.
 pub fn check_binaries() -> Result<()> {
@@ -92,17 +92,8 @@ async fn check_newest_snapshot_origin<B: BtrfsOps>(
         .subvolume_uuids(&task.snapshot_dir.join(newest))
         .await
         .map_err(|e| anyhow!("task '{}': {e}", task.name))?;
-    if snapshot.parent_uuid.as_deref() != Some(source_uuid) {
-        return Err(anyhow!(
-            "task '{}': snapshot '{newest}' was not taken from {:?} (its Parent UUID is {}, the \
-             subvolume's UUID is {source_uuid}); check that snapshot_dir holds this subvolume's \
-             snapshots",
-            task.name,
-            task.subvolume,
-            snapshot.parent_uuid.as_deref().unwrap_or("-"),
-        ));
-    }
-    Ok(())
+    ensure_snapshot_of(newest, &snapshot, &task.subvolume, source_uuid)
+        .map_err(|e| anyhow!("task '{}': {e}", task.name))
 }
 
 #[cfg(test)]

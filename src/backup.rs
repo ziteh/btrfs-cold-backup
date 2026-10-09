@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     BtrfsOps, Config, RemoteBackend, Task,
+    btrfs::ensure_snapshot_of,
     crypto::blake3_file,
     manifest::{
         Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo, parse_backup,
@@ -71,14 +72,6 @@ impl PersistentState {
     /// discard its uploaded parts and leave that level without a backup.
     fn load_or_init(path: PathBuf, task_name: &str, level: u32) -> Result<Self> {
         let inner = match read_state::<BackupState>(&path)? {
-            // Older versions kept plaintext parts and recorded no per-part hashes.
-            Some(s) if s.stream_hash.is_some() && s.parts.is_empty() => {
-                return Err(anyhow!(
-                    "backup state {path:?} was written by an older bcb whose local parts this \
-                     version cannot resume; delete it and {:?}, then re-run",
-                    s.output_dir
-                ));
-            }
             Some(s) if s.level == level => {
                 tracing::info!("resuming from existing backup state");
                 s
@@ -248,15 +241,7 @@ async fn init_backup_plan<B: BtrfsOps, R: RemoteBackend>(
     let snapshot = btrfs
         .subvolume_uuids(&task.snapshot_dir.join(&snapshot_name))
         .await?;
-    if snapshot.parent_uuid.as_deref() != Some(source.uuid.as_str()) {
-        return Err(anyhow!(
-            "snapshot '{snapshot_name}' was not taken from {:?} (its Parent UUID is {}, the \
-             subvolume's UUID is {}); check that snapshot_dir holds this subvolume's snapshots",
-            task.subvolume,
-            snapshot.parent_uuid.as_deref().unwrap_or("-"),
-            source.uuid
-        ));
-    }
+    ensure_snapshot_of(&snapshot_name, &snapshot, &task.subvolume, &source.uuid)?;
 
     // A manifest already on remote means this snapshot is fully backed up: skip rather than
     // redo it — overwriting archived objects incurs minimum-storage-duration charges, and a

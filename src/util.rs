@@ -144,7 +144,7 @@ pub fn backup_dir_name(level: u32, timestamp: &str) -> String {
     format!("bcb_level{level}_{compact}")
 }
 
-/// Inverse of [`backup_dir_name`]: extracts (level, ISO timestamp) from a task dir name.
+/// Inverse of [`backup_dir_name`]: extracts (level, ISO timestamp) from a backup dir name.
 pub fn parse_backup_dir_name(dir: &str) -> Option<(u32, String)> {
     let parts: Vec<&str> = dir.split('_').collect();
     let [_, level_str, compact_ts] = parts.as_slice() else {

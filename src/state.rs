@@ -23,11 +23,8 @@ pub struct BackupState {
     pub timestamp: String,
     pub output_dir: PathBuf,
     pub stream_hash: Option<String>,
-    /// Every part of the stream, recorded together with `stream_hash`. Defaulted so a
-    /// state from before these fields loads and can be recognized as such.
-    #[serde(default)]
+    /// Every part of the stream, recorded together with `stream_hash`.
     pub parts: BTreeMap<String, PartRecord>,
-    #[serde(default)]
     pub uploaded_parts: BTreeSet<String>,
     pub manifest_uploaded: bool,
     pub last_updated: i64,

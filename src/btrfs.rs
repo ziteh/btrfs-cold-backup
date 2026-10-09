@@ -28,6 +28,24 @@ pub struct SubvolumeUuids {
     pub parent_uuid: Option<String>,
 }
 
+/// Fails unless `snapshot` was taken from the subvolume at `subvolume` with `source_uuid`.
+pub(crate) fn ensure_snapshot_of(
+    snapshot_name: &str,
+    snapshot: &SubvolumeUuids,
+    subvolume: &Path,
+    source_uuid: &str,
+) -> Result<()> {
+    if snapshot.parent_uuid.as_deref() == Some(source_uuid) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "snapshot '{snapshot_name}' was not taken from {subvolume:?} (its Parent UUID is {}, \
+         the subvolume's UUID is {source_uuid}); check that snapshot_dir holds this \
+         subvolume's snapshots",
+        snapshot.parent_uuid.as_deref().unwrap_or("-"),
+    ))
+}
+
 /// Parses `btrfs subvolume show` output. `Received UUID:` and `Parent UUID:` lines are
 /// distinguished from `UUID:` by matching each line's full label.
 fn parse_subvolume_uuids(show_output: &str) -> Result<SubvolumeUuids> {

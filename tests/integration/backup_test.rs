@@ -1404,58 +1404,6 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
     assert_eq!(std::fs::read(&sp).unwrap(), before);
 }
 
-/// A state from a version that kept plaintext parts can't be resumed; bcb must say how to
-/// recover instead of misreading it.
-#[tokio::test]
-async fn resume_should_refuse_state_from_older_layout() {
-    use btrfs_cold_backup::backup_state_path;
-
-    let work_dir = tempfile::tempdir().unwrap();
-    let config = test_config(work_dir.path());
-    let task = movies_task();
-    let sanitized = "mnt_data_movies";
-
-    let output_dir = work_dir
-        .path()
-        .join("backup")
-        .join(sanitized)
-        .join("bcb_level0_202606021430");
-    std::fs::create_dir_all(&output_dir).unwrap();
-    std::fs::write(output_dir.join("snapshot.part-000000"), b"raw part").unwrap();
-
-    let sp = backup_state_path(work_dir.path(), sanitized);
-    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
-    std::fs::write(
-        &sp,
-        format!(
-            "level: 0\n\
-             snapshot_name: bcb_level0.20260602T1430\n\
-             parent_snapshot: null\n\
-             source_uuid: {SOURCE_UUID}\n\
-             snapshot_uuid: x\n\
-             timestamp: 2026-06-02T14:30\n\
-             output_dir: {}\n\
-             stream_hash: streamhash\n\
-             total_parts: 1\n\
-             parts_completed: {{}}\n\
-             manifest_uploaded: false\n\
-             last_updated: 0\n",
-            output_dir.display()
-        ),
-    )
-    .unwrap();
-
-    let btrfs = MockBtrfs::new();
-    let remote = MockRemote::new();
-
-    let err = backup_task(&config, &task, 0, &btrfs, &remote)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("older bcb"), "unexpected error: {err}");
-    assert!(output_dir.join("snapshot.part-000000").exists());
-}
-
 /// Archived parts must trigger a retrieval request and a retry-later error, not a download.
 #[tokio::test]
 async fn restore_should_request_retrieval_for_archived_objects() {
