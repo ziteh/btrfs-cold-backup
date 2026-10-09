@@ -87,9 +87,9 @@ pub trait RemoteBackend: Send + Sync {
     async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
     /// Initiates an archive retrieval so the object becomes downloadable for `days`.
     async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()>;
-    /// Returns the object's size and storage class via HeadObject, without requesting or
-    /// waiting on any archive retrieval — used by `bcb verify` to audit stored backups.
-    async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata>;
+    /// Returns the object's size and storage class via HeadObject, or None if it doesn't
+    /// exist, without requesting or waiting on any archive retrieval.
+    async fn head_metadata(&self, key: &str) -> Result<Option<ObjectMetadata>>;
     async fn verify_credentials(&self) -> Result<()>;
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -552,20 +552,26 @@ impl RemoteBackend for S3Backend {
         Ok(RestoreStatusDetail { status, expires_at })
     }
 
-    async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata> {
-        let resp = self
+    async fn head_metadata(&self, key: &str) -> Result<Option<ObjectMetadata>> {
+        let resp = match self
             .client
             .head_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map_err(|e| {
-                anyhow!(
+        {
+            Ok(resp) => resp,
+            Err(e) if matches!(e.as_service_error(), Some(HeadObjectError::NotFound(_))) => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(anyhow!(
                     "S3 head_object failed for {key}: {}",
                     DisplayErrorContext(&e)
-                )
-            })?;
+                ));
+            }
+        };
 
         let size_bytes = resp.content_length().unwrap_or(0).max(0) as u64;
         // HeadObject omits x-amz-storage-class entirely for the default STANDARD class.
@@ -574,10 +580,10 @@ impl RemoteBackend for S3Backend {
             .map(|sc| sc.as_str().to_string())
             .unwrap_or_else(|| "STANDARD".to_string());
 
-        Ok(ObjectMetadata {
+        Ok(Some(ObjectMetadata {
             size_bytes,
             storage_class,
-        })
+        }))
     }
 
     async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()> {

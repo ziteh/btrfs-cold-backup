@@ -35,7 +35,7 @@ mock! {
         async fn download_range_to_file(&self, key: &str, start: u64, end: u64, path: &Path) -> Result<()>;
         async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
         async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()>;
-        async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata>;
+        async fn head_metadata(&self, key: &str) -> Result<Option<ObjectMetadata>>;
         async fn verify_credentials(&self) -> Result<()>;
         async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
     }
@@ -152,10 +152,10 @@ fn expect_parts_on_s3(remote: &mut MockRemote, base_dir: &Path) {
         .expect_head_metadata()
         .withf(move |key| local_clone(key).is_some_and(|p| p.exists()))
         .returning(move |key| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: std::fs::metadata(local(key).unwrap())?.len(),
                 storage_class: "STANDARD".to_string(),
-            })
+            }))
         });
 }
 
@@ -313,8 +313,9 @@ async fn backup_should_fail_when_latest_manifest_is_corrupt() {
 }
 
 /// Makes every ancestor manifest downloadable, each listing one part of `ANCESTOR_PART_SIZE`
-/// bytes. `head_metadata` answers each part with the size `part_size` returns for its key.
-fn expect_ancestors(remote: &mut MockRemote, part_size: fn(&str) -> Result<u64>) {
+/// bytes. `head_metadata` answers each part with the size `part_size` returns for its key,
+/// None meaning the part doesn't exist.
+fn expect_ancestors(remote: &mut MockRemote, part_size: fn(&str) -> Result<Option<u64>>) {
     use btrfs_cold_backup::manifest::{Backup, PartInfo, SystemInfo};
     remote
         .expect_download()
@@ -342,10 +343,10 @@ fn expect_ancestors(remote: &mut MockRemote, part_size: fn(&str) -> Result<u64>)
             Ok(serde_yaml::to_string(&backup).unwrap().into_bytes())
         });
     remote.expect_head_metadata().returning(move |key| {
-        Ok(ObjectMetadata {
-            size_bytes: part_size(key)?,
+        Ok(part_size(key)?.map(|size_bytes| ObjectMetadata {
+            size_bytes,
             storage_class: "STANDARD".to_string(),
-        })
+        }))
     });
 }
 
@@ -384,7 +385,7 @@ async fn level1_incremental_should_use_level0_as_parent() {
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
     expect_parts_on_s3(&mut remote, work_dir.path());
-    expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
+    expect_ancestors(&mut remote, |_| Ok(Some(ANCESTOR_PART_SIZE)));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
@@ -437,7 +438,7 @@ async fn level2_incremental_should_use_level1_as_parent() {
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
     expect_parts_on_s3(&mut remote, work_dir.path());
-    expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
+    expect_ancestors(&mut remote, |_| Ok(Some(ANCESTOR_PART_SIZE)));
     remote
         .expect_upload_file()
         .withf(|_, _, _, tags| tags == "bcb-backup-level=2")
@@ -454,7 +455,7 @@ async fn level2_incremental_should_use_level1_as_parent() {
 }
 
 /// Level 1 backup whose level 0 ancestor's parts are answered by `part_size`.
-async fn level1_backup_with_ancestor_parts(part_size: fn(&str) -> Result<u64>) -> String {
+async fn level1_backup_with_ancestor_parts(part_size: fn(&str) -> Result<Option<u64>>) -> String {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
     let task = movies_task();
@@ -480,7 +481,7 @@ async fn level1_backup_with_ancestor_parts(part_size: fn(&str) -> Result<u64>) -
 /// alone) makes the new incremental unrestorable, so the backup must fail before sending.
 #[tokio::test]
 async fn level1_should_fail_before_send_when_level0_part_is_missing() {
-    let err = level1_backup_with_ancestor_parts(|_| Err(anyhow::anyhow!("NotFound"))).await;
+    let err = level1_backup_with_ancestor_parts(|_| Ok(None)).await;
     assert!(
         err.contains("level 0 backup") && err.contains("snapshot.part-000000"),
         "unexpected error: {err}"
@@ -489,7 +490,7 @@ async fn level1_should_fail_before_send_when_level0_part_is_missing() {
 
 #[tokio::test]
 async fn level1_should_fail_before_send_when_level0_part_size_differs() {
-    let err = level1_backup_with_ancestor_parts(|_| Ok(ANCESTOR_PART_SIZE - 1)).await;
+    let err = level1_backup_with_ancestor_parts(|_| Ok(Some(ANCESTOR_PART_SIZE - 1))).await;
     assert!(err.contains("S3 reports"), "unexpected error: {err}");
 }
 
@@ -527,7 +528,7 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
-    expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
+    expect_ancestors(&mut remote, |_| Ok(Some(ANCESTOR_PART_SIZE)));
     // No upload_file/upload_bytes expectations: the storage-class lookup must fail before
     // ever calling upload_file (any such call would itself be a test failure).
 
@@ -1270,7 +1271,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
 /// manifest must be held back, and that part marked pending so the next run re-uploads only
 /// it. `head` answers the HEAD of part 000001 on the first run.
 async fn lost_part_should_be_reuploaded_before_manifest(
-    head: fn(u64) -> Result<ObjectMetadata>,
+    head: fn(u64) -> Result<Option<ObjectMetadata>>,
 ) -> String {
     use btrfs_cold_backup::{BackupState, backup_state_path};
 
@@ -1338,20 +1339,65 @@ async fn lost_part_should_be_reuploaded_before_manifest(
     err
 }
 
+/// A HEAD that fails for a reason other than the part being gone (e.g. the network) says
+/// nothing about the part: the manifest must still be held back, but no upload record may be
+/// dropped, or an outage during the check would re-upload every part.
 #[tokio::test]
-async fn part_failing_head_should_be_reuploaded_before_manifest() {
-    let err =
-        lost_part_should_be_reuploaded_before_manifest(|_| Err(anyhow::anyhow!("NotFound"))).await;
+async fn transient_head_failure_should_hold_manifest_and_keep_upload_records() {
+    use btrfs_cold_backup::{BackupState, backup_state_path};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let output_dir = work_dir
+        .path()
+        .join("backup")
+        .join(sanitized)
+        .join("bcb_level0_202606021430");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    let mut state = sent_state(&output_dir);
+    for (index, bytes) in [("000000", &b"part a"[..]), ("000001", b"part b")] {
+        state
+            .parts
+            .insert(index.to_string(), write_part(&output_dir, index, bytes));
+        state.uploaded_parts.insert(index.to_string());
+    }
+    let sp = backup_state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    state.save(&sp).unwrap();
+
+    let btrfs = MockBtrfs::new();
+    // No upload expectations: nothing may be uploaded, the manifest least of all.
+    let mut remote = MockRemote::new();
+    remote
+        .expect_head_metadata()
+        .returning(|_| Err(anyhow::anyhow!("dispatch failure")));
+
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect_err("an unchecked part must hold the manifest back")
+        .to_string();
+    assert!(err.contains("dispatch failure"), "unexpected error: {err}");
+    let saved: BackupState = serde_yaml::from_slice(&std::fs::read(&sp).unwrap()).unwrap();
+    assert_eq!(saved.uploaded_parts, state.uploaded_parts);
+}
+
+#[tokio::test]
+async fn part_missing_from_s3_should_be_reuploaded_before_manifest() {
+    let err = lost_part_should_be_reuploaded_before_manifest(|_| Ok(None)).await;
     assert!(err.contains("part-000001"), "unexpected error: {err}");
 }
 
 #[tokio::test]
 async fn part_with_wrong_size_on_s3_should_be_reuploaded_before_manifest() {
     let err = lost_part_should_be_reuploaded_before_manifest(|size| {
-        Ok(ObjectMetadata {
+        Ok(Some(ObjectMetadata {
             size_bytes: size - 1,
             storage_class: "STANDARD".to_string(),
-        })
+        }))
     })
     .await;
     assert!(err.contains("part-000001"), "unexpected error: {err}");

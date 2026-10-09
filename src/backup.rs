@@ -190,7 +190,7 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
             &ancestor,
             |_, _| None,
         )
-        .await;
+        .await?;
         if let Some((_, first)) = issues.first() {
             return Err(anyhow!(
                 "level {l} backup {manifest_key} is incomplete ({} problem(s), first: {first}), \
@@ -790,9 +790,11 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
 
     if !state.inner.manifest_uploaded {
         // A store can lose a part after acknowledging its upload, e.g. on power loss, and a
-        // manifest promises a restorable backup, so every part is HEADed first. Any failure,
-        // even a network error, holds the manifest back; the `.age` files are kept until the
-        // backup completes, so the next run re-uploads just the parts found wanting.
+        // manifest promises a restorable backup, so every part is HEADed first. A part found
+        // missing or of the wrong size is marked for upload again; the `.age` files are kept
+        // until the backup completes, so the next run re-uploads just those. A HEAD that fails
+        // otherwise (e.g. the network) also holds the manifest back but leaves the state
+        // alone, so an outage can't turn into re-uploading every part.
         let issues = check_parts(
             remote,
             &config.s3.prefix,
@@ -802,7 +804,7 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
             &backup,
             |_, _| None,
         )
-        .await;
+        .await?;
         if let Some((_, first)) = issues.first() {
             for (index, _) in &issues {
                 state.inner.uploaded_parts.remove(index);

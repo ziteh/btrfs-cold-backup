@@ -105,7 +105,8 @@ pub async fn verify_task<R: RemoteBackend>(
                 _ => None,
             },
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| vec![(String::new(), format!("could not check parts: {e}"))]);
         issues.extend(part_issues.into_iter().map(|(_, description)| VerifyIssue {
             level: entry.level,
             timestamp: entry.timestamp.clone(),
@@ -132,9 +133,10 @@ pub async fn verify_task<R: RemoteBackend>(
     Ok(issues)
 }
 
-/// HEADs every part of `backup` and describes each that is missing, inaccessible, or not the
-/// size its manifest records, paired with the part's index. `check_found` adds
-/// caller-specific checks on parts that exist.
+/// HEADs every part of `backup` and describes each that is missing or not the size its
+/// manifest records, paired with the part's index. `check_found` adds caller-specific checks
+/// on parts that exist. A HEAD that fails for any other reason (e.g. the network) fails the
+/// whole check: it says nothing about the part, so callers must not act on it as missing.
 pub async fn check_parts<R: RemoteBackend>(
     remote: &R,
     prefix: &str,
@@ -143,12 +145,12 @@ pub async fn check_parts<R: RemoteBackend>(
     timestamp: &str,
     backup: &Backup,
     mut check_found: impl FnMut(&str, &ObjectMetadata) -> Option<String>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
     let mut issues = Vec::new();
     for part in &backup.parts {
         let part_key = s3_backup_key(prefix, sanitized, level, timestamp, &part.index);
-        match remote.head_metadata(&part_key).await {
-            Ok(meta) => {
+        match remote.head_metadata(&part_key).await? {
+            Some(meta) => {
                 if meta.size_bytes != part.size_bytes {
                     issues.push((
                         part.index.clone(),
@@ -161,13 +163,10 @@ pub async fn check_parts<R: RemoteBackend>(
                 issues
                     .extend(check_found(&part_key, &meta).map(|issue| (part.index.clone(), issue)));
             }
-            Err(e) => issues.push((
-                part.index.clone(),
-                format!("part {part_key} missing or inaccessible: {e}"),
-            )),
+            None => issues.push((part.index.clone(), format!("part {part_key} is missing"))),
         }
     }
-    issues
+    Ok(issues)
 }
 
 #[cfg(test)]
@@ -259,10 +258,10 @@ mod tests {
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
         remote.expect_head_metadata().returning(|_| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: 1024,
                 storage_class: "DEEP_ARCHIVE".to_string(),
-            })
+            }))
         });
 
         let issues = verify_task(&test_config(), &test_task(), &remote, None)
@@ -291,10 +290,10 @@ mod tests {
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
         remote.expect_head_metadata().returning(|_| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: 999,
                 storage_class: "DEEP_ARCHIVE".to_string(),
-            })
+            }))
         });
 
         let issues = verify_task(&test_config(), &test_task(), &remote, None)
@@ -323,10 +322,10 @@ mod tests {
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
         remote.expect_head_metadata().returning(|_| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: 1024,
                 storage_class: "STANDARD".to_string(),
-            })
+            }))
         });
 
         let issues = verify_task(&test_config(), &test_task(), &remote, None)
@@ -351,15 +350,13 @@ mod tests {
         remote
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
-        remote
-            .expect_head_metadata()
-            .returning(|_| Err(anyhow::anyhow!("not found")));
+        remote.expect_head_metadata().returning(|_| Ok(None));
 
         let issues = verify_task(&test_config(), &test_task(), &remote, None)
             .await
             .unwrap();
         assert_eq!(issues.len(), 1);
-        assert!(issues[0].description.contains("missing or inaccessible"));
+        assert!(issues[0].description.contains("is missing"));
     }
 
     #[tokio::test]
@@ -381,10 +378,10 @@ mod tests {
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
         remote.expect_head_metadata().returning(|_| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: 1024,
                 storage_class: "DEEP_ARCHIVE".to_string(),
-            })
+            }))
         });
 
         let issues = verify_task(&test_config(), &test_task(), &remote, None)
@@ -411,10 +408,10 @@ mod tests {
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
         remote.expect_head_metadata().returning(|_| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: 1024,
                 storage_class: "DEEP_ARCHIVE".to_string(),
-            })
+            }))
         });
 
         let issues = verify_task(&test_config(), &test_task(), &remote, Some(30))
@@ -440,10 +437,10 @@ mod tests {
             .expect_download()
             .returning(move |_| Ok(manifest_yaml.clone()));
         remote.expect_head_metadata().returning(|_| {
-            Ok(ObjectMetadata {
+            Ok(Some(ObjectMetadata {
                 size_bytes: 1024,
                 storage_class: "DEEP_ARCHIVE".to_string(),
-            })
+            }))
         });
 
         let issues = verify_task(&test_config(), &test_task(), &remote, Some(30))
