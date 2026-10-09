@@ -12,6 +12,23 @@ S3_PORT=8333
 S3_USER=s3testcreds
 S3_PASS=s3testcreds
 
+# `--reset` throws away the test state (btrfs image, S3 data) before setting up, so a run
+# doesn't inherit leftovers of earlier ones: a full disk, stray fixtures, objects under old
+# prefixes. Left off by default because the power-loss drill re-runs this script after a
+# reboot, and CI starts from a clean machine anyway.
+if [ "${1:-}" = "--reset" ]; then
+    systemctl stop bcb-weed &>/dev/null || true
+    pkill -x weed || true
+    while pgrep -x weed &>/dev/null; do sleep 0.5; done
+    mountpoint -q "$BTRFS_MOUNT" && umount "$BTRFS_MOUNT"
+    rm -f "$LOOP_IMG"
+    rm -rf "$SEAWEEDFS_DATA"
+fi
+
+# An automatic upgrade interrupted by a crash leaves packages half-configured, and apt then
+# refuses everything until repaired.
+systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer &>/dev/null || true
+
 # Sync clock before apt
 chronyc makestep 2>/dev/null || true
 

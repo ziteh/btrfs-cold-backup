@@ -9,17 +9,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VM=bcb-dev
+# shellcheck source=vm-lib.sh
+source "$SCRIPT_DIR/vm-lib.sh"
 
-vm() { multipass exec "$VM" -- sudo bash -c "$1"; }
-
-wait_for_vm() {
-    for _ in $(seq 1 60); do
-        multipass exec "$VM" -- true 2>/dev/null && return
-        sleep 3
-    done
-    echo "VM did not come back" >&2
-    exit 1
-}
+vm() { vm_exec "$1"; }
 
 # Runs in the VM: shared settings for every step below.
 PRELUDE='
@@ -99,6 +92,8 @@ crash_when() {
         multipass exec "$VM" -- true &>/dev/null || break
         sleep 0.5
     done
+    # The job is a subshell around the pipeline, so its `multipass exec` child must go first.
+    pkill -P "$session" 2>/dev/null || true
     kill "$session" 2>/dev/null || true
     wait "$session" 2>/dev/null || true
     wait_for_vm
@@ -120,9 +115,7 @@ resume_and_restore() {
 }
 
 ensure_vm_ready() {
-    multipass transfer "$SCRIPT_DIR/setup-vm.sh" "$VM:setup-vm.sh"
-    # Piped rather than sent to /dev/null: `multipass exec` busy-loops on a /dev/null stdout.
-    multipass exec "$VM" -- sudo bash setup-vm.sh | tail -1
+    vm_setup | tail -1
 }
 
 ensure_vm_ready

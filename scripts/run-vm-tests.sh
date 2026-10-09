@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VM=bcb-dev
+# shellcheck source=vm-lib.sh
+source "$SCRIPT_DIR/vm-lib.sh"
 BTRFS_MOUNT=/mnt/bcb-test
 S3_ENDPOINT=http://localhost:8333
 S3_BUCKET=bcb-test
@@ -12,6 +14,12 @@ TARGET=aarch64-unknown-linux-gnu
 
 # VM setup
 
+# Reset every run: the VM is long-lived, and state left by earlier runs (a full disk, stray
+# fixtures) otherwise surfaces as failures that look like bcb bugs. `--fresh` also recreates
+# the VM itself, to rule out the environment entirely.
+if [ "${1:-}" = "--fresh" ]; then
+    multipass delete --purge "$VM" 2>/dev/null || true
+fi
 if ! multipass info "$VM" &>/dev/null; then
     echo "==> Launching VM $VM..."
     # SeaweedFS runs master, volume, filer and S3 in one process; on multipass's default
@@ -20,11 +28,8 @@ if ! multipass info "$VM" &>/dev/null; then
     multipass launch --name "$VM" --disk 20G --memory 4G --cpus 2
 fi
 
-if ! multipass exec "$VM" -- bash -c "mountpoint -q '$BTRFS_MOUNT' && pgrep -x weed > /dev/null" 2>/dev/null; then
-    echo "==> Running VM setup..."
-    multipass transfer "$SCRIPT_DIR/setup-vm.sh" "$VM:setup-vm.sh"
-    multipass exec "$VM" -- sudo bash setup-vm.sh
-fi
+echo "==> Resetting VM test state..."
+vm_setup --reset
 
 # Host toolchain
 
