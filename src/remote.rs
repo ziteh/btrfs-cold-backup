@@ -12,7 +12,7 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::S3Config;
-use crate::util::{BYTES_PER_KBPS, IO_BUF_SIZE};
+use crate::util::{BYTES_PER_KBPS, IO_BUF_SIZE, fsync_dir};
 
 const PART_SIZE: usize = 64 * 1024 * 1024;
 
@@ -498,7 +498,13 @@ impl RemoteBackend for S3Backend {
             }
             file.write_all(&buf[..n]).await.with_context(write_err)?;
         }
-        file.flush().await.with_context(write_err)?;
+        // The caller records the range as downloaded next; after a power loss it must be.
+        file.sync_all().await.with_context(write_err)?;
+        if start == 0
+            && let Some(parent) = path.parent()
+        {
+            fsync_dir(parent).with_context(|| format!("failed to sync {parent:?}"))?;
+        }
         Ok(())
     }
 

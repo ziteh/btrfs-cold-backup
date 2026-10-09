@@ -12,7 +12,7 @@ use crate::{
     state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
         BYTES_PER_KBPS, GIB, available_space_bytes, compact_to_iso, restore_state_path,
-        restore_work_dir, s3_backup_key, s3_manifest_key, sanitize_subvolume_path,
+        restore_work_dir, s3_backup_key, s3_manifest_key, sanitize_subvolume_path, write_atomic,
     },
 };
 
@@ -150,6 +150,8 @@ async fn pipe_to_btrfs_receive(
 
 /// Downloads a single part in `chunk_size` ranges, persisting progress to `RestoreState`
 /// after every chunk so a crash mid-part only loses the in-flight chunk, not the whole part.
+/// The part is left `PartiallyDownloaded` at its full size; only the caller's hash check
+/// makes it `Downloaded`.
 async fn download_part_with_resume<R: RemoteBackend>(
     remote: &R,
     key: &str,
@@ -197,6 +199,15 @@ async fn download_part_with_resume<R: RemoteBackend>(
         remote
             .download_range_to_file(key, downloaded, chunk_end, target_path)
             .await?;
+        // A body cut short without an error would otherwise shift every later chunk.
+        let len = tokio::fs::metadata(target_path).await?.len();
+        if len != chunk_end + 1 {
+            return Err(anyhow!(
+                "range {downloaded}-{chunk_end} of {key} left {target_path:?} at {len} bytes, \
+                 expected {}",
+                chunk_end + 1
+            ));
+        }
 
         downloaded = chunk_end + 1;
         if let Some(part) = state.parts.get_mut(part_index) {
@@ -206,10 +217,6 @@ async fn download_part_with_resume<R: RemoteBackend>(
         }
         state.save(state_path)?;
         test_pause_after_downloaded_bytes(downloaded).await;
-    }
-
-    if let Some(part) = state.parts.get_mut(part_index) {
-        part.download_state = PartDownloadState::Downloaded;
     }
     Ok(())
 }
@@ -320,9 +327,7 @@ async fn load_or_fetch_manifest<R: RemoteBackend>(
     let bytes = remote.download(manifest_key).await?;
     // Parse before caching so a corrupt download is never persisted.
     let backup = parse_backup(&bytes)?;
-    let tmp = cache_path.with_extension("yaml.tmp");
-    tokio::fs::write(&tmp, &bytes).await?;
-    tokio::fs::rename(&tmp, cache_path).await?;
+    write_atomic(cache_path, &bytes)?;
     Ok(backup)
 }
 
@@ -1037,11 +1042,48 @@ mod tests {
 
         assert_eq!(
             state.parts["000000"].download_state,
-            PartDownloadState::Downloaded
+            PartDownloadState::PartiallyDownloaded {
+                downloaded_bytes: 25
+            }
         );
         let content = std::fs::read(&target).unwrap();
         let expected: Vec<u8> = (0u64..25).map(|i| i as u8).collect();
         assert_eq!(content, expected);
+    }
+
+    #[tokio::test]
+    async fn download_part_fails_when_a_range_comes_back_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("part.age");
+        let state_path = dir.path().join("state.yaml");
+        let mut state = state_with_part("000000", 25);
+
+        // The second range ends a byte early without an error.
+        let mut remote = MockRemoteBackend::new();
+        remote
+            .expect_download_range_to_file()
+            .returning(|_, start, end, path| {
+                append_range(path, start, if start == 10 { end - 1 } else { end })
+            });
+
+        download_part_with_resume(
+            &remote,
+            "key",
+            10,
+            &target,
+            &mut state,
+            "000000",
+            &state_path,
+        )
+        .await
+        .expect_err("a short range must fail the part");
+
+        assert_eq!(
+            state.parts["000000"].download_state,
+            PartDownloadState::PartiallyDownloaded {
+                downloaded_bytes: 10
+            }
+        );
     }
 
     #[tokio::test]
