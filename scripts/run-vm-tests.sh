@@ -17,7 +17,7 @@ if ! multipass info "$VM" &>/dev/null; then
     # SeaweedFS runs master, volume, filer and S3 in one process; on multipass's default
     # memory it is OOM-killed partway through the suite, which surfaces as unrelated-looking
     # "dispatch failure" errors from every S3 call after that point.
-    multipass launch --name "$VM" --disk 10G --memory 4G --cpus 2
+    multipass launch --name "$VM" --disk 20G --memory 4G --cpus 2
 fi
 
 if ! multipass exec "$VM" -- bash -c "mountpoint -q '$BTRFS_MOUNT' && pgrep -x weed > /dev/null" 2>/dev/null; then

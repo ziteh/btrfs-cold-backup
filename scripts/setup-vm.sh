@@ -15,8 +15,12 @@ S3_PASS=s3testcreds
 # Sync clock before apt
 chronyc makestep 2>/dev/null || true
 
-apt-get update -q
-apt-get install -y btrfs-progs curl unzip
+# Skipped once installed: re-running after a VM crash shouldn't depend on apt, which a crash
+# mid-upgrade can leave broken.
+if ! command -v btrfs &>/dev/null || ! command -v curl &>/dev/null || ! command -v unzip &>/dev/null; then
+    apt-get update -q
+    apt-get install -y btrfs-progs curl unzip
+fi
 
 # AWS CLI v2 (used only to create the test bucket below). Not installed via apt: Ubuntu
 # noble dropped the `awscli` package, and GitHub-hosted runners already have v2 preinstalled
@@ -63,9 +67,13 @@ fi
 
 if ! pgrep -x weed &>/dev/null; then
     mkdir -p "$SEAWEEDFS_DATA"
-    nohup "$SEAWEEDFS_BIN" server -dir="$SEAWEEDFS_DATA" -s3 -s3.port="$S3_PORT" \
-        -master.port=9333 -volume.port=8080 -filer.port=8888 -ip=localhost \
-        &>/var/log/seaweedfs.log &
+    # A systemd unit outlives the `multipass exec` session that started it, which a nohup'd
+    # child does not. -volume.max is raised from the default 8 because volumes left
+    # unwritable by a crash count against it, and once all are, every upload fails.
+    systemctl reset-failed bcb-weed &>/dev/null || true
+    systemd-run --unit=bcb-weed "$SEAWEEDFS_BIN" server -dir="$SEAWEEDFS_DATA" -s3 \
+        -s3.port="$S3_PORT" -master.port=9333 -volume.port=8080 -filer.port=8888 \
+        -volume.max=100 -ip=localhost
     for _ in $(seq 1 30); do
         curl -fsS "http://localhost:$S3_PORT" &>/dev/null && break
         sleep 1
