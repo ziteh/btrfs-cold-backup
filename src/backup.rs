@@ -342,9 +342,11 @@ const SPLIT_PART_SIZE: u64 = 3 * 1024 * 1024 * 1024;
 // fixtures.
 #[cfg(debug_assertions)]
 fn split_part_size() -> u64 {
+    // A value that doesn't parse must not silently fall back to full-size parts, or a test
+    // meant to exercise multiple parts would quietly run with one.
     std::env::var("BCB_TEST_SPLIT_SIZE")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .map(|v| v.parse().expect("BCB_TEST_SPLIT_SIZE must be a byte count"))
         .unwrap_or(SPLIT_PART_SIZE)
 }
 

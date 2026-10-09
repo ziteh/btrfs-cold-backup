@@ -21,7 +21,10 @@ use crate::{
 fn part_chunk_size() -> usize {
     std::env::var("BCB_TEST_PART_CHUNK_SIZE")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .map(|v| {
+            v.parse()
+                .expect("BCB_TEST_PART_CHUNK_SIZE must be a byte count")
+        })
         .unwrap_or(64 * 1024 * 1024)
 }
 
