@@ -21,7 +21,9 @@ pub use crypto::{
     blake3_file, decrypt_file, encrypt_file, generate_key_pair, test_key_pair, write_private_key,
 };
 pub use lock::PidLock;
-pub use remote::{ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, S3Backend};
+pub use remote::{
+    ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, RestoreTier, S3Backend,
+};
 pub use restore::RetrievalOptions;
 pub use state::{BackupState, PartDownloadState, PartRecord, RestorePartState, RestoreState};
 pub use util::{backup_state_path, sanitize_subvolume_path};

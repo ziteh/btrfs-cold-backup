@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use btrfs_cold_backup::{
     BtrfsOps, Config, ObjectMetadata, RemoteBackend, RestoreConfig, RestoreStatus,
-    RestoreStatusDetail, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass, SubvolumeUuids,
-    Task,
+    RestoreStatusDetail, RestoreTier, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass,
+    SubvolumeUuids, Task,
     backup::backup_task,
     manifest::{FORMAT_VERSION, LatestBackup, LatestManifest},
     restore::restore_task,
@@ -34,7 +34,7 @@ mock! {
         async fn download(&self, key: &str) -> Result<Vec<u8>>;
         async fn download_range_to_file(&self, key: &str, start: u64, end: u64, path: &Path) -> Result<()>;
         async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
-        async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
+        async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()>;
         async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata>;
         async fn verify_credentials(&self) -> Result<()>;
         async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
@@ -57,7 +57,7 @@ fn test_public_key() -> String {
 fn retrieval() -> RetrievalOptions {
     RetrievalOptions {
         days: 1,
-        tier: "Standard".to_string(),
+        tier: RestoreTier::Standard,
     }
 }
 
@@ -2303,7 +2303,7 @@ async fn restore_should_reissue_retrieval_for_expired_partial_download_regardles
         &test_private_key(),
         &RetrievalOptions {
             days: 2,
-            tier: "Standard".to_string(),
+            tier: RestoreTier::Standard,
         },
         &remote,
     )
@@ -2440,7 +2440,7 @@ async fn run_draining_ready_wave_should_request_next_wave_within_budget() {
         private_key.expose_secret(),
         &RetrievalOptions {
             days: 2,
-            tier: "Standard".to_string(),
+            tier: RestoreTier::Standard,
         },
         &remote,
     )
@@ -2529,7 +2529,7 @@ async fn restore_budget_smaller_than_any_part_should_force_one_request_instead_o
         &test_private_key(),
         &RetrievalOptions {
             days: 2,
-            tier: "Standard".to_string(),
+            tier: RestoreTier::Standard,
         },
         &remote,
     )
@@ -2946,7 +2946,7 @@ async fn restore_days_shorter_than_lead_window_should_be_rejected_before_any_s3_
         &test_private_key(),
         &RetrievalOptions {
             days: 3,
-            tier: "Bulk".to_string(),
+            tier: RestoreTier::Bulk,
         },
         &remote,
     )

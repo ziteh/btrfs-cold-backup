@@ -1,6 +1,8 @@
 use age::secrecy::ExposeSecret;
 use anyhow::{Result, anyhow};
-use btrfs_cold_backup::{BtrfsDriver, Config, PidLock, S3Backend, Task, write_private_key};
+use btrfs_cold_backup::{
+    BtrfsDriver, Config, PidLock, RestoreTier, S3Backend, Task, write_private_key,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -79,9 +81,9 @@ enum Commands {
         /// Days the retrieved copy of archived objects stays downloadable
         #[arg(long, default_value_t = 3)]
         restore_days: i32,
-        /// Archive retrieval tier: Standard, Bulk, or Expedited
-        #[arg(long, default_value = "Standard")]
-        restore_tier: String,
+        /// Archive retrieval tier
+        #[arg(long, value_enum, default_value_t = RestoreTier::Standard)]
+        restore_tier: RestoreTier,
     },
 }
 

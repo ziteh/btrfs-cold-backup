@@ -3,14 +3,14 @@ use std::process::Command;
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    BtrfsDriver, Config, RestoreConfig, RetrievalOptions, S3Backend, S3Config, S3RetryConfig,
-    S3StorageClass, Task, backup::backup_task, restore::restore_task,
+    BtrfsDriver, Config, RestoreConfig, RestoreTier, RetrievalOptions, S3Backend, S3Config,
+    S3RetryConfig, S3StorageClass, Task, backup::backup_task, restore::restore_task,
 };
 
 fn retrieval() -> RetrievalOptions {
     RetrievalOptions {
         days: 1,
-        tier: "Standard".to_string(),
+        tier: RestoreTier::Standard,
     }
 }
 

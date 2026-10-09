@@ -150,3 +150,24 @@ fn test_keys_with_mismatched_key_pair_should_fail_with_nonzero_exit() {
     ]);
     assert!(!out.status.success());
 }
+
+#[test]
+fn restore_with_unknown_tier_should_exit_with_clap_usage_error() {
+    let out = run_bcb(&[
+        "restore",
+        "--task",
+        "task",
+        "--level",
+        "0",
+        "--date",
+        "20260602",
+        "--target",
+        "/nonexistent",
+        "--private-key",
+        "/nonexistent",
+        "--restore-tier",
+        "Fastest",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("Fastest"), "stderr={}", stderr(&out));
+}

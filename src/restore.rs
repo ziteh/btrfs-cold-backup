@@ -8,7 +8,7 @@ use crate::{
     Config, RemoteBackend, Task,
     crypto::{blake3_file, decrypt_to_writer},
     manifest::{Backup, parse_backup},
-    remote::{RestoreStatus, RestoreStatusDetail},
+    remote::{RestoreStatus, RestoreStatusDetail, RestoreTier},
     state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
         BYTES_PER_KBPS, GIB, available_space_bytes, compact_to_iso, restore_state_path,
@@ -55,7 +55,7 @@ async fn test_pause_after_downloaded_bytes(_downloaded: u64) {}
 /// Retrieval tier and lifetime for archived (Glacier / Deep Archive) objects.
 pub struct RetrievalOptions {
     pub days: i32,
-    pub tier: String,
+    pub tier: RestoreTier,
 }
 
 /// Outcome of one `restore_task` invocation: either the restore fully finished (the
@@ -76,12 +76,11 @@ pub struct RestoreProgress {
 /// Deep Archive SLA for each tier (since a single retrieval tier can back either storage
 /// class) with a 1.5x safety margin. Override via `restore.lead_days` if these drift from
 /// AWS's current published values.
-fn default_lead_days(tier: &str) -> f64 {
+fn default_lead_days(tier: RestoreTier) -> f64 {
     match tier {
-        "Expedited" => 0.05, // Glacier only, ~1-5min SLA
-        "Standard" => 0.75,  // max(Glacier ~5h, Deep Archive ~12h) * 1.5
-        "Bulk" => 3.0,       // max(Glacier ~12h, Deep Archive ~48h) * 1.5
-        _ => 1.0,
+        RestoreTier::Expedited => 0.05, // Glacier only, ~1-5min SLA
+        RestoreTier::Standard => 0.75,  // max(Glacier ~5h, Deep Archive ~12h) * 1.5
+        RestoreTier::Bulk => 3.0,       // max(Glacier ~12h, Deep Archive ~48h) * 1.5
     }
 }
 
@@ -311,7 +310,7 @@ async fn load_or_fetch_manifest<R: RemoteBackend>(
         RestoreStatus::NotRequested => {
             tracing::warn!("manifest is archived, requesting retrieval");
             remote
-                .request_restore(manifest_key, retrieval.days, &retrieval.tier)
+                .request_restore(manifest_key, retrieval.days, retrieval.tier)
                 .await?;
             return Err(anyhow!(
                 "manifest archived, retrieval requested; re-run restore task once retrieval completes"
@@ -371,7 +370,7 @@ fn retrieval_buffer_target(config: &Config, retrieval: &RetrievalOptions) -> Res
         .s3
         .restore
         .lead_days
-        .unwrap_or_else(|| default_lead_days(&retrieval.tier));
+        .unwrap_or_else(|| default_lead_days(retrieval.tier));
     let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);
 
     // With pacing enabled, a wave of retrieved copies is drained over ~lead_days of
@@ -525,7 +524,7 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
             };
             tracing::info!("requesting retrieval for part {}", part_info.index);
             self.remote
-                .request_restore(key, self.retrieval.days, &self.retrieval.tier)
+                .request_restore(key, self.retrieval.days, self.retrieval.tier)
                 .await?;
             if !partially_downloaded {
                 bytes_requested += part.size_bytes;
@@ -549,7 +548,7 @@ impl<R: RemoteBackend> RestoreRun<'_, R> {
                      part {index} to avoid stalling forever"
                 );
                 self.remote
-                    .request_restore(key, self.retrieval.days, &self.retrieval.tier)
+                    .request_restore(key, self.retrieval.days, self.retrieval.tier)
                     .await?;
             }
         }

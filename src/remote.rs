@@ -27,6 +27,15 @@ pub enum RestoreStatus {
     NotRequested,
 }
 
+/// Archive retrieval tier, named as in the S3 API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "PascalCase")]
+pub enum RestoreTier {
+    Standard,
+    Bulk,
+    Expedited,
+}
+
 /// Detailed restore status with expiry information for Ready objects.
 #[derive(Debug, Clone)]
 pub struct RestoreStatusDetail {
@@ -77,7 +86,7 @@ pub trait RemoteBackend: Send + Sync {
     /// with the retrieved copy's expiry when available.
     async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
     /// Initiates an archive retrieval so the object becomes downloadable for `days`.
-    async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()>;
+    async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()>;
     /// Returns the object's size and storage class via HeadObject, without requesting or
     /// waiting on any archive retrieval — used by `bcb verify` to audit stored backups.
     async fn head_metadata(&self, key: &str) -> Result<ObjectMetadata>;
@@ -571,12 +580,17 @@ impl RemoteBackend for S3Backend {
         })
     }
 
-    async fn request_restore(&self, key: &str, days: i32, tier: &str) -> Result<()> {
+    async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()> {
+        let tier = match tier {
+            RestoreTier::Standard => Tier::Standard,
+            RestoreTier::Bulk => Tier::Bulk,
+            RestoreTier::Expedited => Tier::Expedited,
+        };
         let request = RestoreRequest::builder()
             .days(days)
             .glacier_job_parameters(
                 GlacierJobParameters::builder()
-                    .tier(Tier::from(tier))
+                    .tier(tier)
                     .build()
                     .map_err(|e| anyhow!("invalid retrieval tier: {e}"))?,
             )
