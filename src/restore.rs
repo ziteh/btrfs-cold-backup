@@ -873,12 +873,14 @@ pub async fn restore_task<R: RemoteBackend>(
     preflight(&backup, &state, &identity, level, target_dir, &work_dir)?;
 
     let daily_budget = daily_budget_bytes(config.s3.restore.expected_download_kbps);
-    let remaining_bytes: u64 = state
-        .parts
-        .values()
-        .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
-        .map(|p| p.size_bytes)
-        .sum();
+    let remaining = || {
+        state
+            .parts
+            .values()
+            .filter(|p| !matches!(p.download_state, PartDownloadState::Downloaded))
+    };
+    let remaining_bytes: u64 = remaining().map(|p| p.size_bytes).sum();
+    let remaining_parts = remaining().count();
     if daily_budget > 0 {
         let estimated_days = (remaining_bytes as f64 / daily_budget as f64).ceil() as u64;
         tracing::info!(
@@ -887,6 +889,15 @@ pub async fn restore_task<R: RemoteBackend>(
             daily_budget,
             remaining_bytes,
             estimated_days
+        );
+    } else if remaining_parts > 1 {
+        tracing::warn!(
+            "restore schedule: no pacing configured (s3.restore.expected_download_kbps is 0), \
+             so all {remaining_parts} remaining parts ({remaining_bytes} bytes) are requested \
+             for retrieval at once; parts not downloaded within --restore-days ({} days) \
+             expire and must be retrieved, and paid for, again. Set expected_download_kbps \
+             to pace retrievals to your bandwidth",
+            retrieval.days
         );
     } else {
         tracing::info!(
