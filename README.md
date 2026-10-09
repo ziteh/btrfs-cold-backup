@@ -168,6 +168,8 @@ Leave `manifest` objects unexpired. Don't expire a level that a later incrementa
 
 Before an incremental backup, bcb HEADs every part of every lower level listed in `latest.yaml` and refuses to back up if any is missing or has the wrong size; run a level 0 backup to start a new chain.
 
+Before writing a backup's manifest, bcb HEADs every part of that backup; a part missing or of the wrong size is uploaded again on the next run.
+
 ## Documentation
 
 - [Periodic backup example](docs/periodic-backup-example.md) — btrbk config, systemd units, failure alerting (ready-to-copy files in [contrib/](contrib/README.md))

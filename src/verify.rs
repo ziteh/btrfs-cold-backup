@@ -106,7 +106,7 @@ pub async fn verify_task<R: RemoteBackend>(
             },
         )
         .await;
-        issues.extend(part_issues.into_iter().map(|description| VerifyIssue {
+        issues.extend(part_issues.into_iter().map(|(_, description)| VerifyIssue {
             level: entry.level,
             timestamp: entry.timestamp.clone(),
             description,
@@ -133,7 +133,8 @@ pub async fn verify_task<R: RemoteBackend>(
 }
 
 /// HEADs every part of `backup` and describes each that is missing, inaccessible, or not the
-/// size its manifest records. `check_found` adds caller-specific checks on parts that exist.
+/// size its manifest records, paired with the part's index. `check_found` adds
+/// caller-specific checks on parts that exist.
 pub async fn check_parts<R: RemoteBackend>(
     remote: &R,
     prefix: &str,
@@ -142,21 +143,28 @@ pub async fn check_parts<R: RemoteBackend>(
     timestamp: &str,
     backup: &Backup,
     mut check_found: impl FnMut(&str, &ObjectMetadata) -> Option<String>,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let mut issues = Vec::new();
     for part in &backup.parts {
         let part_key = s3_backup_key(prefix, sanitized, level, timestamp, &part.index);
         match remote.head_metadata(&part_key).await {
             Ok(meta) => {
                 if meta.size_bytes != part.size_bytes {
-                    issues.push(format!(
-                        "part {part_key}: manifest says {} bytes, S3 reports {} bytes",
-                        part.size_bytes, meta.size_bytes
+                    issues.push((
+                        part.index.clone(),
+                        format!(
+                            "part {part_key}: manifest says {} bytes, S3 reports {} bytes",
+                            part.size_bytes, meta.size_bytes
+                        ),
                     ));
                 }
-                issues.extend(check_found(&part_key, &meta));
+                issues
+                    .extend(check_found(&part_key, &meta).map(|issue| (part.index.clone(), issue)));
             }
-            Err(e) => issues.push(format!("part {part_key} missing or inaccessible: {e}")),
+            Err(e) => issues.push((
+                part.index.clone(),
+                format!("part {part_key} missing or inaccessible: {e}"),
+            )),
         }
     }
     issues

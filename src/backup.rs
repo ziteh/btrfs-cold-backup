@@ -191,7 +191,7 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
             |_, _| None,
         )
         .await;
-        if let Some(first) = issues.first() {
+        if let Some((_, first)) = issues.first() {
             return Err(anyhow!(
                 "level {l} backup {manifest_key} is incomplete ({} problem(s), first: {first}), \
                  so a level {level} backup on top of it could never be restored; its parts may \
@@ -786,20 +786,36 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         .await?;
         state.inner.uploaded_parts.insert(index.clone());
         state.save()?;
-        // Deleted only once the state records the upload: gone any earlier, a crash would
-        // leave a part that is neither on disk nor marked uploaded. A crash after the save
-        // leaves the file for the output_dir cleanup below.
-        let enc_path = plan
-            .output_dir
-            .join(format!("{SNAPSHOT_PART_PREFIX}{index}.age"));
-        if let Err(e) = tokio::fs::remove_file(&enc_path).await {
-            tracing::warn!("failed to remove uploaded part {:?}: {e}", enc_path);
-        }
     }
 
     let backup = build_manifest(config, &plan, level, stream_hash, &state.inner).await;
 
     if !state.inner.manifest_uploaded {
+        // A store can lose a part after acknowledging its upload, e.g. on power loss, and a
+        // manifest promises a restorable backup, so every part is HEADed first. Any failure,
+        // even a network error, holds the manifest back; the `.age` files are kept until the
+        // backup completes, so the next run re-uploads just the parts found wanting.
+        let issues = check_parts(
+            remote,
+            &config.s3.prefix,
+            &sanitized,
+            level,
+            &plan.timestamp,
+            &backup,
+            |_, _| None,
+        )
+        .await;
+        if let Some((_, first)) = issues.first() {
+            for (index, _) in &issues {
+                state.inner.uploaded_parts.remove(index);
+            }
+            state.save()?;
+            return Err(anyhow!(
+                "{} part(s) of this backup are not on S3 as uploaded (first: {first}); the \
+                 manifest was not written, re-run to upload those parts again",
+                issues.len()
+            ));
+        }
         remote
             .upload_bytes(
                 &plan.manifest_key,

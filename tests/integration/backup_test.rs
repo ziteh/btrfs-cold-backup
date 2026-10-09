@@ -123,6 +123,29 @@ fn latest_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
     serde_yaml::to_string(&latest).unwrap().into_bytes()
 }
 
+/// Answers HEADs of this backup's parts as S3 would after good uploads: with the size of the
+/// `.age` that is still in `base_dir`. mockall tries expectations in the order they were set,
+/// so set this before any catch-all `head_metadata` expectation.
+fn expect_parts_on_s3(remote: &mut MockRemote, base_dir: &Path) {
+    let local = {
+        let base_dir = base_dir.to_path_buf();
+        move |key: &str| {
+            key.strip_prefix("backups/backup-data/")
+                .map(|rest| base_dir.join("backup").join(rest))
+        }
+    };
+    let local_clone = local.clone();
+    remote
+        .expect_head_metadata()
+        .withf(move |key| local_clone(key).is_some_and(|p| p.exists()))
+        .returning(move |key| {
+            Ok(ObjectMetadata {
+                size_bytes: std::fs::metadata(local(key).unwrap())?.len(),
+                storage_class: "STANDARD".to_string(),
+            })
+        });
+}
+
 /// Full level-0 backup: find snapshot, send_full, encrypt, upload, write manifests.
 #[tokio::test]
 async fn level0_full_backup_should_succeed_and_return_manifest() {
@@ -151,6 +174,7 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
         .expect_upload_file()
         .withf(|_, _, _, tags| tags == "bcb-backup-level=0")
         .returning(|_, _, _, _| Ok(()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     remote
         .expect_upload_bytes()
         .withf(|_, _, _, tags| tags == "bcb-backup-level=manifest")
@@ -263,6 +287,7 @@ async fn backup_should_fail_when_latest_manifest_is_corrupt() {
         .withf(|key| key.contains("latest.yaml"))
         .returning(|_| Ok(b"[not, a, valid, latest-manifest, mapping]".to_vec()));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
     let err = backup_task(&config, &task, 0, &btrfs, &remote)
@@ -345,6 +370,7 @@ async fn level1_incremental_should_use_level0_as_parent() {
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
@@ -397,6 +423,7 @@ async fn level2_incremental_should_use_level1_as_parent() {
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     expect_ancestors(&mut remote, |_| Ok(ANCESTOR_PART_SIZE));
     remote
         .expect_upload_file()
@@ -876,6 +903,7 @@ async fn level0_of_new_source_should_replace_latest_manifest() {
     let uploaded_clone = uploaded.clone();
     let mut remote = remote_with_latest(old_yaml);
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     remote
         .expect_upload_bytes()
         .withf(|key, _, _, _| key.contains("/manifest.yaml"))
@@ -991,6 +1019,7 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_latest_m
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(stale_last_yaml.clone()));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     remote
         .expect_upload_bytes()
         .withf(|key, _, _, _| key.contains("/manifest.yaml"))
@@ -1108,13 +1137,10 @@ async fn resume_should_skip_already_uploaded_parts() {
     std::fs::create_dir_all(&output_dir).unwrap();
 
     let mut state = sent_state(&output_dir);
-    // part 000000 was already uploaded (gone from disk); 000001 is still pending
+    // part 000000 was already uploaded; 000001 is still pending
     state.parts.insert(
         "000000".to_string(),
-        btrfs_cold_backup::PartRecord {
-            size_bytes: 12,
-            blake3: "already-uploaded".to_string(),
-        },
+        write_part(&output_dir, "000000", b"uploaded part"),
     );
     state.uploaded_parts.insert("000000".to_string());
     state.parts.insert(
@@ -1135,6 +1161,7 @@ async fn resume_should_skip_already_uploaded_parts() {
         .times(1)
         .returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
     remote
         .expect_exists()
         .withf(|key| key.contains("latest.yaml"))
@@ -1148,8 +1175,8 @@ async fn resume_should_skip_already_uploaded_parts() {
     assert_eq!(backup.blake3, "streamhash");
 }
 
-/// A crash after a part's upload but before the state records it must leave the `.age` on
-/// disk, so the resumed run re-uploads it instead of finding the part missing.
+/// A crash after a part's upload but before the state records it must leave the part pending,
+/// so the resumed run re-uploads just that part.
 #[tokio::test]
 async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
     use btrfs_cold_backup::backup_state_path;
@@ -1193,7 +1220,6 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
             .await
             .is_err()
     );
-    assert!(output_dir.join("snapshot.part-000000.age").exists());
 
     std::fs::remove_dir(&tmp_path).unwrap();
     let mut remote = MockRemote::new();
@@ -1204,12 +1230,104 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
         .returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
     remote.expect_exists().returning(|_| Ok(false));
+    expect_parts_on_s3(&mut remote, work_dir.path());
 
     let backup = backup_task(&config, &task, 0, &btrfs, &remote)
         .await
         .expect("resumed backup should succeed")
         .expect("resume must not be skipped");
     assert_eq!(backup.parts.len(), 1);
+}
+
+/// A store can lose a part it acknowledged; the state's upload record is no proof. The
+/// manifest must be held back, and that part marked pending so the next run re-uploads only
+/// it. `head` answers the HEAD of part 000001 on the first run.
+async fn lost_part_should_be_reuploaded_before_manifest(
+    head: fn(u64) -> Result<ObjectMetadata>,
+) -> String {
+    use btrfs_cold_backup::{BackupState, backup_state_path};
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let config = test_config(work_dir.path());
+    let task = movies_task();
+    let sanitized = "mnt_data_movies";
+
+    let output_dir = work_dir
+        .path()
+        .join("backup")
+        .join(sanitized)
+        .join("bcb_level0_202606021430");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    let mut state = sent_state(&output_dir);
+    for (index, bytes) in [("000000", &b"kept part"[..]), ("000001", b"lost part")] {
+        state
+            .parts
+            .insert(index.to_string(), write_part(&output_dir, index, bytes));
+        state.uploaded_parts.insert(index.to_string());
+    }
+    let sp = backup_state_path(work_dir.path(), sanitized);
+    std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
+    state.save(&sp).unwrap();
+
+    let btrfs = MockBtrfs::new();
+    // No upload expectations: nothing may be uploaded, the manifest least of all.
+    let mut remote = MockRemote::new();
+    let lost_size = state.parts["000001"].size_bytes;
+    remote
+        .expect_head_metadata()
+        .withf(|key| key.contains("part-000001"))
+        .returning(move |_| head(lost_size));
+    expect_parts_on_s3(&mut remote, work_dir.path());
+    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect_err("a part missing from S3 must hold the manifest back")
+        .to_string();
+    let saved: BackupState = serde_yaml::from_slice(&std::fs::read(&sp).unwrap()).unwrap();
+    assert!(!saved.uploaded_parts.contains("000001"));
+    assert!(saved.uploaded_parts.contains("000000"));
+
+    let mut remote = MockRemote::new();
+    remote
+        .expect_upload_file()
+        .withf(|key, _, _, _| key.contains("part-000001"))
+        .times(1)
+        .returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_upload_bytes()
+        .withf(|key, _, _, _| key.contains("/manifest.yaml"))
+        .times(1)
+        .returning(|_, _, _, _| Ok(()));
+    remote
+        .expect_upload_bytes()
+        .withf(|key, _, _, _| key.contains("latest.yaml"))
+        .returning(|_, _, _, _| Ok(()));
+    remote.expect_exists().returning(|_| Ok(false));
+    expect_parts_on_s3(&mut remote, work_dir.path());
+    backup_task(&config, &task, 0, &btrfs, &remote)
+        .await
+        .expect("the re-run should re-upload the part and finish")
+        .expect("must not be skipped");
+    err
+}
+
+#[tokio::test]
+async fn part_failing_head_should_be_reuploaded_before_manifest() {
+    let err =
+        lost_part_should_be_reuploaded_before_manifest(|_| Err(anyhow::anyhow!("NotFound"))).await;
+    assert!(err.contains("part-000001"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn part_with_wrong_size_on_s3_should_be_reuploaded_before_manifest() {
+    let err = lost_part_should_be_reuploaded_before_manifest(|size| {
+        Ok(ObjectMetadata {
+            size_bytes: size - 1,
+            storage_class: "STANDARD".to_string(),
+        })
+    })
+    .await;
+    assert!(err.contains("part-000001"), "unexpected error: {err}");
 }
 
 /// An unfinished backup of another level must not be discarded to start this one: its state
@@ -1281,8 +1399,8 @@ async fn uploaded_part_should_decrypt_to_the_send_stream() {
         .returning(move |_| Ok(vec![snap.to_string()]));
     btrfs.expect_send_full().returning(|_| Ok(fake_stream()));
 
-    // production code deletes the file right after a successful upload, so the bytes and
-    // the directory listing must be captured here, before that happens.
+    // output_dir is removed once the backup completes, so the bytes and the directory listing
+    // must be captured here, during the upload.
     let uploaded = Arc::new(Mutex::new(None::<(Vec<u8>, usize)>));
     let uploaded_clone = uploaded.clone();
     let mut remote = MockRemote::new();
@@ -1296,6 +1414,7 @@ async fn uploaded_part_should_decrypt_to_the_send_stream() {
             Ok(())
         });
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
 
     let backup = backup_task(&config, &task, 0, &btrfs, &remote)
         .await
