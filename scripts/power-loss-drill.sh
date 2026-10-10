@@ -124,7 +124,7 @@ resume_and_restore
 
 echo "==> Drill 2: power loss while uploading"
 setup
-crash_when 'grep -q "^- " $D/base/backup/*/state.yaml 2>/dev/null'
+crash_when 'grep -q "^- " $D/base/backup/*/state-level0.yaml 2>/dev/null'
 resume_and_restore
 
 echo "==> Power-loss drills passed"

@@ -1,13 +1,15 @@
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use btrfs_cold_backup::{
     backup::backup_task,
     btrfs::SubvolumeUuids,
-    config::StorageClass,
+    config::{Config, StorageClass},
     manifest::{LatestEntry, LatestManifest},
     remote::ObjectMetadata,
-    timestamp::Timestamp,
+    state::{BackupState, BackupTarget, PartRecord, SentStream, StateFile},
+    timestamp::{BackupId, Timestamp},
 };
 use tokio::io::AsyncRead;
 
@@ -305,24 +307,9 @@ fn latest_with(snapshot_names: &[&str]) -> Vec<u8> {
     yaml(&latest)
 }
 
-/// Runs a level `level` backup of `snap` against a latest manifest holding `latest` and
-/// returns the parent it was sent relative to, or the error.
-async fn incremental_parent(latest: &[&str], snap: &'static str, level: u32) -> Result<String> {
-    let work_dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(work_dir.path());
-    config.s3.storage_class.backup_data = vec![StorageClass::Standard; 4];
-    let task = movies_task();
-
-    let mut local: Vec<String> = latest.iter().map(|s| s.to_string()).collect();
-    local.push(snap.to_string());
-    let mut btrfs = btrfs_with_uuids();
-    btrfs
-        .expect_list_snapshots()
-        .returning(move |_| Ok(local.clone()));
-    btrfs
-        .expect_send_incremental()
-        .returning(|_, _| Ok(fake_stream()));
-
+/// Remote for an incremental backup of movies in `base_dir` against a latest manifest
+/// holding `latest`, with every ancestor's parts on S3.
+fn remote_for_incremental(base_dir: &Path, latest: &[&str]) -> MockRemote {
     let latest_bytes = latest_with(latest);
     let mut remote = MockRemote::new();
     remote
@@ -337,14 +324,47 @@ async fn incremental_parent(latest: &[&str], snap: &'static str, level: u32) -> 
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(latest_bytes.clone()));
-    expect_parts_on_s3(&mut remote, work_dir.path());
+    expect_parts_on_s3(&mut remote, base_dir);
     expect_ancestors(&mut remote, |_| Ok(Some(ANCESTOR_PART_SIZE)));
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+    remote
+}
 
-    let backup = backup_task(&config, &task, level, &btrfs, &remote)
-        .await?
-        .expect("must not be skipped");
+/// Config for movies in `base_dir` with a storage class for levels 0 to 3.
+fn four_level_config(base_dir: &Path) -> Config {
+    let mut config = test_config(base_dir);
+    config.s3.storage_class.backup_data = vec![StorageClass::Standard; 4];
+    config
+}
+
+/// Btrfs holding `snapshots` of movies, any of which can be sent incrementally.
+fn btrfs_for_incremental(snapshots: Vec<String>) -> MockBtrfs {
+    let mut btrfs = btrfs_with_uuids();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(snapshots.clone()));
+    btrfs
+        .expect_send_incremental()
+        .returning(|_, _| Ok(fake_stream()));
+    btrfs
+}
+
+/// Runs a level `level` backup of `snap` against a latest manifest holding `latest` and
+/// returns the parent it was sent relative to, or the error.
+async fn incremental_parent(latest: &[&str], snap: &'static str, level: u32) -> Result<String> {
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut local: Vec<String> = latest.iter().map(|s| s.to_string()).collect();
+    local.push(snap.to_string());
+    let backup = backup_task(
+        &four_level_config(work_dir.path()),
+        &movies_task(),
+        level,
+        &btrfs_for_incremental(local),
+        &remote_for_incremental(work_dir.path(), latest),
+    )
+    .await?
+    .expect("must not be skipped");
     Ok(backup.parent_snapshot.expect("an incremental has a parent"))
 }
 
@@ -380,6 +400,136 @@ async fn level1_should_fail_when_latest_has_no_lower_level() {
         err.contains("run a level 0 backup first"),
         "unexpected error: {err}"
     );
+}
+
+/// Saves an unfinished backup of `snapshot` against `parent`, sent as one part that is not
+/// yet uploaded, as an interrupted run of its level leaves it. Returns its state's path.
+fn save_unfinished(base_dir: &Path, snapshot: &str, parent: Option<&str>) -> PathBuf {
+    let id = BackupId {
+        level: snapshot["bcb_level".len()..snapshot.find('.').unwrap()]
+            .parse()
+            .unwrap(),
+        timestamp: Timestamp::from_snapshot_name(snapshot).unwrap(),
+    };
+    let task_dir = base_dir.join("backup/mnt_data_movies");
+    let parts_dir = task_dir.join(id.dir_name());
+    std::fs::create_dir_all(&parts_dir).unwrap();
+    let bytes = b"unfinished part";
+    std::fs::write(parts_dir.join("snapshot.part-000000.age"), bytes).unwrap();
+    let mut state = BackupState::new(BackupTarget {
+        id: id.clone(),
+        snapshot_name: snapshot.to_string(),
+        parent_snapshot: parent.map(str::to_string),
+        source_uuid: SOURCE_UUID.to_string(),
+        snapshot_uuid: snap_uuid(snapshot),
+    });
+    state.sent = Some(SentStream {
+        blake3: "streamhash".to_string(),
+        parts: [(
+            "000000".to_string(),
+            PartRecord {
+                size_bytes: bytes.len() as u64,
+                blake3: blake3::hash(bytes).to_hex().to_string(),
+            },
+        )]
+        .into(),
+    });
+    let path = task_dir.join(format!("state-level{}.yaml", id.level));
+    StateFile::create(path.clone(), state).unwrap();
+    path
+}
+
+/// A long backup of one level, e.g. a level 0 taking weeks to upload, must not hold up the
+/// other levels, nor be disturbed by them.
+#[tokio::test]
+async fn unfinished_backup_of_another_level_should_neither_block_nor_be_touched() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let level0_state = save_unfinished(work_dir.path(), "bcb_level0.20270101T0100", None);
+    let before = std::fs::read(&level0_state).unwrap();
+
+    let backup = backup_task(
+        &four_level_config(work_dir.path()),
+        &movies_task(),
+        3,
+        &btrfs_for_incremental(vec![
+            "bcb_level0.20260101T0100".to_string(),
+            "bcb_level3.20270103T0100".to_string(),
+        ]),
+        &remote_for_incremental(work_dir.path(), &["bcb_level0.20260101T0100"]),
+    )
+    .await
+    .expect("level 3 backup should succeed")
+    .expect("must not be skipped");
+
+    assert_eq!(
+        backup.parent_snapshot.as_deref(),
+        Some("bcb_level0.20260101T0100")
+    );
+    assert_eq!(std::fs::read(&level0_state).unwrap(), before);
+    assert!(
+        work_dir
+            .path()
+            .join("backup/mnt_data_movies/bcb_level0_202701010100")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn unfinished_incremental_should_resume_when_its_parent_is_current() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let parent = "bcb_level0.20260101T0100";
+    save_unfinished(work_dir.path(), "bcb_level3.20260104T0100", Some(parent));
+
+    // No btrfs expectations: a resume must neither list snapshots nor send again.
+    let backup = backup_task(
+        &four_level_config(work_dir.path()),
+        &movies_task(),
+        3,
+        &MockBtrfs::new(),
+        &remote_for_incremental(work_dir.path(), &[parent]),
+    )
+    .await
+    .expect("resumed backup should succeed")
+    .expect("must not be skipped");
+
+    assert_eq!(backup.snapshot_name, "bcb_level3.20260104T0100");
+    assert_eq!(backup.parent_snapshot.as_deref(), Some(parent));
+}
+
+/// Once a lower level completes, an unfinished incremental against the old chain is worthless:
+/// committing it would put a stale chain in the latest manifest. It is dropped and the newest
+/// snapshot is backed up against the new parent instead, without anyone stepping in.
+#[tokio::test]
+async fn unfinished_incremental_should_be_redone_when_its_parent_was_superseded() {
+    let work_dir = tempfile::tempdir().unwrap();
+    let old_state = save_unfinished(
+        work_dir.path(),
+        "bcb_level3.20261230T0100",
+        Some("bcb_level2.20261215T0100"),
+    );
+    let old_parts = work_dir
+        .path()
+        .join("backup/mnt_data_movies/bcb_level3_202612300100");
+    let new_parent = "bcb_level0.20270101T0100";
+
+    let backup = backup_task(
+        &four_level_config(work_dir.path()),
+        &movies_task(),
+        3,
+        &btrfs_for_incremental(vec![
+            new_parent.to_string(),
+            "bcb_level3.20270103T0100".to_string(),
+        ]),
+        &remote_for_incremental(work_dir.path(), &[new_parent]),
+    )
+    .await
+    .expect("level 3 backup should succeed")
+    .expect("must not be skipped");
+
+    assert_eq!(backup.snapshot_name, "bcb_level3.20270103T0100");
+    assert_eq!(backup.parent_snapshot.as_deref(), Some(new_parent));
+    assert!(!old_parts.exists(), "the abandoned parts must be removed");
+    assert!(!old_state.exists(), "the abandoned state must be removed");
 }
 
 /// Level 1 backup whose level 0 ancestor's parts are answered by `part_size`.

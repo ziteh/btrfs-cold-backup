@@ -5,7 +5,7 @@
 //! <prefix>manifests/<subvolume>/<backup dir>/manifest.yaml
 //! <prefix>manifests/<subvolume>/latest.yaml
 //!
-//! <base_dir>/backup/<subvolume>/state.yaml
+//! <base_dir>/backup/<subvolume>/state-level<N>.yaml
 //! <base_dir>/backup/<subvolume>/<backup dir>/snapshot.part-NNNNNN.age
 //! <base_dir>/restore/<subvolume>/<backup dir>/{state.yaml,manifest.yaml,snapshot.part-NNNNNN.age}
 //! ```
@@ -96,9 +96,14 @@ impl TaskLayout {
         self.base_dir.join("backup").join(&self.subvolume)
     }
 
-    /// The state of this task's unfinished backup. One per task, whatever the level, so an
-    /// unfinished backup of one level blocks starting another.
-    pub fn backup_state_path(&self) -> PathBuf {
+    /// The state of this task's unfinished backup of `level`. One per level, so a long
+    /// backup of one level can be interrupted to run another and resumed after it.
+    pub fn backup_state_path(&self, level: u32) -> PathBuf {
+        self.backup_root().join(format!("state-level{level}.yaml"))
+    }
+
+    /// Where versions before per-level states kept the task's one unfinished backup.
+    pub fn legacy_backup_state_path(&self) -> PathBuf {
         self.backup_root().join("state.yaml")
     }
 
@@ -188,8 +193,8 @@ mod tests {
     fn test_local_paths() {
         let l = layout("/mnt/data");
         assert_eq!(
-            l.backup_state_path(),
-            Path::new("/base/backup/mnt_data/state.yaml")
+            l.backup_state_path(2),
+            Path::new("/base/backup/mnt_data/state-level2.yaml")
         );
         assert_eq!(
             l.backup_parts_dir(&id(1)),

@@ -76,7 +76,9 @@ Progress is persisted in a state file under `base_dir`. Re-running the same comm
 | Confirm            | A part that is missing or has a different size is re-uploaded.                                                   |
 | After manifest     | Only `latest.yaml` is written.                                                                                   |
 
-- An unfinished backup of a level blocks backups of other levels of the same task, until it finishes or is abandoned by deleting its state file and parts directory.
+- Each level has its own state, so other levels can run while a backup of one is unfinished, e.g. while a level 0 spends weeks uploading. Only one bcb runs at a time, so stop the long run, run the other level, then resume it. Stopping during send/encrypt restarts the send; stopping during upload loses at most the part in flight.
+- An unfinished incremental whose parent has been superseded (a lower level completed meanwhile) is abandoned automatically and the newest snapshot is backed up against the new parent. Parts it already uploaded stay on S3 until lifecycle expiration; the warning in the log lists them.
+- To abandon an unfinished backup manually, delete its state file (`state-level<N>.yaml`) and parts directory.
 - Tasks are independent; a failing task does not block the others.
 
 ## Restore workflow

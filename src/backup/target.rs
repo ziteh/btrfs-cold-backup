@@ -7,7 +7,7 @@ use crate::{
     btrfs::{BtrfsOps, ensure_snapshot_of},
     config::Task,
     layout::TaskLayout,
-    manifest::{LatestManifest, fetch_latest, fetch_manifest},
+    manifest::{LatestEntry, LatestManifest, fetch_latest, fetch_manifest},
     remote::RemoteBackend,
     state::BackupTarget,
     timestamp::{BackupId, Timestamp, snapshot_prefix},
@@ -115,11 +115,7 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
             target.source_uuid
         ));
     }
-    // Publishing a level drops every deeper entry, so the entries below `level` form one chain
-    // and the deepest of them is its newest backup.
-    let (_, parent) = latest.levels.range(..level).next_back().ok_or_else(|| {
-        anyhow!("no backup below level {level} in latest manifest; run a level 0 backup first")
-    })?;
+    let parent = parent_entry(&latest, level)?;
     if !snapshots.contains(&parent.snapshot_name) {
         return Err(anyhow!(
             "parent snapshot '{}' not found locally",
@@ -150,6 +146,20 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
     }
     ensure_chain_restorable(remote, layout, &latest, level).await?;
     Ok(parent.snapshot_name.clone())
+}
+
+/// The latest manifest's entry a new level `level` incremental builds on. Publishing a level
+/// drops every deeper entry, so the entries below `level` form one chain and the deepest of
+/// them is its newest backup.
+pub(super) fn parent_entry(latest: &LatestManifest, level: u32) -> Result<&LatestEntry> {
+    latest
+        .levels
+        .range(..level)
+        .next_back()
+        .map(|(_, entry)| entry)
+        .ok_or_else(|| {
+            anyhow!("no backup below level {level} in latest manifest; run a level 0 backup first")
+        })
 }
 
 /// Restoring a level `level` incremental needs every part of each backup below it. S3

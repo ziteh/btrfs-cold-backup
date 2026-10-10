@@ -10,7 +10,7 @@ use btrfs_cold_backup::{
 use crate::common::*;
 
 fn state_path(base_dir: &Path) -> PathBuf {
-    base_dir.join("backup/mnt_data_movies/state.yaml")
+    base_dir.join("backup/mnt_data_movies/state-level0.yaml")
 }
 
 fn parts_dir(base_dir: &Path) -> PathBuf {
@@ -244,30 +244,28 @@ async fn transient_head_failure_should_hold_manifest_and_keep_upload_records() {
     );
 }
 
-/// An unfinished backup of another level must not be discarded to start this one: its state
-/// is the only record of which parts already reached S3.
+/// A state left by a version with one state per task can't be resumed, and silently starting
+/// over would lose its record of which parts already reached S3.
 #[tokio::test]
-async fn backup_should_fail_and_keep_state_when_other_level_is_unfinished() {
+async fn backup_should_fail_and_keep_legacy_state() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
-    save_sent_backup(work_dir.path(), &[("000000", b"x", false)]);
-    let before = std::fs::read(state_path(work_dir.path())).unwrap();
+    let legacy = work_dir.path().join("backup/mnt_data_movies/state.yaml");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "old state").unwrap();
 
     let err = backup_task(
         &config,
         &movies_task(),
-        1,
+        0,
         &MockBtrfs::new(),
         &MockRemote::new(),
     )
     .await
     .unwrap_err()
     .to_string();
-    assert!(
-        err.contains("--level 0 --task movies"),
-        "unexpected error: {err}"
-    );
-    assert_eq!(std::fs::read(state_path(work_dir.path())).unwrap(), before);
+    assert!(err.contains("older bcb"), "unexpected error: {err}");
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"old state");
 }
 
 /// What reaches S3 must be the send stream encrypted to the configured key, with no

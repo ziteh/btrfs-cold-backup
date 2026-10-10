@@ -66,7 +66,7 @@ async fn backup_should_report_enospc_and_clean_up_when_base_dir_fills() {
     let backup_dir = fixture.work_dir.join("backup");
     let state_path = backup_dir
         .join(btrfs_cold_backup::layout::sanitize_subvolume_path(&fixture.subvol).unwrap())
-        .join("state.yaml");
+        .join("state-level0.yaml");
     let leftovers: Vec<_> = walk(&backup_dir)
         .into_iter()
         .filter(|p| p.is_file() && *p != state_path)
