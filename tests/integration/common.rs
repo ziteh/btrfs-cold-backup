@@ -80,6 +80,7 @@ pub fn test_config(base_dir: &Path) -> Config {
             upload_speed_limit_kbps: 0,
             restore: RestoreConfig::default(),
         },
+        oversize_guard: None,
         tasks: vec![],
     }
 }

@@ -79,6 +79,19 @@ Progress is persisted in a state file under `base_dir`. Re-running the same comm
 - Each level has its own state, so other levels can run while a backup of one is unfinished, e.g. while a level 0 spends weeks uploading. Only one bcb runs at a time, so stop the long run, run the other level, then resume it. Stopping during send/encrypt restarts the send; stopping during upload loses at most the part in flight.
 - An unfinished incremental whose parent has been superseded (a lower level completed meanwhile) is abandoned automatically and the newest snapshot is backed up against the new parent. Parts it already uploaded stay on S3 until lifecycle expiration; the warning in the log lists them.
 - To abandon an unfinished backup manually, delete its state file (`state-level<N>.yaml`) and parts directory.
+
+### Oversize guard
+
+Ransomware that encrypts the data makes the next incremental about as large as what it encrypted, even when that is only one shared folder. With `oversize_guard` set, an incremental is checked after the send and before any upload: it is held back if it is larger than `min_size_gib` and larger than `rate_factor` times the median size per day of the newest `history` incrementals (any level), counting days from its parent's snapshot. A cumulative incremental, e.g. the first level 3 weeks after a level 0, has a usual size per day and passes. Until `history` incrementals exist, the limit is `fallback_level0_ratio` of the chain's level 0 size instead.
+
+| Exit code | Meaning                                                                      |
+| --------- | ---------------------------------------------------------------------------- |
+| `0`       | Every task backed up or already backed up.                                   |
+| `1`       | A task failed, whether or not another was held back.                         |
+| `3`       | Held back by the oversize guard, and no task failed otherwise.               |
+
+- A held-back incremental keeps its state and parts, and **stays held until someone acts**: every later run of its level resumes it and holds it again, so that level produces no new backups meanwhile (a lower level that completes supersedes it). If the change is legitimate, e.g. a large import, upload it with `bcb backup --level <N> --task <name> --allow-oversize`; no new send is needed. If not, deal with the infection before anything is uploaded.
+- It catches the size of a change, not every attack: deletions make small incrementals, and encryption spread thinly over many runs can stay under the limit. Whoever controls the host can also edit the config.
 - Tasks are independent; a failing task does not block the others.
 
 ## Restore workflow
@@ -144,6 +157,11 @@ s3:
       - DEEP_ARCHIVE # Level 0 (full backup)
       - DEEP_ARCHIVE # Level 1
       - GLACIER      # Level 2
+oversize_guard: # Optional; see Oversize guard
+  history: 5
+  rate_factor: 10
+  min_size_gib: 20
+  fallback_level0_ratio: 0.1
 tasks:
   - name: example_task # Letters, digits, '.', '_' and '-' only: it becomes a directory name
     description: Example backup task
@@ -158,6 +176,7 @@ tasks:
 - `s3.prefix`: Key prefix prepended to every S3 object key. Empty, or ends with "/" and does not start with "/".
 - `s3.upload_speed_limit_kbps`: limits the read rate into each multipart chunk. Each chunk is then sent at line rate, so the uplink is bursty and the average stays below the limit. For smooth shaping, use router QoS or `tc`.
 - `s3.restore.expected_download_kbps`, `s3.restore.lead_days`: see [Retrieval pacing](#retrieval-pacing).
+- `oversize_guard`: see [Oversize guard](#oversize-guard). Unset disables it.
 
 > Progress state is not guaranteed to be compatible across versions.
 

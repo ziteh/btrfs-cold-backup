@@ -11,7 +11,27 @@ pub struct Config {
     pub age_public_key: String,
     #[serde(default)]
     pub s3: S3Config,
+    /// Unset disables the check.
+    #[serde(default)]
+    pub oversize_guard: Option<OversizeGuard>,
     pub tasks: Vec<Task>,
+}
+
+/// Holds back an incremental whose size is out of line with recent ones, e.g. because
+/// ransomware encrypted the data, before it is uploaded. Sizes are compared per day since
+/// the parent, so a cumulative incremental isn't mistaken for an outlier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OversizeGuard {
+    /// How many of the newest incrementals, of any level, set the usual size per day.
+    pub history: usize,
+    /// How many times the usual size per day an incremental may reach.
+    pub rate_factor: f64,
+    /// Incrementals up to this size always pass, so a small dataset's normal swings don't
+    /// trip the check.
+    pub min_size_gib: f64,
+    /// While fewer than `history` incrementals exist, the share of the chain's level 0 size
+    /// an incremental may reach instead.
+    pub fallback_level0_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +176,27 @@ impl Config {
         crate::crypto::parse_recipient(&self.age_public_key)
             .map_err(|e| anyhow!("age_public_key: {e}"))?;
         self.validate_tasks()?;
-        self.validate_s3()
+        self.validate_s3()?;
+        self.validate_oversize_guard()
+    }
+
+    fn validate_oversize_guard(&self) -> Result<()> {
+        let Some(guard) = &self.oversize_guard else {
+            return Ok(());
+        };
+        if guard.history == 0 {
+            return Err(anyhow!("oversize_guard.history must be > 0"));
+        }
+        for (name, value) in [
+            ("rate_factor", guard.rate_factor),
+            ("min_size_gib", guard.min_size_gib),
+            ("fallback_level0_ratio", guard.fallback_level0_ratio),
+        ] {
+            if !(value.is_finite() && value > 0.0) {
+                return Err(anyhow!("oversize_guard.{name} must be > 0, got {value}"));
+            }
+        }
+        Ok(())
     }
 
     fn validate_tasks(&self) -> Result<()> {
@@ -286,6 +326,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            oversize_guard: None,
             tasks: vec![Task {
                 name: "test".to_string(),
                 description: "test task".to_string(),
@@ -503,5 +544,25 @@ tasks:
         assert_eq!(classes.for_level(0).unwrap(), StorageClass::DeepArchive);
         let err = classes.for_level(1).unwrap_err().to_string();
         assert!(err.contains("level 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_oversize_guard_parses_and_validates() {
+        let yaml = "history: 5\nrate_factor: 10\nmin_size_gib: 20\nfallback_level0_ratio: 0.1\n";
+        let guard: OversizeGuard = serde_yaml::from_str(yaml).unwrap();
+        let mut config = valid_config();
+        config.oversize_guard = Some(guard.clone());
+        assert!(config.validate().is_ok());
+
+        config.oversize_guard = Some(OversizeGuard {
+            history: 0,
+            ..guard.clone()
+        });
+        assert_invalid(&config, "oversize_guard.history");
+        config.oversize_guard = Some(OversizeGuard {
+            rate_factor: 0.0,
+            ..guard
+        });
+        assert_invalid(&config, "oversize_guard.rate_factor");
     }
 }

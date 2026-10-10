@@ -196,6 +196,7 @@ pub(crate) fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Pa
         base_dir: work_dir.clone(),
         age_public_key: identity.to_public().to_string(),
         s3: s3_config(env),
+        oversize_guard: None,
         tasks: vec![Task {
             name: task_name.clone(),
             description: String::new(),

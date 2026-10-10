@@ -168,6 +168,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            oversize_guard: None,
             tasks: vec![Task {
                 name: "test".to_string(),
                 description: String::new(),

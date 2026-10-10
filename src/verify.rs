@@ -174,6 +174,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            oversize_guard: None,
             tasks: vec![],
         }
     }

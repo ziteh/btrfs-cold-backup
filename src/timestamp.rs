@@ -98,6 +98,20 @@ impl Timestamp {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Days from `earlier` to this timestamp. Both are read as UTC: they share the host's
+    /// zone, which bcb requires to have no DST, so the zone cancels out.
+    pub fn days_since(&self, earlier: &Timestamp) -> Result<f64> {
+        let at = |t: &Timestamp| {
+            humantime::parse_rfc3339_weak(&format!("{}:00", t.0))
+                .map_err(|e| anyhow!("invalid timestamp {t}: {e}"))
+        };
+        let seconds = match at(self)?.duration_since(at(earlier)?) {
+            Ok(d) => d.as_secs_f64(),
+            Err(e) => -e.duration().as_secs_f64(),
+        };
+        Ok(seconds / 86400.0)
+    }
 }
 
 impl FromStr for Timestamp {
@@ -195,6 +209,27 @@ mod tests {
 
     fn ts(s: &str) -> Timestamp {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_days_since() {
+        assert_eq!(
+            ts("2026-03-01T12:00")
+                .days_since(&ts("2026-02-27T00:00"))
+                .unwrap(),
+            2.5
+        );
+        assert_eq!(
+            ts("2026-01-01T00:00")
+                .days_since(&ts("2026-01-02T00:00"))
+                .unwrap(),
+            -1.0
+        );
+        assert!(
+            ts("2026-13-01T00:00")
+                .days_since(&ts("2026-01-02T00:00"))
+                .is_err()
+        );
     }
 
     #[test]

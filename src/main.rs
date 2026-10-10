@@ -1,7 +1,7 @@
 use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result, anyhow};
 use btrfs_cold_backup::{
-    backup::backup_task,
+    backup::{Oversize, backup_task},
     btrfs::BtrfsDriver,
     check,
     config::{Config, Task},
@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 // Exit code of a restore that made progress but isn't done.
 const EXIT_RESTORE_IN_PROGRESS: i32 = 2;
+// Exit code of a backup run whose only failures are incrementals the oversize guard held back.
+const EXIT_BACKUP_OVERSIZE: i32 = 3;
 
 #[derive(Parser)]
 #[command(name = "bcb", about = "btrfs cold backup", version)]
@@ -89,6 +91,10 @@ enum Commands {
         /// Limit to a single task by name (default: all enabled tasks).
         #[arg(long)]
         task: Option<String>,
+        /// Upload an incremental the oversize guard held back, once the change it holds is
+        /// confirmed legitimate.
+        #[arg(long, requires = "task")]
+        allow_oversize: bool,
     },
 
     /// Restore a backup.
@@ -144,7 +150,11 @@ async fn main() -> Result<()> {
         Commands::Verify { task, max_age_days } => {
             cmd_verify(&config, task.as_deref(), max_age_days).await
         }
-        Commands::Backup { level, task } => cmd_backup(&config, level, task.as_deref()).await,
+        Commands::Backup {
+            level,
+            task,
+            allow_oversize,
+        } => cmd_backup(&config, level, task.as_deref(), allow_oversize).await,
         Commands::PruneSnapshots { task, dry_run } => {
             cmd_prune_snapshots(&config, task.as_deref(), dry_run).await
         }
@@ -249,7 +259,12 @@ async fn cmd_verify(config: &Config, task: Option<&str>, max_age_days: Option<u6
     aggregate_failures("verify", &failed)
 }
 
-async fn cmd_backup(config: &Config, level: u32, task: Option<&str>) -> Result<()> {
+async fn cmd_backup(
+    config: &Config,
+    level: u32,
+    task: Option<&str>,
+    allow_oversize: bool,
+) -> Result<()> {
     let (remote, _lock) = acquire_runtime(config).await?;
     let tasks = enabled_tasks(&config.tasks, task);
     if tasks.is_empty() {
@@ -258,9 +273,10 @@ async fn cmd_backup(config: &Config, level: u32, task: Option<&str>) -> Result<(
 
     // Outcomes are logged too, so the log file records them.
     let mut failed = Vec::new();
+    let mut held = Vec::new();
     for t in tasks {
         tracing::info!(task = %t.name, level, "backup started");
-        match backup_task(config, t, level, &BtrfsDriver, &remote).await {
+        match backup_task(config, t, level, &BtrfsDriver, &remote, allow_oversize).await {
             Ok(Some(backup)) => {
                 tracing::info!(task = %t.name, level, timestamp = %backup.timestamp, "backup completed");
                 println!(
@@ -272,6 +288,11 @@ async fn cmd_backup(config: &Config, level: u32, task: Option<&str>) -> Result<(
                 tracing::info!(task = %t.name, level, "already backed up, skipped");
                 println!("{}: level {level} already backed up, skipped", t.name);
             }
+            Err(e) if e.is::<Oversize>() => {
+                tracing::error!(task = %t.name, level, error = format!("{e:#}"), "backup held back");
+                eprintln!("{}: level {level} backup held back: {e:#}", t.name);
+                held.push(t.name.clone());
+            }
             Err(e) => {
                 tracing::error!(task = %t.name, level, error = format!("{e:#}"), "backup failed");
                 eprintln!("{}: level {level} backup failed: {e:#}", t.name);
@@ -279,7 +300,16 @@ async fn cmd_backup(config: &Config, level: u32, task: Option<&str>) -> Result<(
             }
         }
     }
-    aggregate_failures("backup", &failed)
+    // Other failures take precedence: they need attention whatever the guard held back.
+    aggregate_failures("backup", &failed)?;
+    if !held.is_empty() {
+        eprintln!(
+            "backup held back by the oversize guard for task(s): {}",
+            held.join(", ")
+        );
+        std::process::exit(EXIT_BACKUP_OVERSIZE);
+    }
+    Ok(())
 }
 
 async fn cmd_prune_snapshots(config: &Config, task: Option<&str>, dry_run: bool) -> Result<()> {

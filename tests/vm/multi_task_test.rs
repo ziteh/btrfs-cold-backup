@@ -43,6 +43,7 @@ async fn one_failing_task_should_not_block_the_others() {
         base_dir: work_dir.clone(),
         age_public_key: identity.to_public().to_string(),
         s3: s3_config(&env),
+        oversize_guard: None,
         tasks: vec![
             Task {
                 name: "bad-task".to_string(),

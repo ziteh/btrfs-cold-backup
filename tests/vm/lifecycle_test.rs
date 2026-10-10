@@ -53,6 +53,7 @@ impl Chain {
                 base_dir: work_dir,
                 age_public_key: identity.to_public().to_string(),
                 s3: s3_config(env),
+                oversize_guard: None,
                 tasks: vec![],
             },
             task: Task {
@@ -103,7 +104,7 @@ async fn level0_backup_and_restore_should_round_trip() {
     let chain = Chain::new(&env, "roundtrip", &[("hello.txt", b"round-trip test")]);
     let remote = S3Backend::new(&chain.config.s3).await.unwrap();
 
-    let backup = backup_task(&chain.config, &chain.task, 0, &BtrfsDriver, &remote)
+    let backup = backup_task(&chain.config, &chain.task, 0, &BtrfsDriver, &remote, false)
         .await
         .unwrap()
         .expect("must not be skipped");
@@ -137,11 +138,11 @@ async fn level1_incremental_backup_should_use_level0_as_parent() {
     );
     let remote = S3Backend::new(&chain.config.s3).await.unwrap();
 
-    backup_task(&chain.config, &chain.task, 0, &BtrfsDriver, &remote)
+    backup_task(&chain.config, &chain.task, 0, &BtrfsDriver, &remote, false)
         .await
         .unwrap()
         .expect("must not be skipped");
-    let b1 = backup_task(&chain.config, &chain.task, 1, &BtrfsDriver, &remote)
+    let b1 = backup_task(&chain.config, &chain.task, 1, &BtrfsDriver, &remote, false)
         .await
         .unwrap()
         .expect("must not be skipped");
@@ -162,9 +163,16 @@ async fn incremental_chain_restore_should_recover_both_levels() {
     let remote = S3Backend::new(&chain.config.s3).await.unwrap();
 
     for level in [0, 1] {
-        backup_task(&chain.config, &chain.task, level, &BtrfsDriver, &remote)
-            .await
-            .unwrap();
+        backup_task(
+            &chain.config,
+            &chain.task,
+            level,
+            &BtrfsDriver,
+            &remote,
+            false,
+        )
+        .await
+        .unwrap();
     }
     for (level, date) in [(0, "20260601"), (1, "20260602")] {
         let progress = restore_task(

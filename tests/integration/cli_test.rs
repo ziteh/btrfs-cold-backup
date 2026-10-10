@@ -41,6 +41,7 @@ fn write_valid_config(dir: &Path, age_public_key: &str) -> std::path::PathBuf {
             restore: RestoreConfig::default(),
             ..Default::default()
         },
+        oversize_guard: None,
         tasks: vec![Task {
             name: "task".to_string(),
             description: String::new(),
@@ -60,6 +61,14 @@ fn no_subcommand_should_exit_with_clap_usage_error() {
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("Usage"));
+}
+
+/// Allowing a held backup for every task at once could wave through ransomware in one.
+#[test]
+fn allow_oversize_without_task_should_exit_with_clap_usage_error() {
+    let out = run_bcb(&["backup", "--level", "1", "--allow-oversize"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("--task"), "{}", stderr(&out));
 }
 
 #[test]

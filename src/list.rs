@@ -31,6 +31,7 @@ mod tests {
             base_dir: PathBuf::from("/tmp"),
             age_public_key: String::new(),
             s3: Default::default(),
+            oversize_guard: None,
             tasks: vec![],
         };
         let task = Task {

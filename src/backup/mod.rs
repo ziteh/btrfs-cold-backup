@@ -4,9 +4,12 @@
 //! backup resumes on the next run of its level: a finished send isn't redone, and uploaded
 //! parts aren't sent again. Other levels may run in between.
 
+mod guard;
 mod send;
 mod target;
 mod upload;
+
+pub use guard::Oversize;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -20,13 +23,15 @@ use crate::{
 };
 
 /// Backs up the newest level `level` snapshot of `task`, or resumes the task's unfinished
-/// backup of that level. Returns None when the snapshot is already backed up.
+/// backup of that level. Returns None when the snapshot is already backed up. An incremental
+/// the oversize guard holds back fails with [`Oversize`] unless `allow_oversize`.
 pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
     config: &Config,
     task: &Task,
     level: u32,
     btrfs: &B,
     remote: &R,
+    allow_oversize: bool,
 ) -> Result<Option<BackupManifest>> {
     // Looked up first, so a missing entry fails at once instead of after a send that can take
     // hours.
@@ -58,6 +63,16 @@ pub async fn backup_task<B: BtrfsOps, R: RemoteBackend>(
         state.save()?;
     }
     upload::verify_local_parts(&mut state, &parts_dir).await?;
+    // Once an upload started, the backup was already checked or allowed.
+    if let Some(guard) = &config.oversize_guard
+        && level > 0
+        && state.data.uploaded_parts.is_empty()
+        && !allow_oversize
+    {
+        let sent = state.data.sent.as_ref().expect("the send finished above");
+        let size_bytes = sent.parts.values().map(|p| p.size_bytes).sum();
+        guard::check(guard, remote, &layout, &state.data.target, size_bytes).await?;
+    }
     upload::upload_pending_parts(remote, &layout, &mut state, &parts_dir, part_class).await?;
 
     let sent = state.data.sent.as_ref().expect("the send finished above");

@@ -47,7 +47,7 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
         .withf(|_, _, _, tags| tags == "bcb-backup-level=manifest")
         .returning(|_, _, _, _| Ok(()));
 
-    let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 0, &btrfs, &remote, false).await;
 
     let backup = result
         .expect("level 0 backup should succeed")
@@ -93,7 +93,7 @@ async fn failed_send_should_remove_output_dir() {
     let mut remote = MockRemote::new();
     expect_no_manifests(&mut remote);
 
-    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+    let err = backup_task(&config, &task, 0, &btrfs, &remote, false)
         .await
         .unwrap_err()
         .to_string();
@@ -118,7 +118,7 @@ async fn backup_should_fail_when_no_matching_snapshot() {
 
     let remote = MockRemote::new();
 
-    let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 0, &btrfs, &remote, false).await;
     assert!(result.is_err(), "should fail with no matching snapshot");
 }
 
@@ -155,7 +155,7 @@ async fn backup_should_fail_when_latest_manifest_is_corrupt() {
     expect_parts_on_s3(&mut remote, work_dir.path());
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
-    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+    let err = backup_task(&config, &task, 0, &btrfs, &remote, false)
         .await
         .unwrap_err();
     assert!(
@@ -224,7 +224,7 @@ async fn level1_incremental_should_use_level0_as_parent() {
     remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
-    let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 1, &btrfs, &remote, false).await;
 
     let backup = result
         .expect("level 1 backup should succeed")
@@ -278,7 +278,7 @@ async fn level2_incremental_should_use_level1_as_parent() {
         .returning(|_, _, _, _| Ok(()));
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
 
-    let result = backup_task(&config, &task, 2, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 2, &btrfs, &remote, false).await;
 
     let backup = result
         .expect("level 2 backup should succeed")
@@ -360,6 +360,7 @@ async fn incremental_parent(latest: &[&str], snap: &'static str, level: u32) -> 
         level,
         &btrfs_for_incremental(local),
         &remote_for_incremental(work_dir.path(), latest),
+        false,
     )
     .await?
     .expect("must not be skipped");
@@ -449,6 +450,7 @@ async fn unfinished_backup_of_another_level_should_neither_block_nor_be_touched(
             "bcb_level3.20270103T0100".to_string(),
         ]),
         &remote_for_incremental(work_dir.path(), &["bcb_level0.20260101T0100"]),
+        false,
     )
     .await
     .expect("level 3 backup should succeed")
@@ -480,6 +482,7 @@ async fn unfinished_incremental_should_resume_when_its_parent_is_current() {
         3,
         &MockBtrfs::new(),
         &remote_for_incremental(work_dir.path(), &[parent]),
+        false,
     )
     .await
     .expect("resumed backup should succeed")
@@ -514,6 +517,7 @@ async fn unfinished_incremental_should_be_redone_when_its_parent_was_superseded(
             "bcb_level3.20270103T0100".to_string(),
         ]),
         &remote_for_incremental(work_dir.path(), &[new_parent]),
+        false,
     )
     .await
     .expect("level 3 backup should succeed")
@@ -541,7 +545,7 @@ async fn level1_backup_with_ancestor_parts(part_size: fn(&str) -> Result<Option<
     let mut remote = remote_with_latest(latest_manifest_yaml(parent, 0));
     expect_ancestors(&mut remote, part_size);
 
-    backup_task(&config, &task, 1, &btrfs, &remote)
+    backup_task(&config, &task, 1, &btrfs, &remote, false)
         .await
         .unwrap_err()
         .to_string()
@@ -577,7 +581,7 @@ async fn backup_should_fail_when_no_storage_class_configured_for_level() {
     let btrfs = MockBtrfs::new();
     let remote = MockRemote::new();
 
-    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+    let err = backup_task(&config, &task, 1, &btrfs, &remote, false)
         .await
         .unwrap_err();
     assert!(
@@ -608,7 +612,7 @@ async fn level1_should_fail_when_no_remote_level0_exists() {
         .withf(|key| key.contains("/manifest.yaml"))
         .returning(|_| head(false));
 
-    let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 1, &btrfs, &remote, false).await;
     assert!(result.is_err(), "should fail without level 0 remote backup");
 }
 
@@ -640,7 +644,7 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
 
-    let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 1, &btrfs, &remote, false).await;
     assert!(
         result.is_err(),
         "should fail when parent snapshot missing locally"
@@ -672,7 +676,7 @@ async fn backup_should_skip_already_completed_backup() {
         .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest.clone()));
 
-    let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 0, &btrfs, &remote, false).await;
     assert!(
         result.expect("skip must not be an error").is_none(),
         "completed backup must be skipped"
@@ -712,7 +716,7 @@ async fn skip_should_fail_when_existing_manifest_is_from_another_source() {
         .withf(|key| key.contains("/manifest.yaml"))
         .returning(move |_| Ok(manifest.clone()));
 
-    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+    let err = backup_task(&config, &task, 0, &btrfs, &remote, false)
         .await
         .unwrap_err()
         .to_string();
@@ -738,7 +742,7 @@ async fn backup_should_fail_when_snapshot_parent_uuid_mismatches() {
 
     let remote = MockRemote::new();
 
-    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+    let err = backup_task(&config, &task, 0, &btrfs, &remote, false)
         .await
         .unwrap_err()
         .to_string();
@@ -792,7 +796,7 @@ async fn level1_should_fail_when_latest_manifest_is_from_another_source() {
     );
     let remote = remote_with_latest(serde_yaml::to_string(&latest).unwrap().into_bytes());
 
-    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+    let err = backup_task(&config, &task, 1, &btrfs, &remote, false)
         .await
         .unwrap_err()
         .to_string();
@@ -837,7 +841,7 @@ async fn level1_should_fail_when_local_parent_uuid_mismatches() {
     });
     let remote = remote_with_latest(latest_manifest_yaml(parent, 0));
 
-    let err = backup_task(&config, &task, 1, &btrfs, &remote)
+    let err = backup_task(&config, &task, 1, &btrfs, &remote, false)
         .await
         .unwrap_err()
         .to_string();
@@ -892,7 +896,7 @@ async fn level0_of_new_source_should_replace_latest_manifest() {
             Ok(())
         });
 
-    backup_task(&config, &task, 0, &btrfs, &remote)
+    backup_task(&config, &task, 0, &btrfs, &remote, false)
         .await
         .expect("level 0 backup should succeed")
         .expect("must not be skipped");
@@ -923,7 +927,7 @@ async fn same_minute_snapshot_should_fail_loudly_not_be_silently_skipped() {
 
     let remote = MockRemote::new();
 
-    let err = backup_task(&config, &task, 0, &btrfs, &remote)
+    let err = backup_task(&config, &task, 0, &btrfs, &remote, false)
         .await
         .expect_err("a same-minute snapshot must not be silently skipped")
         .to_string();
@@ -1004,7 +1008,7 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_latest_m
             Ok(())
         });
 
-    let result = backup_task(&config, &task, 0, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 0, &btrfs, &remote, false).await;
     result
         .expect("level 0 backup should succeed")
         .expect("must not be skipped");
@@ -1059,7 +1063,7 @@ async fn level1_should_fail_when_snapshot_not_newer_than_parent() {
         .withf(|key| key.contains("latest.yaml"))
         .returning(move |_| Ok(manifest_bytes.clone()));
 
-    let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
+    let result = backup_task(&config, &task, 1, &btrfs, &remote, false).await;
     let err = result
         .expect_err("stale snapshot must be rejected")
         .to_string();

@@ -134,6 +134,7 @@ mod tests {
                 prefix: "backups/".to_string(),
                 ..Default::default()
             },
+            oversize_guard: None,
             tasks: vec![],
         };
         let task = Task {

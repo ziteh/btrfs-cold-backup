@@ -89,10 +89,17 @@ async fn resume_should_skip_already_uploaded_parts() {
     expect_parts_on_s3(&mut remote, work_dir.path());
     expect_no_manifests(&mut remote);
 
-    let backup = backup_task(&config, &movies_task(), 0, &MockBtrfs::new(), &remote)
-        .await
-        .expect("resumed backup should succeed")
-        .expect("resume must not be skipped");
+    let backup = backup_task(
+        &config,
+        &movies_task(),
+        0,
+        &MockBtrfs::new(),
+        &remote,
+        false,
+    )
+    .await
+    .expect("resumed backup should succeed")
+    .expect("resume must not be skipped");
     assert_eq!(backup.parts.len(), 2);
     assert_eq!(backup.blake3, "streamhash");
 }
@@ -119,7 +126,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
             Ok(())
         });
     assert!(
-        backup_task(&config, &movies_task(), 0, &btrfs, &remote)
+        backup_task(&config, &movies_task(), 0, &btrfs, &remote, false)
             .await
             .is_err()
     );
@@ -135,7 +142,7 @@ async fn resume_should_succeed_when_crash_hit_between_upload_and_state_save() {
     expect_no_manifests(&mut remote);
     expect_parts_on_s3(&mut remote, work_dir.path());
 
-    let backup = backup_task(&config, &movies_task(), 0, &btrfs, &remote)
+    let backup = backup_task(&config, &movies_task(), 0, &btrfs, &remote, false)
         .await
         .expect("resumed backup should succeed")
         .expect("resume must not be skipped");
@@ -166,7 +173,7 @@ async fn lost_part_should_be_reuploaded_before_manifest(
         .withf(|key| key.contains("part-000001"))
         .returning(move |_| head(lost_size));
     expect_parts_on_s3(&mut remote, work_dir.path());
-    let err = backup_task(&config, &movies_task(), 0, &btrfs, &remote)
+    let err = backup_task(&config, &movies_task(), 0, &btrfs, &remote, false)
         .await
         .expect_err("a part missing from S3 must hold the manifest back")
         .to_string();
@@ -191,7 +198,7 @@ async fn lost_part_should_be_reuploaded_before_manifest(
         .returning(|_, _, _, _| Ok(()));
     expect_no_manifests(&mut remote);
     expect_parts_on_s3(&mut remote, work_dir.path());
-    backup_task(&config, &movies_task(), 0, &btrfs, &remote)
+    backup_task(&config, &movies_task(), 0, &btrfs, &remote, false)
         .await
         .expect("the re-run should re-upload the part and finish")
         .expect("must not be skipped");
@@ -233,10 +240,17 @@ async fn transient_head_failure_should_hold_manifest_and_keep_upload_records() {
         .expect_head_metadata()
         .returning(|_| Err(anyhow::anyhow!("dispatch failure")));
 
-    let err = backup_task(&config, &movies_task(), 0, &MockBtrfs::new(), &remote)
-        .await
-        .expect_err("an unchecked part must hold the manifest back")
-        .to_string();
+    let err = backup_task(
+        &config,
+        &movies_task(),
+        0,
+        &MockBtrfs::new(),
+        &remote,
+        false,
+    )
+    .await
+    .expect_err("an unchecked part must hold the manifest back")
+    .to_string();
     assert!(err.contains("dispatch failure"), "unexpected error: {err}");
     assert_eq!(
         saved_state(work_dir.path()).uploaded_parts,
@@ -260,6 +274,7 @@ async fn backup_should_fail_and_keep_legacy_state() {
         0,
         &MockBtrfs::new(),
         &MockRemote::new(),
+        false,
     )
     .await
     .unwrap_err()
@@ -301,7 +316,7 @@ async fn uploaded_part_should_decrypt_to_the_send_stream() {
     remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
     expect_parts_on_s3(&mut remote, work_dir.path());
 
-    let backup = backup_task(&config, &movies_task(), 0, &btrfs, &remote)
+    let backup = backup_task(&config, &movies_task(), 0, &btrfs, &remote, false)
         .await
         .unwrap()
         .unwrap();
@@ -334,6 +349,7 @@ async fn resume_should_reset_state_when_part_is_damaged_before_any_upload() {
         0,
         &MockBtrfs::new(),
         &MockRemote::new(),
+        false,
     )
     .await
     .unwrap_err()
@@ -361,6 +377,7 @@ async fn resume_should_fail_when_parts_missing_from_disk() {
         0,
         &MockBtrfs::new(),
         &MockRemote::new(),
+        false,
     )
     .await
     .expect_err("incomplete part set must fail")
