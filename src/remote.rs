@@ -550,28 +550,25 @@ impl RemoteBackend for S3Backend {
             .await
             .map_err(|e| remote_error("cannot access S3 bucket", e))?;
 
-        // head_bucket only proves read access; backups also need write, delete and tagging, so
-        // a throwaway object is written under the configured prefix, tagged like a real part.
-        // AWS checks a PutObject's tags against s3:PutObjectTagging separately from
-        // s3:PutObject, so an untagged probe would pass without the tagging permission.
+        // head_bucket only proves read access; backups also need write and tagging, so a
+        // multipart upload is started under the configured prefix, tagged like a real part.
+        // AWS checks its tags against s3:PutObjectTagging separately from s3:PutObject, so an
+        // untagged probe would pass without the tagging permission. Aborting it leaves no
+        // object behind, so the policy needs no s3:DeleteObject.
         let probe_key = format!("{}bcb_check_probe", self.prefix);
-        self.client
-            .put_object()
+        let upload_id = self
+            .client
+            .create_multipart_upload()
             .bucket(&self.bucket)
             .key(&probe_key)
-            .body(ByteStream::from_static(b""))
             .tagging(check_tag())
             .send()
             .await
-            .map_err(|e| remote_error("cannot write to S3 bucket", e))?;
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&probe_key)
-            .send()
-            .await
-            .map_err(|e| remote_error("cannot delete from S3 bucket", e))?;
-        Ok(())
+            .map_err(|e| remote_error("cannot write to S3 bucket", e))?
+            .upload_id()
+            .ok_or_else(|| anyhow!("create_multipart_upload returned no upload_id"))?
+            .to_string();
+        self.abort_upload(&probe_key, &upload_id).await
     }
 
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {

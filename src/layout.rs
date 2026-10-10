@@ -32,7 +32,7 @@ pub fn manifest_tag() -> String {
     format!("{LEVEL_TAG_KEY}=manifest")
 }
 
-/// The tag set of the throwaway object `bcb check` writes to probe permissions.
+/// The tag set of the throwaway upload `bcb check` starts to probe permissions.
 pub fn check_tag() -> String {
     format!("{LEVEL_TAG_KEY}=check")
 }
