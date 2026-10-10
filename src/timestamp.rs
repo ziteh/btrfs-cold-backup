@@ -205,7 +205,7 @@ mod tests {
     fn test_from_snapshot_name_invalid() {
         for name in [
             "bcb_level0",
-            // btrbk timestamp_format short (date only)
+            // btrbk timestamp_format short (date only).
             "bcb_level0.20260602",
             "bcb_level0.20260602_1430",
             "bcb_level0_2026-06-02_14-30",

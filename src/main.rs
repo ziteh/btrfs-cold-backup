@@ -18,8 +18,7 @@ use btrfs_cold_backup::{
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-/// Exit code of a restore that made progress but isn't done, so a scheduler can tell it from
-/// success (0) and failure (1).
+// Exit code of a restore that made progress but isn't done.
 const EXIT_RESTORE_IN_PROGRESS: i32 = 2;
 
 #[derive(Parser)]
@@ -33,29 +32,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate an age key pair; writes the private key to a file (mode 0600)
+    /// Generate an age key pair; writes the private key to a file (mode 0600).
     Genkey {
-        /// Output file for the age private key
+        /// Output file for the age private key.
         #[arg(long)]
         output: PathBuf,
     },
 
-    /// Validate config and connectivity
+    /// Validate config and connectivity.
     Check,
 
-    /// Verify a private key matches the configured public key
+    /// Verify a private key matches the configured public key.
     TestKeys {
-        /// Path to the age private key file
+        /// Path to the age private key file.
         #[arg(long)]
         private_key: PathBuf,
     },
 
-    /// List backups stored on S3
+    /// List backups stored on S3.
     List {
-        /// Limit to a single task by name (default: all enabled tasks)
+        /// Limit to a single task by name (default: all enabled tasks).
         #[arg(long)]
         task: Option<String>,
-        /// Filter by level
+        /// Filter by level.
         #[arg(long)]
         level: Option<u32>,
     },
@@ -63,41 +62,42 @@ enum Commands {
     /// Audit backups on S3: chain completeness, part existence/size, storage class, and
     /// (optionally) freshness. Read-only and never triggers an archive retrieval.
     Verify {
-        /// Limit to a single task by name (default: all enabled tasks)
+        /// Limit to a single task by name (default: all enabled tasks).
         #[arg(long)]
         task: Option<String>,
-        /// Flag the task if its newest backup is older than this many days
+        /// Flag the task if its newest backup is older than this many days.
         #[arg(long)]
         max_age_days: Option<u64>,
     },
 
-    /// Run a backup
+    /// Run a backup.
     Backup {
+        /// Backup level: 0 is full, N is incremental relative to the newest level N-1 backup.
         #[arg(long)]
         level: u32,
-        /// Limit to a single task by name (default: all enabled tasks)
+        /// Limit to a single task by name (default: all enabled tasks).
         #[arg(long)]
         task: Option<String>,
     },
 
-    /// Restore a backup
+    /// Restore a backup.
     Restore {
         #[arg(long)]
         task: String,
         #[arg(long)]
         level: u32,
-        /// Backup timestamp: YYYYMMDDHHMM (e.g. 202606021430) or YYYYMMDD for T00:00
+        /// Backup timestamp: YYYYMMDDHHMM (e.g. 202606021430) or YYYYMMDD for T00:00.
         #[arg(long)]
         date: String,
         #[arg(long)]
         target: PathBuf,
-        /// Path to the age private key file
+        /// Path to the age private key file.
         #[arg(long)]
         private_key: PathBuf,
-        /// Days the retrieved copy of archived objects stays downloadable
+        /// Days the retrieved copy of archived objects stays downloadable.
         #[arg(long, default_value_t = 3)]
         restore_days: i32,
-        /// Archive retrieval tier
+        /// Archive retrieval tier.
         #[arg(long, value_enum, default_value_t = RetrievalTier::Standard)]
         restore_tier: RetrievalTier,
     },
@@ -106,6 +106,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Genkey needs no config file, so handle it before the config is loaded.
     if let Commands::Genkey { output } = &cli.command {
         init_logging(None);
         return cmd_genkey(output);
