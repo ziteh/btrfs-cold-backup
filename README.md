@@ -1,52 +1,130 @@
 # Btrfs Cold Backup
 
-`bcb` backs up Btrfs subvolume snapshots to an object storage service for offsite backup.
+`bcb` is an offsite cold-backup tool for Btrfs subvolume snapshots. It targets [Amazon S3 Glacier Deep Archive][s3-classes] and is built around that class's retrieval, minimum-duration and per-object billing constraints, to minimize storage and retrieval cost without weakening integrity guarantees.
 
-Features:
-
-- Full and incremental multi-level backups.
-- Built for [AWS S3 Glacier Deep Archive][s3-gda] cold storage, optimal storage costs.
-- End-to-end encryption via [Age][age].
-- Integrity verification via [BLAKE3][b3].
-
-```mermaid
----
-title: Backup Overview
----
-flowchart LR
-    S["bcb backup --level N"] --> L{"Backup level"}
-    L -->|level 0| F["btrfs send<br/>full stream"]
-    L -->|level N > 0| P["Read the level N-1 parent<br/>from the latest manifest"]
-    P --> I["btrfs send -p parent<br/>incremental stream"]
-
-    F --> X["Split into 3 GiB parts<br/>and compute stream BLAKE3"]
-    I --> X
-    X --> E["Each part:<br/>Age encrypt -> BLAKE3"]
-    E --> D[("S3: encrypted parts<br/>with a per-level storage class")]
-    X --> M["Manifest: parent snapshot, stream BLAKE3, and each part's size and BLAKE3"]
-    E --> M
-    M --> SM[("S3: manifest")]
-```
-
-To restore, apply level 0, level 1, …, level N in order; each incremental requires its parent level to be present on the target.
+- Multi-level backup: full and incremental. Snapshots are created by [btrbk][btrbk].
+- E2EE: data is encrypted with [age][age] on the host before uploading.
+- Integrity: [BLAKE3][b3] hashes per part and per stream.
+- Resumable: backup and restore persist progress and continue after an interruption.
+- No deletion: bcb never deletes from S3; retention is delegated to bucket lifecycle rules.
 
 > For ZFS: [zrb](https://github.com/ziteh/zfs-remote-backup)
+
+> [!NOTE]
+> This repo contains LLM-assisted code; please review and validate it as appropriate.
+
+## Design
+
+bcb is specifically designed for S3 Glacier Deep Archive.
+
+| Constraint                                                                                                  | bcb behavior                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Objects are unreadable until retrieved, billed per GB and per request. [^retrieval]                         | Manifests are stored in a class readable without retrieval (`storage_class.manifest`, e.g. STANDARD). Chain checks and `bcb verify` use HEAD and LIST only and never trigger a retrieval. |
+| Minimum storage duration of 180 days; earlier deletion or overwrite is billed for the remainder. [^classes] | A backup whose manifest exists is skipped and never re-uploaded. bcb never deletes; expiry is set by lifecycle rules.                                                                     |
+| ~40 KB billed overhead per archived object; requests billed per object. [^classes]                          | The send stream is split into 3 GiB parts, which bounds object and request count.                                                                                                         |
+| A retrieved copy is downloadable only for the requested number of days. [^retrieval]                        | Retrieval is paced to the download bandwidth. An expired copy is re-requested.                                                                                                            |
+| Large full backups are costly to store and slow to retrieve.                                                | Incremental levels, each with its own storage class.                                                                                                                                      |
+| Data is held by a third party for years.                                                                    | Parts are encrypted on the host. The private key is needed only for restore. Part and stream BLAKE3 hashes are recorded in the manifest.                                                  |
+
+> S3 figures are AWS's published values at the time of writing.
+
+[^classes]: [Amazon S3 storage classes][s3-storage-class-intro], [Amazon S3 pricing][s3-pricing]
+[^retrieval]: [Understanding archive retrieval options][s3-retrieval]
+
+### Backup levels
+
+A level-N backup is a `btrfs send -p` against the newest level N-1 backup. Restoring level N requires levels 0 to N-1 restored first, so a lower level must remain on S3 while any higher level depends on it.
+
+## Backup workflow
+
+`bcb backup --level N` processes each enabled task sequentially. Per task:
+
+1. **Select snapshot**: the newest `bcb_level<N>.*` snapshot in `snapshot_dir`. If its manifest exists on S3, the task is skipped.
+2. **Check chain** (level > 0): the parent is the level N-1 backup recorded in `latest.yaml`, matched to a local snapshot by btrfs UUID. HEAD every part of every lower level; abort if any is missing or has a different size.
+3. **Check space**: `base_dir` must have free space for about one full stream.
+4. **Send and encrypt**: run `btrfs send` (`-p` for incrementals), hash the whole stream, split it into 3 GiB parts, then encrypt and hash each part into `base_dir`.
+5. **Upload**: one S3 object per part, sent as multipart chunks, with the level's storage class and a `bcb-backup-level` tag.
+6. **Confirm**: HEAD every part and compare its size.
+7. **Commit**: write `manifest.yaml`, then `latest.yaml`. A backup exists once its manifest exists.
+8. **Clean up**: remove the local parts and state.
+
+```mermaid
+sequenceDiagram
+    participant B as bcb
+    participant L as base_dir
+    participant S as S3
+    B->>S: HEAD manifest (already backed up?)
+    B->>S: HEAD lower-level parts (chain intact?)
+    B->>L: btrfs send | split | age | BLAKE3
+    loop each part
+        B->>S: multipart upload (storage class per level)
+    end
+    B->>S: HEAD every part (size check)
+    B->>S: PUT manifest.yaml (commit point)
+    B->>S: PUT latest.yaml
+    B->>L: remove parts
+```
+
+### Resume
+
+Progress is persisted in a state file under `base_dir`. Re-running the same command resumes the backup.
+
+| Interrupted during | Behavior on next run                                                                                             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| Send / encrypt     | Partial parts are discarded and the send restarts.                                                               |
+| Upload             | Local part hashes are re-checked; only parts not yet on S3 are uploaded. Orphaned multipart uploads are aborted. |
+| Confirm            | A part that is missing or has a different size is re-uploaded.                                                   |
+| After manifest     | Only `latest.yaml` is written.                                                                                   |
+
+- An unfinished backup of a level blocks backups of other levels of the same task, until it finishes or is abandoned by deleting its state file and parts directory.
+- Tasks are independent; a failing task does not block the others.
+
+## Restore workflow
+
+Retrieval takes hours to days, so `bcb restore` is idempotent and intended to be re-run until it reports completion. Each run:
+
+1. **Preflight** (before any retrieval is requested): the private key matches the backup; for an incremental, the parent snapshot exists on the target; `base_dir` has space for the remaining parts.
+2. **Request retrieval** for the next batch of archived parts, within the pacing budget.
+3. **Download** all currently retrievable parts in 64 MiB ranges. A crash loses at most one range.
+4. **Verify and receive**, once all parts are downloaded: check each part's BLAKE3 and the whole stream's BLAKE3, decrypting in memory into `btrfs receive`. Decrypted data is never written to disk.
+
+| Exit code | Meaning                                                                                                                        |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `0`       | Restore complete.                                                                                                              |
+| `1`       | Local error (e.g. disk full, permissions), or every status check and download attempted in the run failed (e.g. network down). |
+| `2`       | In progress; re-run later.                                                                                                     |
+
+- A part that fails on the S3 side is logged and retried on the next run.
+- Under a systemd timer, set `SuccessExitStatus=2`.
+- Restore levels in order onto the same target: 0, 1, …, N.
+
+### Retrieval pacing
+
+Requesting all parts at once wastes retrieval cost if the download cannot finish before the retrieved copies expire. When `s3.restore.expected_download_kbps` is set, bcb keeps at most `lead_days × expected_download_kbps` of data in retrieval and requests more as parts are downloaded. Requests for the next batch are issued before downloading the current one, so retrieval and download overlap.
+
+- `--restore-tier`: `standard` (default), `bulk` or `expedited`.
+- `--restore-days`: how long a retrieved copy stays downloadable. With pacing enabled it must be at least `lead_days` + 1.
+- `lead_days`: defaults to 1.5× the tier's documented retrieval time. Override with `s3.restore.lead_days`.
+- `expected_download_kbps`: kilobit/s. A lower estimate is safer.
+
+A copy that expires before download is re-requested on the next run, and the partial download resumes.
 
 ## Usage
 
 ```bash
-sudo bcb check                          # validate config and connectivity
-bcb backup --level 0                    # run a backup
-bcb restore --task <name> --level 0 --date <YYYYMMDDHHMM> --target <path> --private-key <key>
-
-bcb genkey --output ./bcb_private.key   # generate an age key pair
+bcb genkey --output ./bcb_private.key   # generate an age key pair; store the private key offline
+sudo bcb check                          # validate config, binaries and S3 connectivity
+bcb backup --level 0                    # back up every enabled task
 bcb list                                # list backups on S3
 bcb verify                              # audit backups without triggering retrieval
+bcb restore --task <name> --level 0 --date <YYYYMMDDHHMM> --target <path> --private-key <key>
 ```
 
-Config path defaults to `/etc/bcb/config.yaml`; override with `--config`. Run `bcb --help` or `bcb <command> --help` for the full option list.
+The config path defaults to `/etc/bcb/config.yaml`; override with `--config`. See `bcb <command> --help` for all options.
 
-### Config
+> For scheduled backups (btrbk and systemd), see the [periodic backup example](docs/periodic-backup-example.md) and the ready-to-copy files in [contrib/](contrib/README.md).
+
+## Config
 
 ```yaml
 # /etc/bcb/config.yaml
@@ -54,11 +132,11 @@ base_dir: /var/lib/bcb/
 age_public_key: age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 s3:
   bucket: my-backup-bucket
-  prefix: btrfs-backups/ # Empty, or ends with "/" and does not start with "/"
-  endpoint: "" # Leave empty for AWS S3, or specify custom endpoint for S3-compatible services
+  prefix: btrfs-backups/
+  endpoint: "" # Empty for AWS S3, or an S3-compatible endpoint
   region: us-east-1
   storage_class:
-    manifest: STANDARD # Must be readable without retrieval: STANDARD, STANDARD_IA, ONEZONE_IA or GLACIER_IR
+    manifest: STANDARD # Must be readable without retrieval
     backup_data: # One entry per backup level; a level without an entry is an error
       - DEEP_ARCHIVE # Level 0 (full backup)
       - DEEP_ARCHIVE # Level 1
@@ -66,153 +144,104 @@ s3:
 tasks:
   - name: example_task # Letters, digits, '.', '_' and '-' only: it becomes a directory name
     description: Example backup task
-    subvolume: /mnt/data
-    snapshot_dir: /mnt/.snapshots # Must not be shared with another enabled task
+    subvolume: /mnt/pool/@data # Absolute path of the subvolume to back up
+    snapshot_dir: /mnt/pool/.snapshots # Must not be shared with another enabled task
     enabled: true
 ```
 
-`base_dir` is bcb's local working directory: it holds the lock file, resume state, daily log files, and the temporary encrypted parts during backup and the downloaded parts during restore. Its filesystem needs free space roughly equal to one full backup; bcb checks this before sending and refuses to start otherwise. bcb sets its permissions to 0700 on every run.
+- `storage_class.manifest`: STANDARD, STANDARD_IA, ONEZONE_IA or GLACIER_IR
+- `storage_class.backup_data`: STANDARD, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER or DEEP_ARCHIVE.
+- `base_dir`: lock file, state files, daily logs, and parts in transit. Requires free space for about one full backup, checked before sending. Permissions are set to 0700 on every run.
+- `s3.prefix`: Key prefix prepended to every S3 object key. Empty, or ends with "/" and does not start with "/".
+- `s3.upload_speed_limit_kbps`: limits the read rate into each multipart chunk. Each chunk is then sent at line rate, so the uplink is bursty and the average stays below the limit. For smooth shaping, use router QoS or `tc`.
+- `s3.restore.expected_download_kbps`, `s3.restore.lead_days`: see [Retrieval pacing](#retrieval-pacing).
 
-`s3.upload_speed_limit_kbps` paces how fast bcb reads into each multipart part, but each part is then sent at line rate, so the uplink alternates between idle and saturated and the effective average stays below the limit. If the bursts disturb other traffic, shape the NAS's upload with router QoS or `tc` instead.
+> Progress state is not guaranteed to be compatible across versions.
 
-Finish any unfinished backup or restore before upgrading bcb: a new version may not resume another version's local progress.
+## Snapshots
 
-`backup_data` accepts STANDARD, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER and DEEP_ARCHIVE.
-
-### Snapshots
-
-`bcb` does **not** create snapshots; it expects them in each task's `snapshot_dir`, created by [btrbk][btrbk] with `snapshot_name bcb_level<N>` and `timestamp_format long`:
+bcb does **not** create snapshots. Each task's `snapshot_dir` must contain snapshots created by [btrbk][btrbk] with `snapshot_name bcb_level<N>` and `timestamp_format long`:
 
 ```text
 bcb_level<N>.<YYYYMMDD>T<hhmm>
 ```
 
-- `bcb backup --level N` picks the newest matching snapshot.
-- The snapshot must have been taken from the task's `subvolume` (btrfs Parent UUID), and a level-N parent is matched by UUID, not just name. A replaced source (e.g. new disk) fails until a level 0 backup starts a new chain.
-- Timestamps (snapshot names, `--date`, manifests) are the snapshot's local time with no zone. On a host that observes DST, the hour repeated when clocks fall back can make a newer snapshot sort as older, or collide with an existing name; run bcb on a host without DST.
-- A level-N (N > 0) backup requires the level-(N-1) parent snapshot from the latest backup, and the level-N snapshot must be newer.
-- btrbk's same-minute suffix (`_<n>`) is not supported; bcb fails naming the snapshot, delete or rename it.
-- Backups are idempotent: a completed snapshot is skipped, an interrupted one resumes. Tasks run sequentially; one failing task doesn't block the others.
-- While a level of a task has an unfinished backup, backing up another level of that task fails until it is finished, or abandoned by deleting its state file and parts directory.
-
-## Restoring
-
-AWS S3 Glacier objects **require** retrieval before download.
-
-`bcb restore` requests retrieval for the next batch, downloads whatever is currently retrievable, and exits — re-run until it prints `restore complete`. Exit code 2 means in progress, exit 0 means done, so a scheduler can just retry. A part that fails on the S3 side is logged and skipped; the next run retries it. The run exits 1 instead on a local error (e.g. a full disk or a permission problem), or when every part status check or download it attempted failed (e.g. the network is down), so a scheduler alerts.
-
-- `--restore-tier` / `--restore-days`: retrieval speed/cost and how long a retrieved copy stays downloadable.
-- `s3.restore.expected_download_kbps` / `s3.restore.lead_days`: pace retrieval to available bandwidth instead of requesting everything at once. `expected_download_kbps` is in kilobit/s (e.g. the download number your ISP advertises); when unsure, a conservative (lower) estimate is safer. With pacing on, `--restore-days` must exceed the lead window by at least a day.
-- Restore levels in order onto the same target (level 0 first); each incremental needs its parent already restored.
-- Before requesting any retrieval, bcb checks that the private key matches the backup, that an incremental's parent is already on the target, and that base_dir has room for the parts still to download (plus the received snapshot when the target is on the same filesystem).
-- If wrapped in a systemd timer, add `SuccessExitStatus=2` or every in-progress retry is treated as a failure.
-
-```mermaid
-gantt
-    title Retrieval pipeline (lead_days = 2, restore-days = 4)
-    dateFormat  YYYY-MM-DD
-    axisFormat  %m/%d
-    tickInterval 1day
-
-    section Wave 1
-    Retrieval        :active, w1req, 2024-01-01, 2d
-    Data available   :        w1valid, 2024-01-03, 4d
-    Download         :done,   w1dl,  2024-01-03, 1d
-
-    section Wave 2
-    Retrieval        :active, w2req, 2024-01-02, 2d
-    Data available   :        w2valid, 2024-01-04, 4d
-    Download         :done,   w2dl,  2024-01-04, 1d
-
-    section Wave 3
-    Retrieval        :active, w3req, 2024-01-03, 2d
-    Data available   :        w3valid, 2024-01-05, 4d
-    Download         :done,   w3dl,  2024-01-05, 1d
-```
-
-```mermaid
-gantt
-    title Out of time to finish downloading
-    dateFormat  YYYY-MM-DD
-    axisFormat  %m/%d
-    tickInterval 1day
-
-    section 1st retrieval
-    Retrieval #1               :active, req1, 2024-01-01, 2d
-    Data available             :        valid1, 2024-01-03, 4d
-    Download (Interrupted)     :crit,   dl1, 2024-01-06, 2d
-    Retrieved copy expired      :milestone, exp1, 2024-01-07, 0d
-
-    section 2nd retrieval (auto)
-    Retrieval #2               :active, req2, 2024-01-07, 2d
-    Data available             :        valid2, 2024-01-09, 4d
-    Resume Download            :done,   dl2, 2024-01-09, 1d
-```
-
-> Waves above are illustrative; actual requests are paced by a rolling byte budget (lead_days x expected_download_kbps), not fixed daily batches.
-
-## S3 Layout
-
-```text
-<prefix>backup-data/<subvolume>/bcb_level<N>_<YYYYMMDDhhmm>/snapshot.part-NNNNNN.age
-<prefix>manifests/<subvolume>/bcb_level<N>_<YYYYMMDDhhmm>/manifest.yaml
-<prefix>manifests/<subvolume>/latest.yaml
-```
-
-`<subvolume>` is the subvolume path with `/` replaced by `_`. `manifest.yaml` describes one backup; `latest.yaml` records the newest backup of each level, which the next incremental uses as its parent. Both carry a `format_version`, and bcb refuses a manifest whose major version it doesn't know.
+- The snapshot must originate from the task's `subvolume` (btrfs Parent UUID). If the source is replaced (e.g. new disk), backups fail until a level 0 backup starts a new chain.
+- A level-N (N > 0) snapshot must be newer than its level N-1 parent, and the parent must exist locally. In the contrib setup, `snapshot_preserve_min latest` retains it and `bcb-run` prunes only after a successful backup.
+- Timestamps (snapshot names, `--date`, manifests) are local time without a zone. On hosts observing DST, the repeated hour can misorder or collide snapshots; run bcb on a host without DST.
+- btrbk's same-minute suffix (`_<n>`) is unsupported. bcb fails and names the snapshot; delete or rename it.
 
 ## Retention
 
-`bcb` **never** deletes from S3; use bucket lifecycle rules.
+bcb **never** deletes from S3. Configure [bucket lifecycle rules][s3-lifecycle]. Every object is tagged `bcb-backup-level` (`0`, `1`, … or `manifest`), so one rule per level covers all subvolumes.
 
-Every object is tagged `bcb-backup-level` (`0`, `1`, ... or `manifest`) so one lifecycle rule per level covers all subvolumes.
+- Do not expire `manifest` objects.
+- Expire a level only after the last incremental built on it.
+- Observe each storage class's minimum storage duration.
+- If a lower level is missing, the next incremental aborts. Run a level N-1 backup to start a new chain.
 
-Leave `manifest` objects unexpired. Don't expire a level that a later incremental still depends on: its expiration must come after the last incremental built on it. Respect each storage class's minimum duration too.
+## Verifying backups
 
-Before an incremental backup, bcb HEADs every part of every lower level listed in `latest.yaml` and refuses to back up if any is missing or has the wrong size; run a level 0 backup to start a new chain.
+`bcb verify` audits all backups on record without triggering a retrieval. Checks: chain completeness, part existence and size, storage class, and age of the latest backup. These are metadata checks only; content corruption is detected only by a restore, which verifies BLAKE3.
 
-An incremental also needs its parent snapshot locally. With the contrib setup that parent is always the newest snapshot of the level below, which `snapshot_preserve_min latest` keeps and `bcb-run` only prunes after a successful backup. Pruning manually or changing those settings can delete it; the next incremental then fails and needs a level 0 backup.
+## S3 layout
 
-Before writing a backup's manifest, bcb HEADs every part of that backup; a part missing or of the wrong size is uploaded again on the next run.
+```text
+<bucket>/<prefix>
+├── backup-data/
+│   └── <subvolume>/
+│       └── bcb_level<N>_<YYYYMMDDhhmm>/
+│           └── snapshot.part-NNNNNN.age
+└── manifests/
+    └── <subvolume>/
+        ├── latest.yaml
+        └── bcb_level<N>_<YYYYMMDDhhmm>/
+            └── manifest.yaml
+```
 
-## Documentation
-
-- [Periodic backup example](docs/periodic-backup-example.md) — btrbk config, systemd units, failure alerting (ready-to-copy files in [contrib/](contrib/README.md))
-- [Restore drill runbook](docs/restore-drill-runbook.md)
+- `<subvolume>`: the subvolume path with `/` replaced by `_`.
+- `manifest.yaml`: describes one backup: parent snapshot, stream BLAKE3, and each part's size and BLAKE3.
+- `latest.yaml`: the newest backup of each level; the next incremental takes its parent from it.
+- Both files carry a `format_version`.
 
 ## Development
 
 ```bash
-cargo fmt && cargo clippy && cargo build && cargo test
+cargo build
+cargo test
+
+cargo fmt
+cargo clippy
 ```
 
-**VM tests:** require [Multipass](https://multipass.run); the script creates and sets up the VM on first run.
+**VM tests** require [Multipass](https://multipass.run). The script creates and provisions the VM on first run:
 
 ```bash
 bash scripts/run-vm-tests.sh
 ```
 
-The VM suite is compiled into the same `cargo test` run, but each test skips itself (reporting "ok" either way) when its required environment variables aren't set — run with `cargo test -- --nocapture` to see the "skipping: ..." messages that distinguish an actual pass from a skip.
+The VM suite is part of `cargo test`. A test skips itself, still reporting "ok", when its required environment variables are unset. Use `cargo test -- --nocapture` to see the "skipping: ..." messages.
 
-## TODO
+> See also [Taskfile](./Taskfile.yml).
 
-- [x] CI (GitHub Actions: test, clippy, fmt)
-- [x] Failure alerting (e.g. systemd OnFailure= notification unit)
-- [ ] Release packaging
+### Todo
+
 - [ ] `restore --dry-run` and a `--force` passthrough for `btrfs receive`
-- [x] Resumable restore: keep downloaded parts across runs so an interrupted restore only fetches (and re-requests archive retrieval for) the missing parts
-- [x] `bcb verify`: audit chain completeness, part existence/size, storage class, and freshness without triggering an archive retrieval
-- [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents (retrieval cost/latency, so off by default; for periodic drills)
-- [ ] Add btrbk to VM for E2E testing
-- [ ] `--download-kbps` override `expected_download_kbps`
-- [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink instead of bursting each part
-- [ ] Raise unit/integration coverage of code that only the VM suite exercises today: `S3Backend` (multipart upload, orphaned-upload cleanup, range download), `BtrfsDriver` (send stream exit handling, receive), and the `main.rs` command functions beyond argument parsing
+- [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents
+- [ ] Add btrbk to the VM for E2E testing
+- [ ] `--download-kbps` to override `expected_download_kbps`
+- [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink
+- [ ] Unit/integration coverage for code only the VM suite exercises: `S3Backend`, `BtrfsDriver`, and the `main.rs` command functions
 
 ## License
 
 [Apache License 2.0](LICENSE)
 
-[s3-gda]: https://aws.amazon.com/s3/storage-classes/glacier/
+[s3-classes]: https://aws.amazon.com/s3/storage-classes/glacier/
+[s3-storage-class-intro]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html
+[s3-pricing]: https://aws.amazon.com/s3/pricing/
+[s3-retrieval]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/restoring-objects-retrieval-options.html
+[s3-lifecycle]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html
 [age]: https://github.com/filosottile/age
 [b3]: https://github.com/BLAKE3-team/BLAKE3
 [btrbk]: https://github.com/digint/btrbk
