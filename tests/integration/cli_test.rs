@@ -1,7 +1,7 @@
 //! Black-box tests of the `bcb` binary itself: argument parsing and the `main()` wiring for
 //! commands that don't touch S3 or btrfs (genkey, test-keys). Commands that construct an
 //! `S3Backend` (check/list/verify/backup/restore) are exercised against a real S3-compatible
-//! server in the vm/e2e suites instead, since `aws-config` credential/region resolution isn't
+//! server in the VM suite instead, since `aws-config` credential/region resolution isn't
 //! something worth faking here.
 
 use std::path::Path;

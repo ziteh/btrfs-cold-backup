@@ -1,10 +1,7 @@
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{Config, Task};
 
-use crate::interruption_test::{
-    btrfs_subvolume_create, btrfs_subvolume_delete, ensure_bucket, run_bcb, s3_config, test_dir,
-    vm_env,
-};
+use crate::common::*;
 
 /// A backup run covering multiple tasks must not let one task's failure stop the others from
 /// being attempted: `bcb backup` (no --task filter) should still complete the healthy task
@@ -36,11 +33,8 @@ async fn one_failing_task_should_not_block_the_others() {
         .unwrap();
     assert!(out.status.success());
 
-    // The "bad" task's snapshot_dir deliberately has no matching level-0 snapshot in it, so
-    // backup_task() fails with "no level 0 snapshot found" for this task specifically. Its
-    // subvolume path is never touched by a level-0 backup that fails this early — it only
-    // needs to be distinct from good-task's so config validation doesn't reject them as
-    // duplicates.
+    // The bad task's snapshot_dir has no level 0 snapshot, so its backup fails before touching
+    // its subvolume, which only has to differ from the good task's to pass config validation.
     let bad_snap_dir = dir.join("bad-snapshots-empty");
     std::fs::create_dir_all(&bad_snap_dir).unwrap();
 

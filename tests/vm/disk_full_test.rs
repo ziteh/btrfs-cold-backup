@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::interruption_test::{setup_fixture, vm_env};
+use crate::common::*;
 
 struct TmpfsMount(PathBuf);
 

@@ -1,6 +1,6 @@
 # Real AWS Restore Drill Runbook
 
-The e2e and vm test suites run against a local S3-compatible server (SeaweedFS), which never
+The VM test suite runs against a local S3-compatible server (SeaweedFS), which never
 enforces Glacier's access restrictions or retrieval scheduling — every test task's
 `storage_class.backup_data` is `STANDARD`. That leaves the following untested against real AWS:
 

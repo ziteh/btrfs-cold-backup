@@ -1,8 +1,6 @@
 use std::process::Command;
 
-use btrfs_cold_backup::sanitize_subvolume_path;
-
-use crate::interruption_test::{raw_s3_client, setup_fixture, vm_env};
+use crate::common::*;
 
 /// A backup spanning multiple parts must round-trip: parts are encrypted and uploaded
 /// individually, and restore must reassemble them in order before piping to btrfs receive.
@@ -44,8 +42,7 @@ async fn multi_part_backup_and_restore_should_round_trip() {
     );
 
     // The test proves nothing unless the backup actually produced multiple parts.
-    let sanitized = sanitize_subvolume_path(&fixture.subvol).unwrap();
-    let prefix = format!("interrupt-test/backup-data/{sanitized}/");
+    let prefix = data_prefix(&fixture);
     let s3 = raw_s3_client(&env).await;
     let resp = s3
         .list_objects_v2()

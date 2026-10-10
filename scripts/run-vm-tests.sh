@@ -83,11 +83,3 @@ build_and_run vm \
     "AWS_ACCESS_KEY_ID=$S3_USER" \
     "AWS_SECRET_ACCESS_KEY=$S3_PASS" \
     "AWS_DEFAULT_REGION=us-east-1"
-
-build_and_run e2e \
-    "BCB_BTRFS_MOUNT=$BTRFS_MOUNT" \
-    "BCB_S3_ENDPOINT=$S3_ENDPOINT" \
-    "BCB_S3_BUCKET=$S3_BUCKET" \
-    "AWS_ACCESS_KEY_ID=$S3_USER" \
-    "AWS_SECRET_ACCESS_KEY=$S3_PASS" \
-    "AWS_DEFAULT_REGION=us-east-1"

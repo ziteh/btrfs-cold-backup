@@ -6,11 +6,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use btrfs_cold_backup::{Config, sanitize_subvolume_path};
+use btrfs_cold_backup::Config;
 
-use crate::interruption_test::{
-    Fixture, VmEnv, btrfs_subvolume_delete, raw_s3_client, setup_fixture, vm_env,
-};
+use crate::common::*;
 
 const PART_SIZE: u64 = 4 * 1024 * 1024;
 
@@ -72,34 +70,10 @@ fn restore(env: &VmEnv, f: &Fixture, config: &Path, level: u32, date: &str, key:
     )
 }
 
-fn assert_ok(out: &Output, what: &str) {
-    assert!(
-        out.status.success(),
-        "{what} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// `needle` may be on either stream: errors go to stderr, progress reports to stdout.
-fn assert_exit(out: &Output, code: i32, needle: &str) {
-    let output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(out.status.code(), Some(code), "output: {output}");
-    assert!(output.contains(needle), "expected {needle:?} in: {output}");
-}
-
 fn assert_same_file(f: &Fixture, snapshot: &str) {
     let original = std::fs::read(f.subvol.join("big.bin")).unwrap();
     let recovered = std::fs::read(f.restore_dir.join(snapshot).join("big.bin")).unwrap();
     assert!(original == recovered, "restored content must match source");
-}
-
-fn data_prefix(f: &Fixture) -> String {
-    let sanitized = sanitize_subvolume_path(&f.subvol).unwrap();
-    format!("interrupt-test/backup-data/{sanitized}/")
 }
 
 async fn part_keys(env: &VmEnv, f: &Fixture) -> Vec<(String, u64)> {
@@ -239,13 +213,7 @@ async fn part_damaged_before_finalize_should_be_downloaded_again() {
     child.kill().unwrap();
     child.wait().unwrap();
 
-    let sanitized = sanitize_subvolume_path(&f.subvol).unwrap();
-    let damaged = f
-        .work_dir
-        .join("restore")
-        .join(sanitized)
-        .join("bcb_level0_202606010000")
-        .join("part-000000.age");
+    let damaged = restore_work_dir(&f).join("part-000000.age");
     let mut bytes = std::fs::read(&damaged).unwrap();
     bytes[1000] ^= 0xff;
     std::fs::write(&damaged, bytes).unwrap();

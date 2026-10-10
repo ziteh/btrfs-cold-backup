@@ -29,8 +29,8 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
-      # Only unit + integration tests are instrumented: e2e/vm need real btrfs + S3 and run
-      # separately (uninstrumented) in the e2e job below, so their coverage isn't reflected in
+      # Only unit + integration tests are instrumented: the vm tests need real btrfs + S3 and run
+      # separately (uninstrumented) in the vm job below, so their coverage isn't reflected in
       # this number.
       #
       # The 70% floor is a regression guard, not a target: it's set a couple points below what
@@ -39,11 +39,11 @@ jobs:
       - name: Test with coverage
         run: cargo llvm-cov --lib --bins --test integration --fail-under-lines 70
 
-  e2e:
+  vm:
     runs-on: ubuntu-latest
     env:
-      # CI=true is already set by GitHub Actions for every job; the e2e/vm test binaries key
-      # off it to fail loudly instead of silently skipping when the env vars below are wrong.
+      # CI=true is already set by GitHub Actions for every job; the vm test binary keys off it
+      # to fail loudly instead of silently skipping when the env vars below are wrong.
       BCB_BTRFS_MOUNT: /mnt/bcb-test
       BCB_S3_ENDPOINT: http://localhost:8333
       BCB_S3_BUCKET: bcb-test
@@ -64,8 +64,8 @@ jobs:
       - name: Build bcb binary (dev profile, keeps BCB_TEST_PAUSE_* hooks compiled in)
         run: cargo build --bin bcb
 
-      - name: Build e2e/vm test binaries
-        run: cargo test --test e2e --test vm --no-run
+      - name: Build vm test binary
+        run: cargo test --test vm --no-run
 
       - name: Run vm tests
         run: |
@@ -76,20 +76,6 @@ jobs:
             "BCB_S3_ENDPOINT=$BCB_S3_ENDPOINT" \
             "BCB_S3_BUCKET=$BCB_S3_BUCKET" \
             "BCB_BIN_PATH=$PWD/target/debug/bcb" \
-            "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
-            "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
-            "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \
-            "CI=$CI" \
-            "$bin" --nocapture
-
-      - name: Run e2e tests
-        run: |
-          set -euo pipefail
-          bin=$(ls -t target/debug/deps/e2e-* | grep -v '\.d$' | head -1)
-          sudo env \
-            "BCB_BTRFS_MOUNT=$BCB_BTRFS_MOUNT" \
-            "BCB_S3_ENDPOINT=$BCB_S3_ENDPOINT" \
-            "BCB_S3_BUCKET=$BCB_S3_BUCKET" \
             "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
             "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
             "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" \

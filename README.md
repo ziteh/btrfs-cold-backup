@@ -186,13 +186,13 @@ Before writing a backup's manifest, bcb HEADs every part of that backup; a part 
 cargo fmt && cargo clippy && cargo build && cargo test
 ```
 
-**E2E:** requires Docker and [Multipass](https://multipass.run); the script creates and sets up the VM on first run.
+**VM tests:** require [Multipass](https://multipass.run); the script creates and sets up the VM on first run.
 
 ```bash
 bash scripts/run-vm-tests.sh
 ```
 
-The e2e and VM suites are compiled into the same `cargo test` run, but each test skips itself (reporting "ok" either way) when its required environment variables aren't set — run with `cargo test -- --nocapture` to see the "skipping: ..." messages that distinguish an actual pass from a skip.
+The VM suite is compiled into the same `cargo test` run, but each test skips itself (reporting "ok" either way) when its required environment variables aren't set — run with `cargo test -- --nocapture` to see the "skipping: ..." messages that distinguish an actual pass from a skip.
 
 ## TODO
 

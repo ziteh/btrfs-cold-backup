@@ -1,67 +1,18 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use btrfs_cold_backup::{BtrfsDriver, BtrfsOps};
 use tokio::io::AsyncReadExt;
 
-/// Returns the btrfs test mount path from BCB_BTRFS_MOUNT, or None to skip. `cargo test`
-/// reports a skipped test identically to a real pass ("ok"); run with `-- --nocapture` to
-/// see this skip reason instead of silently trusting a green "N passed".
+use crate::common::*;
+
+/// The btrfs test mount, or None (after logging why) to skip the test. These tests need no
+/// S3, so they don't require the whole VM environment.
 fn btrfs_mount() -> Option<PathBuf> {
     let mount = std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from);
     if mount.is_none() {
-        let msg =
-            "skipping btrfs driver test: BCB_BTRFS_MOUNT not set (run via scripts/run-vm-tests.sh)";
-        // A skipped test and a real pass both print "ok", so a misconfigured CI env would
-        // otherwise go unnoticed as a green run. In CI this must fail loudly instead.
-        assert!(std::env::var("CI").is_err(), "{msg}, but CI=true");
-        eprintln!("{msg}");
+        skip("BCB_BTRFS_MOUNT not set");
     }
     mount
-}
-
-/// Creates a unique working directory under the btrfs mount for one test.
-fn test_dir(mount: &Path, name: &str) -> PathBuf {
-    let dir = mount.join(format!("test-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn btrfs_subvolume_create(path: &Path) {
-    let out = Command::new("btrfs")
-        .args(["subvolume", "create", path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn btrfs_snapshot(src: &Path, dst: &Path) {
-    let out = Command::new("btrfs")
-        .args([
-            "subvolume",
-            "snapshot",
-            "-r",
-            src.to_str().unwrap(),
-            dst.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn btrfs_subvolume_delete(path: &Path) {
-    Command::new("btrfs")
-        .args(["subvolume", "delete", path.to_str().unwrap()])
-        .output()
-        .unwrap();
 }
 
 #[tokio::test]
@@ -99,7 +50,6 @@ async fn list_snapshots_should_return_only_bcb_prefixed_dirs() {
     let snap_dir = dir.join("snapshots");
     std::fs::create_dir_all(&snap_dir).unwrap();
 
-    // Create bcb-prefixed snapshot dirs and one unrelated dir
     std::fs::create_dir(snap_dir.join("bcb_level0.20260101T0000")).unwrap();
     std::fs::create_dir(snap_dir.join("bcb_level1.20260102T0000")).unwrap();
     std::fs::create_dir(snap_dir.join("unrelated")).unwrap();
@@ -149,8 +99,6 @@ async fn send_incremental_should_produce_smaller_stream_than_full() {
     let snap0 = snap_dir.join("bcb_level0.20260101T0000");
     btrfs_snapshot(&subvol, &snap0);
 
-    // Make the subvolume writable again by deleting and recreating
-    // (btrfs snapshot -r is read-only; add data to parent subvol)
     std::fs::write(subvol.join("extra.txt"), b"added later").unwrap();
     let snap1 = snap_dir.join("bcb_level1.20260102T0000");
     btrfs_snapshot(&subvol, &snap1);

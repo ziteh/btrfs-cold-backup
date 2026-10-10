@@ -1,116 +1,9 @@
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use age::secrecy::ExposeSecret;
-use btrfs_cold_backup::{
-    Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task, sanitize_subvolume_path,
-};
-
-pub(crate) struct VmEnv {
-    pub(crate) btrfs_mount: PathBuf,
-    pub(crate) s3_endpoint: String,
-    pub(crate) s3_bucket: String,
-    pub(crate) bin_path: PathBuf,
-}
-
-/// Returns the VM env from env vars, or None to skip the test. `cargo test` reports a
-/// skipped test identically to a real pass ("ok"); run with `-- --nocapture` to see this
-/// skip reason instead of silently trusting a green "N passed".
-pub(crate) fn vm_env() -> Option<VmEnv> {
-    let btrfs_mount = std::env::var("BCB_BTRFS_MOUNT").ok().map(PathBuf::from);
-    let s3_endpoint = std::env::var("BCB_S3_ENDPOINT").ok();
-    let s3_bucket = std::env::var("BCB_S3_BUCKET").ok();
-    let bin_path = std::env::var("BCB_BIN_PATH").ok().map(PathBuf::from);
-    let (Some(btrfs_mount), Some(s3_endpoint), Some(s3_bucket), Some(bin_path)) =
-        (btrfs_mount, s3_endpoint, s3_bucket, bin_path)
-    else {
-        let msg = "skipping VM test: BCB_BTRFS_MOUNT / BCB_S3_ENDPOINT / BCB_S3_BUCKET / \
-             BCB_BIN_PATH not set (run via scripts/run-vm-tests.sh)";
-        // A skipped test and a real pass both print "ok", so a misconfigured CI env would
-        // otherwise go unnoticed as a green run. In CI this must fail loudly instead.
-        assert!(std::env::var("CI").is_err(), "{msg}, but CI=true");
-        eprintln!("{msg}");
-        return None;
-    };
-    Some(VmEnv {
-        btrfs_mount,
-        s3_endpoint,
-        s3_bucket,
-        bin_path,
-    })
-}
-
-pub(crate) fn test_dir(mount: &Path, name: &str) -> PathBuf {
-    let dir = mount.join(format!("interrupt-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-pub(crate) fn btrfs_subvolume_create(path: &Path) {
-    let out = Command::new("btrfs")
-        .args(["subvolume", "create", path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-pub(crate) fn btrfs_subvolume_delete(path: &Path) {
-    Command::new("btrfs")
-        .args(["subvolume", "delete", path.to_str().unwrap()])
-        .output()
-        .unwrap();
-}
-
-pub(crate) fn ensure_bucket(endpoint: &str, bucket: &str) {
-    // Ignore the exit status: this races other test binaries creating the same bucket, and
-    // "already exists" is the expected outcome most of the time.
-    Command::new("aws")
-        .args([
-            "--endpoint-url",
-            endpoint,
-            "s3",
-            "mb",
-            &format!("s3://{bucket}"),
-        ])
-        .output()
-        .unwrap();
-}
-
-pub(crate) fn s3_config(env: &VmEnv) -> S3Config {
-    S3Config {
-        bucket: env.s3_bucket.clone(),
-        region: "us-east-1".to_string(),
-        prefix: "interrupt-test/".to_string(),
-        endpoint: env.s3_endpoint.clone(),
-        // Explicit because S3StorageClass::default() leaves `manifest` empty (serde
-        // defaults only apply when deserializing).
-        storage_class: S3StorageClass {
-            manifest: "STANDARD".to_string(),
-            backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],
-        },
-        retry: S3RetryConfig::default(),
-        upload_speed_limit_kbps: 0,
-        restore: RestoreConfig::default(),
-    }
-}
-
-pub(crate) async fn raw_s3_client(env: &VmEnv) -> aws_sdk_s3::Client {
-    let region = aws_sdk_s3::config::Region::new("us-east-1");
-    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(region)
-        .load()
-        .await;
-    let builder = aws_sdk_s3::config::Builder::from(&shared_config)
-        .endpoint_url(env.s3_endpoint.clone())
-        .force_path_style(true);
-    aws_sdk_s3::Client::from_conf(builder.build())
-}
+use crate::common::*;
 
 // ListMultipartUploads' `prefix` filter isn't reliable against this S3-compatible test server
 // (observed: a genuine string-prefix of an in-progress upload's key still came back empty), so
@@ -213,13 +106,6 @@ fn spawn_bcb_restore(
     cmd.spawn().expect("failed to spawn bcb")
 }
 
-pub(crate) fn run_bcb(env: &VmEnv, args: &[&str]) -> std::process::Output {
-    Command::new(&env.bin_path)
-        .args(args)
-        .output()
-        .expect("failed to run bcb")
-}
-
 /// Blocks until a line containing `marker` appears on the child's stderr, or `timeout` elapses.
 fn wait_for_marker(child: &mut Child, marker: &str, timeout: Duration) -> bool {
     let stderr = child.stderr.take().expect("stderr not piped");
@@ -246,8 +132,8 @@ fn no_process_matches(pgrep_args: &[&str]) -> bool {
         .success()
 }
 
-/// Polls until no btrfs-send process remains, or returns false on timeout.
-// Matches on this fixture's snapshot dir, since other tests run btrfs send concurrently.
+/// Polls until no btrfs-send process of this fixture remains, or returns false on timeout.
+/// Matches on the fixture's snapshot dir, since other tests run btrfs send concurrently.
 fn wait_no_orphan_children(snap_dir: &Path, timeout: Duration) -> bool {
     let pattern = format!("btrfs.*send.*{}", snap_dir.display());
     let deadline = Instant::now() + timeout;
@@ -262,104 +148,13 @@ fn wait_no_orphan_children(snap_dir: &Path, timeout: Duration) -> bool {
     }
 }
 
-pub(crate) struct Fixture {
-    pub(crate) config_path: PathBuf,
-    pub(crate) private_key_path: PathBuf,
-    pub(crate) subvol: PathBuf,
-    pub(crate) snap_dir: PathBuf,
-    pub(crate) work_dir: PathBuf,
-    pub(crate) restore_dir: PathBuf,
-    pub(crate) task_name: String,
-    /// Root of this fixture's directories on the btrfs device (snap_dir, restore_dir live here).
-    pub(crate) btrfs_dir: PathBuf,
-}
-
-/// Creates a subvolume + snapshot + on-disk config/key files for one interruption test.
-pub(crate) fn setup_fixture(env: &VmEnv, name: &str, write_file: impl FnOnce(&Path)) -> Fixture {
-    ensure_bucket(&env.s3_endpoint, &env.s3_bucket);
-
-    let btrfs_dir = test_dir(&env.btrfs_mount, name);
-    let subvol = btrfs_dir.join("subvol");
-    let snap_dir = btrfs_dir.join("snapshots");
-    let restore_dir = btrfs_dir.join("restore");
-    // work_dir holds bcb's lock file, state file, and multi-GB encrypted parts — keep it
-    // off the btrfs loop device (which is small) to avoid filling the btrfs device with bcb's
-    // own working data.  /var/tmp is on the VM's root filesystem which has ample free space.
-    let work_dir = PathBuf::from(format!("/var/tmp/bcb-work-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::create_dir_all(&work_dir).unwrap();
-
-    btrfs_subvolume_create(&subvol);
-    write_file(&subvol);
-
-    Command::new("btrfs")
-        .args([
-            "subvolume",
-            "snapshot",
-            "-r",
-            subvol.to_str().unwrap(),
-            btrfs_dir
-                .join("snapshots/bcb_level0.20260601T0000")
-                .to_str()
-                .unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    let identity = age::x25519::Identity::generate();
-    let task_name = format!("interrupt-{name}");
-    let config = Config {
-        base_dir: work_dir.clone(),
-        age_public_key: identity.to_public().to_string(),
-        s3: s3_config(env),
-        tasks: vec![Task {
-            name: task_name.clone(),
-            description: String::new(),
-            subvolume: subvol.clone(),
-            snapshot_dir: snap_dir.clone(),
-            enabled: true,
-        }],
-    };
-
-    let config_path = btrfs_dir.join("config.yaml");
-    std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
-
-    let private_key_path = btrfs_dir.join("key.txt");
-    std::fs::write(&private_key_path, identity.to_string().expose_secret()).unwrap();
-
-    Fixture {
-        config_path,
-        private_key_path,
-        subvol,
-        snap_dir,
-        work_dir,
-        restore_dir,
-        task_name,
-        btrfs_dir,
-    }
-}
-
-impl Drop for Fixture {
-    // Runs even when a test assertion panics, so a failing run doesn't leak subvolumes or disk
-    // space into the next run.
-    fn drop(&mut self) {
-        // Delete any restored subvolume first (btrfs receive creates a subvolume under restore_dir).
-        btrfs_subvolume_delete(&self.restore_dir.join("bcb_level0.20260601T0000"));
-        btrfs_subvolume_delete(&self.snap_dir.join("bcb_level0.20260601T0000"));
-        btrfs_subvolume_delete(&self.subvol);
-        // Remove plain directories left on the btrfs device and the work dir in /var/tmp.
-        let _ = std::fs::remove_dir_all(&self.btrfs_dir);
-        let _ = std::fs::remove_dir_all(&self.work_dir);
-    }
-}
-
 /// Killing bcb mid-multipart-upload must leave a recoverable, resumable state: the orphaned S3
 /// multipart session is detected and aborted on the next run, not left to leak storage forever.
 #[tokio::test]
 async fn kill_during_multipart_upload_then_resume_should_abort_orphan_and_succeed() {
     let Some(env) = vm_env() else { return };
     let fixture = setup_fixture(&env, "multipart", |subvol| {
-        // >64MB (PART_SIZE) so the single part's .age upload spans >=2 S3 multipart chunks.
+        // Larger than one S3 multipart chunk, so the part's upload spans several.
         let status = Command::new("dd")
             .args([
                 "if=/dev/urandom",
@@ -372,8 +167,7 @@ async fn kill_during_multipart_upload_then_resume_should_abort_orphan_and_succee
         assert!(status.success());
     });
 
-    let sanitized = sanitize_subvolume_path(&fixture.subvol).unwrap();
-    let prefix = format!("interrupt-test/backup-data/{sanitized}/");
+    let prefix = data_prefix(&fixture);
     let s3 = raw_s3_client(&env).await;
 
     let mut child = spawn_bcb_backup(
@@ -659,20 +453,9 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
     child.kill().unwrap();
     child.wait().unwrap();
 
-    // bcb's restore work dir is named deterministically from subvolume/level/timestamp; read
-    // its state directly (real file, no mocking involved) to confirm the kill actually landed
-    // mid-part rather than after it had already finished.
-    let restore_work_dir = btrfs_cold_backup::util::restore_work_dir(
-        &fixture.work_dir,
-        &sanitize_subvolume_path(&fixture.subvol).unwrap(),
-        0,
-        "2026-06-01T00:00",
-    );
+    // The state proves the kill landed mid-part rather than after the part had finished.
     let state: btrfs_cold_backup::RestoreState = serde_yaml::from_str(
-        &std::fs::read_to_string(btrfs_cold_backup::util::restore_state_path(
-            &restore_work_dir,
-        ))
-        .unwrap(),
+        &std::fs::read_to_string(restore_work_dir(&fixture).join("state.yaml")).unwrap(),
     )
     .unwrap();
     let part_state = state
@@ -717,7 +500,7 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
         String::from_utf8_lossy(&resumed.stdout)
     );
     assert!(
-        !restore_work_dir.exists(),
+        !restore_work_dir(&fixture).exists(),
         "restore work dir must be cleaned up after a completed restore"
     );
 
