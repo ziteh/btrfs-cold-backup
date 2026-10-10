@@ -231,6 +231,9 @@ The VM suite is part of `cargo test`. A test skips itself, still reporting "ok",
 - [ ] Add btrbk to the VM for E2E testing
 - [ ] `--download-kbps` to override `expected_download_kbps`
 - [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink
+- [ ] `bcb check` needs `s3:DeleteObject` to remove its probe object; drop that permission (least privilege, so stolen credentials cannot even place delete markers) by checking write access another way
+- [ ] Optional S3 Object Lock for level 0 data parts only (per-object retention set at upload, e.g. Compliance mode matching the Deep Archive minimum storage duration); needs `s3:PutObjectRetention` and a bucket created with Object Lock enabled
+- [ ] Split IAM policies: a backup policy without `s3:RestoreObject` for the host, and a restore policy kept offline with the private key, so stolen host credentials cannot run up retrieval costs
 - [ ] Unit/integration coverage for code only the VM suite exercises: `S3Backend`, `BtrfsDriver`, and the `main.rs` command functions
 
 ## License
