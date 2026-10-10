@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use btrfs_cold_backup::Config;
+use btrfs_cold_backup::config::Config;
 
 use crate::common::*;
 

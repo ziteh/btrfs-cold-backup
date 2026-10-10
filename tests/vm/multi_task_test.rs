@@ -1,5 +1,5 @@
 use age::secrecy::ExposeSecret;
-use btrfs_cold_backup::{Config, Task};
+use btrfs_cold_backup::config::{Config, Task};
 
 use crate::common::*;
 

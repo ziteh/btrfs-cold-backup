@@ -1,7 +1,12 @@
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
-use crate::{BtrfsOps, Config, RemoteBackend, Task, btrfs::ensure_snapshot_of};
+use crate::{
+    btrfs::BtrfsOps,
+    btrfs::ensure_snapshot_of,
+    config::{Config, Task},
+    remote::RemoteBackend,
+};
 
 /// Verifies the external executables bcb shells out to are present on PATH.
 pub fn check_binaries() -> Result<()> {
@@ -39,8 +44,6 @@ pub async fn check<B: BtrfsOps, R: RemoteBackend>(
     btrfs: &B,
     remote: &R,
 ) -> Result<()> {
-    config.validate()?;
-
     for task in &config.tasks {
         if !task.enabled {
             continue;
@@ -174,19 +177,6 @@ mod tests {
                 enabled: true,
             }],
         }
-    }
-
-    #[tokio::test]
-    async fn test_check_fails_when_config_invalid() {
-        let mut config = valid_config(PathBuf::from("/mnt/snapshots"));
-        config.s3.bucket = String::new();
-
-        // No expectations set on either mock: config validation must fail before any
-        // btrfs or remote call is made.
-        let btrfs = MockBtrfsOps::new();
-        let remote = MockRemoteBackend::new();
-
-        assert!(check(&config, &btrfs, &remote).await.is_err());
     }
 
     const SOURCE_UUID: &str = "src-uuid";

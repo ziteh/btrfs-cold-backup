@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use btrfs_cold_backup::{
-    BtrfsOps, Config, ObjectMetadata, RemoteBackend, RestoreConfig, RestoreStatus,
-    RestoreStatusDetail, RestoreTier, RetrievalOptions, S3Config, S3RetryConfig, S3StorageClass,
-    SubvolumeUuids, Task,
+    btrfs::{BtrfsOps, SubvolumeUuids},
+    config::{Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task},
     manifest::{Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo},
+    remote::{ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, RestoreTier},
+    restore::RetrievalOptions,
 };
 use mockall::mock;
 use tokio::io::AsyncRead;

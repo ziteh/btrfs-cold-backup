@@ -109,9 +109,8 @@ impl Config {
         if self.age_public_key.is_empty() {
             return Err(anyhow!("age_public_key cannot be empty"));
         }
-        if let Err(e) = self.age_public_key.parse::<age::x25519::Recipient>() {
-            return Err(anyhow!("age_public_key is not a valid age public key: {e}"));
-        }
+        crate::crypto::parse_recipient(&self.age_public_key)
+            .map_err(|e| anyhow!("age_public_key: {e}"))?;
         if self.tasks.is_empty() {
             return Err(anyhow!("at least one task must be defined"));
         }

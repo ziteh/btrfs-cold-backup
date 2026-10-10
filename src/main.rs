@@ -1,7 +1,11 @@
 use age::secrecy::ExposeSecret;
 use anyhow::{Result, anyhow};
 use btrfs_cold_backup::{
-    BtrfsDriver, Config, PidLock, RestoreTier, S3Backend, Task, write_private_key,
+    btrfs::BtrfsDriver,
+    config::{Config, Task},
+    crypto,
+    lock::InstanceLock,
+    remote::{RestoreTier, S3Backend},
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -107,24 +111,15 @@ fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
     }
 }
 
-async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, PidLock)> {
+async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, InstanceLock)> {
     // Up front, so a missing executable fails the run before any work starts.
     btrfs_cold_backup::check::check_binaries()?;
 
     btrfs_cold_backup::util::prepare_base_dir(&config.base_dir)
         .map_err(|e| anyhow!("failed to prepare base_dir: {e}"))?;
-    let old = btrfs_cold_backup::util::find_old_layout(&config.base_dir)?;
-    if !old.is_empty() {
-        let list: Vec<String> = old.iter().map(|p| p.display().to_string()).collect();
-        return Err(anyhow!(
-            "base_dir holds files from an older bcb layout: {}; \
-             delete them once confirmed unneeded",
-            list.join(", ")
-        ));
-    }
 
     let lock_path = config.base_dir.join("bcb.lock");
-    let lock = PidLock::acquire(&lock_path)?;
+    let lock = InstanceLock::acquire(&lock_path)?;
     let btrfs = BtrfsDriver;
     let remote = S3Backend::new(&config.s3).await?;
     Ok((btrfs, remote, lock))
@@ -189,8 +184,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Genkey { output } => {
-            let pair = btrfs_cold_backup::generate_key_pair();
-            write_private_key(&output, pair.private_key.expose_secret())?;
+            let pair = crypto::generate_key_pair();
+            crypto::write_private_key(&output, pair.private_key.expose_secret())?;
             println!("{}", pair.public_key);
         }
 
@@ -208,7 +203,8 @@ async fn main() -> Result<()> {
             let key_str = std::fs::read_to_string(&private_key)
                 .map_err(|e| anyhow!("failed to read private key {:?}: {e}", private_key))?;
 
-            btrfs_cold_backup::test_key_pair(&config.age_public_key, key_str.trim()).await?;
+            let identity = crypto::parse_identity(key_str.trim())?;
+            crypto::ensure_key_pair(&config.age_public_key, &identity)?;
             println!("OK: private key matches the configured public key");
         }
 

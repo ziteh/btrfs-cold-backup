@@ -2,10 +2,11 @@ use anyhow::Result;
 use std::collections::HashSet;
 
 use crate::{
-    Config, RemoteBackend, Task,
+    config::{Config, Task},
     list::list_backups,
     manifest::{Backup, parse_backup},
     remote::ObjectMetadata,
+    remote::RemoteBackend,
     util::{now_unix, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
 };
 

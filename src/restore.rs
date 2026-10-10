@@ -1,13 +1,14 @@
 use age::x25519;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    Config, RemoteBackend, Task,
-    crypto::{blake3_file, decrypt_to_writer},
+    config::{Config, Task},
+    crypto::{blake3_file, decrypt_to_writer, ensure_key_pair, parse_identity},
     manifest::{Backup, parse_backup},
+    remote::RemoteBackend,
     remote::{RestoreStatus, RestoreStatusDetail, RestoreTier},
     state::{PartDownloadState, RestorePartState, RestoreState, read_state},
     util::{
@@ -805,14 +806,8 @@ fn preflight(
     target_dir: &Path,
     work_dir: &Path,
 ) -> Result<()> {
-    let public_key = identity.to_public().to_string();
-    if public_key != backup.age_public_key {
-        return Err(anyhow!(
-            "the private key belongs to {public_key}, but this backup was encrypted to {}; \
-             no retrieval was requested",
-            backup.age_public_key
-        ));
-    }
+    ensure_key_pair(&backup.age_public_key, identity)
+        .context("the backup was encrypted to another key; no retrieval was requested")?;
 
     if let Some(parent) = &backup.parent_snapshot
         && !target_dir.join(parent).exists()
@@ -850,9 +845,7 @@ pub async fn restore_task<R: RemoteBackend>(
     retrieval: &RetrievalOptions,
     remote: &R,
 ) -> Result<RestoreProgress> {
-    let identity: x25519::Identity = private_key_str
-        .parse()
-        .map_err(|e| anyhow!("invalid age private key: {e}"))?;
+    let identity = parse_identity(private_key_str)?;
     let sanitized = sanitize_subvolume_path(&task.subvolume)?;
     let timestamp = compact_to_iso(date)?;
     let buffer_target = retrieval_buffer_target(config, retrieval)?;

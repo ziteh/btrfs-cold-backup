@@ -6,7 +6,8 @@ use std::process::{Command, Output};
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task, sanitize_subvolume_path,
+    config::{Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task},
+    util::sanitize_subvolume_path,
 };
 
 /// S3 prefix every VM test writes under.

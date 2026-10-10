@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use btrfs_cold_backup::{BtrfsDriver, BtrfsOps};
+use btrfs_cold_backup::btrfs::{BtrfsDriver, BtrfsOps};
 use tokio::io::AsyncReadExt;
 
 use crate::common::*;

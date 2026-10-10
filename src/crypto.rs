@@ -1,82 +1,71 @@
 use age::secrecy::SecretString;
 use age::x25519;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::io::{Read, Write};
 use std::path::Path;
-use tokio::task;
 
-use crate::util::{IO_BUF_SIZE, now_unix};
+use crate::util::IO_BUF_SIZE;
 
 pub struct AgeKeyPair {
     pub public_key: String,
     pub private_key: SecretString,
 }
 
-pub fn write_private_key(path: &std::path::Path, key: &str) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| anyhow!("failed to create {:?}: {e}", path))?;
-    file.write_all(key.as_bytes())
-        .map_err(|e| anyhow!("failed to write private key to {:?}: {e}", path))
-}
-
 pub fn generate_key_pair() -> AgeKeyPair {
-    let identity = age::x25519::Identity::generate();
+    let identity = x25519::Identity::generate();
     AgeKeyPair {
         public_key: identity.to_public().to_string(),
         private_key: identity.to_string(),
     }
 }
 
-pub async fn encrypt_file(input: &Path, output: &Path, public_key_str: &str) -> Result<()> {
-    let public_key = public_key_str.to_string();
-    let input_buf = input.to_path_buf();
-    let output_buf = output.to_path_buf();
-
-    task::spawn_blocking(move || -> Result<()> {
-        let recipient: x25519::Recipient = public_key
-            .parse()
-            .map_err(|e| anyhow!("invalid age public key: {e}"))?;
-
-        let encryptor =
-            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
-                .map_err(|e| anyhow!("failed to create encryptor: {e}"))?;
-
-        let mut input_file = std::io::BufReader::new(std::fs::File::open(&input_buf)?);
-        let mut output_file = std::fs::File::create(&output_buf)?;
-
-        let mut writer = encryptor
-            .wrap_output(&mut output_file)
-            .map_err(|e| anyhow!("failed to initialize encryption: {e}"))?;
-        std::io::copy(&mut input_file, &mut writer)?;
-        writer
-            .finish()
-            .map_err(|e| anyhow!("failed to finalize encryption: {e}"))?;
-        output_file.sync_all()?;
-
-        Ok(())
-    })
-    .await?
+/// Writes the private key to a new file readable only by its owner; never overwrites.
+pub fn write_private_key(path: &Path, key: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to create {path:?}"))?;
+    file.write_all(key.as_bytes())
+        .with_context(|| format!("failed to write private key to {path:?}"))
 }
 
-pub async fn decrypt_file(input: &Path, output: &Path, private_key_str: &str) -> Result<()> {
-    let private_key = private_key_str.to_string();
-    let input_buf = input.to_path_buf();
-    let output_buf = output.to_path_buf();
+pub fn parse_recipient(public_key: &str) -> Result<x25519::Recipient> {
+    public_key
+        .parse()
+        .map_err(|e| anyhow!("invalid age public key: {e}"))
+}
 
-    task::spawn_blocking(move || -> Result<()> {
-        let identity: x25519::Identity = private_key
-            .parse()
-            .map_err(|e| anyhow!("invalid age private key: {e}"))?;
-        let mut output_file = std::fs::File::create(&output_buf)?;
-        decrypt_to_writer(&input_buf, &identity, &mut output_file)
-    })
-    .await?
+pub fn parse_identity(private_key: &str) -> Result<x25519::Identity> {
+    private_key
+        .parse()
+        .map_err(|e| anyhow!("invalid age private key: {e}"))
+}
+
+/// Fails unless `identity` is the private half of `public_key`, i.e. can decrypt what was
+/// encrypted to it.
+pub fn ensure_key_pair(public_key: &str, identity: &x25519::Identity) -> Result<()> {
+    let actual = identity.to_public().to_string();
+    if actual != public_key {
+        return Err(anyhow!(
+            "the private key belongs to {actual}, not to {public_key}"
+        ));
+    }
+    Ok(())
+}
+
+/// Wraps `out` so that everything written to it is encrypted to `recipient`. The returned
+/// writer must be `finish`ed, or the ciphertext is truncated.
+pub fn encrypting_writer<W: Write>(
+    recipient: &x25519::Recipient,
+    out: W,
+) -> Result<age::stream::StreamWriter<W>> {
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(recipient as &dyn age::Recipient))
+            .map_err(|e| anyhow!("failed to create encryptor: {e}"))?;
+    Ok(encryptor.wrap_output(out)?)
 }
 
 /// Decrypts the age file `input` into `out`. Blocking.
@@ -85,59 +74,23 @@ pub fn decrypt_to_writer(
     identity: &x25519::Identity,
     out: &mut impl Write,
 ) -> Result<()> {
-    let input_file = std::io::BufReader::new(std::fs::File::open(input)?);
-
-    let decryptor = age::Decryptor::new_buffered(input_file)
-        .map_err(|e| anyhow!("failed to create decryptor: {e}"))?;
-
+    let file = std::fs::File::open(input).with_context(|| format!("failed to open {input:?}"))?;
+    let decryptor = age::Decryptor::new_buffered(std::io::BufReader::new(file))
+        .map_err(|e| anyhow!("failed to read age header of {input:?}: {e}"))?;
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
-        .map_err(|e| anyhow!("decryption failed: {e}"))?;
+        .map_err(|e| anyhow!("failed to decrypt {input:?}: {e}"))?;
     std::io::copy(&mut reader, out)?;
-
     Ok(())
-}
-
-/// Verifies a public/private age key pair can encrypt and decrypt together,
-/// by round-tripping a throwaway test file through both.
-pub async fn test_key_pair(public_key_str: &str, private_key_str: &str) -> Result<()> {
-    let tmp_dir = std::env::temp_dir().join(format!("bcb_key_test_{}", std::process::id()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
-
-    let result: Result<()> = async {
-        let test_content = format!("bcb key pair test - {}", now_unix());
-        let test_file = tmp_dir.join("test.txt");
-        tokio::fs::write(&test_file, test_content.as_bytes()).await?;
-
-        let enc_file = tmp_dir.join("test.txt.age");
-        encrypt_file(&test_file, &enc_file, public_key_str).await?;
-
-        let dec_file = tmp_dir.join("test.txt.decrypted");
-        decrypt_file(&enc_file, &dec_file, private_key_str).await?;
-
-        let decrypted = tokio::fs::read_to_string(&dec_file).await?;
-        if decrypted != test_content {
-            return Err(anyhow!(
-                "content mismatch: decrypted content does not match original"
-            ));
-        }
-
-        Ok(())
-    }
-    .await;
-
-    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    result
 }
 
 pub async fn blake3_file(path: &Path) -> Result<String> {
     let path = path.to_path_buf();
-
-    task::spawn_blocking(move || -> Result<String> {
-        let mut file = std::fs::File::open(&path)?;
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("failed to open {path:?}"))?;
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; IO_BUF_SIZE];
-
         loop {
             let n = file.read(&mut buf)?;
             if n == 0 {
@@ -145,7 +98,6 @@ pub async fn blake3_file(path: &Path) -> Result<String> {
             }
             hasher.update(&buf[..n]);
         }
-
         Ok(hasher.finalize().to_hex().to_string())
     })
     .await?
@@ -154,66 +106,46 @@ pub async fn blake3_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use age::secrecy::ExposeSecret;
 
-    #[tokio::test]
-    async fn test_encrypt_decrypt_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let pair = generate_key_pair();
-
-        let plain = dir.path().join("plain.bin");
-        std::fs::write(&plain, b"round trip payload").unwrap();
-
-        let enc = dir.path().join("enc.age");
-        encrypt_file(&plain, &enc, &pair.public_key).await.unwrap();
-        assert_ne!(std::fs::read(&enc).unwrap(), b"round trip payload");
-
-        let dec = dir.path().join("dec.bin");
-        decrypt_file(&enc, &dec, pair.private_key.expose_secret())
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&dec).unwrap(), b"round trip payload");
+    fn encrypt(recipient: &x25519::Recipient, plaintext: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut writer = encrypting_writer(recipient, &mut out).unwrap();
+        writer.write_all(plaintext).unwrap();
+        writer.finish().unwrap();
+        out
     }
 
-    #[tokio::test]
-    async fn test_decrypt_with_wrong_key_fails() {
+    fn decrypt(identity: &x25519::Identity, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let dir = tempfile::tempdir().unwrap();
-        let pair = generate_key_pair();
-        let other = generate_key_pair();
+        let path = dir.path().join("enc.age");
+        std::fs::write(&path, ciphertext).unwrap();
+        let mut out = Vec::new();
+        decrypt_to_writer(&path, identity, &mut out)?;
+        Ok(out)
+    }
 
-        let plain = dir.path().join("plain.bin");
-        std::fs::write(&plain, b"secret").unwrap();
-        let enc = dir.path().join("enc.age");
-        encrypt_file(&plain, &enc, &pair.public_key).await.unwrap();
-
-        let dec = dir.path().join("dec.bin");
-        assert!(
-            decrypt_file(&enc, &dec, other.private_key.expose_secret())
-                .await
-                .is_err()
+    #[test]
+    fn test_encrypt_decrypt_round_trip() {
+        let identity = x25519::Identity::generate();
+        let ciphertext = encrypt(&identity.to_public(), b"round trip payload");
+        assert_ne!(ciphertext, b"round trip payload");
+        assert_eq!(
+            decrypt(&identity, &ciphertext).unwrap(),
+            b"round trip payload"
         );
     }
 
-    #[tokio::test]
-    async fn test_decrypt_truncated_file_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let pair = generate_key_pair();
+    #[test]
+    fn test_decrypt_with_wrong_key_fails() {
+        let ciphertext = encrypt(&x25519::Identity::generate().to_public(), b"secret");
+        assert!(decrypt(&x25519::Identity::generate(), &ciphertext).is_err());
+    }
 
-        let plain = dir.path().join("plain.bin");
-        std::fs::write(&plain, vec![7u8; 4096]).unwrap();
-        let enc = dir.path().join("enc.age");
-        encrypt_file(&plain, &enc, &pair.public_key).await.unwrap();
-
-        let bytes = std::fs::read(&enc).unwrap();
-        let truncated = dir.path().join("truncated.age");
-        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
-
-        let dec = dir.path().join("dec.bin");
-        assert!(
-            decrypt_file(&truncated, &dec, pair.private_key.expose_secret())
-                .await
-                .is_err()
-        );
+    #[test]
+    fn test_decrypt_truncated_file_fails() {
+        let identity = x25519::Identity::generate();
+        let ciphertext = encrypt(&identity.to_public(), &[7u8; 4096]);
+        assert!(decrypt(&identity, &ciphertext[..ciphertext.len() / 2]).is_err());
     }
 
     #[tokio::test]
@@ -227,26 +159,16 @@ mod tests {
         std::fs::write(&c, b"other content").unwrap();
 
         let ha = blake3_file(&a).await.unwrap();
-        let hb = blake3_file(&b).await.unwrap();
-        let hc = blake3_file(&c).await.unwrap();
-        assert_eq!(ha, hb);
-        assert_ne!(ha, hc);
+        assert_eq!(ha, blake3_file(&b).await.unwrap());
+        assert_ne!(ha, blake3_file(&c).await.unwrap());
     }
 
-    #[tokio::test]
-    async fn test_key_pair_mismatch_fails() {
-        let pair = generate_key_pair();
-        let other = generate_key_pair();
-
-        assert!(
-            test_key_pair(&pair.public_key, other.private_key.expose_secret())
-                .await
-                .is_err()
-        );
-        assert!(
-            test_key_pair(&pair.public_key, pair.private_key.expose_secret())
-                .await
-                .is_ok()
-        );
+    #[test]
+    fn test_ensure_key_pair() {
+        let identity = x25519::Identity::generate();
+        let public_key = identity.to_public().to_string();
+        assert!(ensure_key_pair(&public_key, &identity).is_ok());
+        let err = ensure_key_pair(&public_key, &x25519::Identity::generate()).unwrap_err();
+        assert!(err.to_string().contains(&public_key));
     }
 }

@@ -1,6 +1,8 @@
 use btrfs_cold_backup::{
-    PartDownloadState, RestoreConfig, RestorePartState, RestoreState, RestoreStatus, RestoreTier,
-    RetrievalOptions, restore::restore_task,
+    config::RestoreConfig,
+    remote::{RestoreStatus, RestoreTier},
+    restore::{RetrievalOptions, restore_task},
+    state::{PartDownloadState, RestorePartState, RestoreState},
 };
 
 use crate::common::*;

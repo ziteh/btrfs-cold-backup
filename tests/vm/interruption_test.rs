@@ -454,7 +454,7 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
     child.wait().unwrap();
 
     // The state proves the kill landed mid-part rather than after the part had finished.
-    let state: btrfs_cold_backup::RestoreState = serde_yaml::from_str(
+    let state: btrfs_cold_backup::state::RestoreState = serde_yaml::from_str(
         &std::fs::read_to_string(restore_work_dir(&fixture).join("state.yaml")).unwrap(),
     )
     .unwrap();
@@ -465,7 +465,7 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
         .expect("restore state must have at least one part");
     assert_eq!(
         part_state.download_state,
-        btrfs_cold_backup::PartDownloadState::PartiallyDownloaded {
+        btrfs_cold_backup::state::PartDownloadState::PartiallyDownloaded {
             downloaded_bytes: chunk_size
         },
         "state must reflect exactly one chunk downloaded when killed"

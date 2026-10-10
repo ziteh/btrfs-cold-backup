@@ -2,9 +2,10 @@ use std::io::Cursor;
 
 use anyhow::Result;
 use btrfs_cold_backup::{
-    ObjectMetadata, SubvolumeUuids,
     backup::backup_task,
+    btrfs::SubvolumeUuids,
     manifest::{LatestBackup, LatestManifest},
+    remote::ObjectMetadata,
 };
 use tokio::io::AsyncRead;
 

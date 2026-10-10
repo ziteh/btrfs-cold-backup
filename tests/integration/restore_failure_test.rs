@@ -2,9 +2,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use btrfs_cold_backup::{
-    RestoreConfig, RestoreStatus, RestoreStatusDetail, RestoreTier, RetrievalOptions,
+    config::RestoreConfig,
     manifest::Backup,
-    restore::{RestoreProgress, restore_task},
+    remote::{RestoreStatus, RestoreStatusDetail, RestoreTier},
+    restore::{RestoreProgress, RetrievalOptions, restore_task},
 };
 
 use crate::common::*;

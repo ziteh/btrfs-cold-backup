@@ -1,52 +1,45 @@
-use anyhow::{Result, anyhow};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use anyhow::{Context, Result, anyhow};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::Path;
 
-// Held for the lifetime of the struct via flock; the kernel releases the lock when the
-// process exits (even on SIGKILL), so no stale-lock detection or cleanup is needed. The
-// lock file itself is left behind on purpose: deleting it by path would race with another
-// process that has already reopened it.
-pub struct PidLock {
+/// Keeps other bcb processes from running while it is held.
+///
+/// The lock is an flock on the lock file, which the kernel releases when the process exits,
+/// even on SIGKILL, so no stale-lock detection is needed. The file itself is left behind on
+/// purpose: deleting it by path would race with another process that has already opened it.
+pub struct InstanceLock {
     _file: File,
 }
 
-impl PidLock {
+impl InstanceLock {
     pub fn acquire(lock_path: &Path) -> Result<Self> {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .open(lock_path)
-            .map_err(|e| anyhow!("failed to open lock file: {e}"))?;
+            .with_context(|| format!("failed to open lock file {lock_path:?}"))?;
 
-        if Self::try_lock(&file).is_err() {
-            return Err(anyhow!(
-                "another instance is already running (lock held on {})",
-                lock_path.display()
-            ));
-        }
-
-        // Truncate only after the flock is ours, so a losing contender can't wipe the
-        // holder's PID. The PID is informational, for operators inspecting the file.
-        file.set_len(0)
-            .map_err(|e| anyhow!("failed to truncate lock file: {e}"))?;
-        writeln!(file, "{}", std::process::id())
-            .map_err(|e| anyhow!("failed to write PID to lock file: {e}"))?;
-
-        Ok(PidLock { _file: file })
-    }
-
-    fn try_lock(file: &File) -> io::Result<()> {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            let fd = file.as_raw_fd();
-            if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(anyhow!(
+                    "another instance is already running (lock held on {lock_path:?})"
+                ));
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("failed to lock {lock_path:?}"));
             }
         }
+
+        // Truncated only once the lock is ours, so a losing contender can't wipe the holder's
+        // PID. The PID is for operators inspecting the file.
+        file.set_len(0)
+            .and_then(|()| writeln!(file, "{}", std::process::id()))
+            .with_context(|| format!("failed to write PID to {lock_path:?}"))?;
+
+        Ok(Self { _file: file })
     }
 }
 
@@ -60,8 +53,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("test.lock");
 
-        let lock = PidLock::acquire(&lock_path);
-        assert!(lock.is_ok());
+        assert!(InstanceLock::acquire(&lock_path).is_ok());
         assert!(lock_path.exists());
     }
 
@@ -70,8 +62,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("held.lock");
 
-        let _lock = PidLock::acquire(&lock_path).unwrap();
-        assert!(PidLock::acquire(&lock_path).is_err());
+        let _lock = InstanceLock::acquire(&lock_path).unwrap();
+        assert!(InstanceLock::acquire(&lock_path).is_err());
     }
 
     #[test]
@@ -79,9 +71,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("release.lock");
 
-        let lock = PidLock::acquire(&lock_path).unwrap();
-        drop(lock);
-        assert!(PidLock::acquire(&lock_path).is_ok());
+        drop(InstanceLock::acquire(&lock_path).unwrap());
+        assert!(InstanceLock::acquire(&lock_path).is_ok());
     }
 
     #[test]
@@ -89,8 +80,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("pid.lock");
 
-        let _lock = PidLock::acquire(&lock_path).unwrap();
-        let _ = PidLock::acquire(&lock_path);
+        let _lock = InstanceLock::acquire(&lock_path).unwrap();
+        let _ = InstanceLock::acquire(&lock_path);
 
         let content = std::fs::read_to_string(&lock_path).unwrap();
         let pid: u32 = content.trim().parse().unwrap();

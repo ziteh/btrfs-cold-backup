@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use btrfs_cold_backup::{
-    BackupState, ObjectMetadata, PartRecord, backup::backup_task, backup_state_path,
+    backup::backup_task,
+    remote::ObjectMetadata,
+    state::{BackupState, PartRecord},
+    util::backup_state_path,
 };
 
 use crate::common::*;

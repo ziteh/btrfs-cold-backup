@@ -5,13 +5,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    BtrfsOps, Config, RemoteBackend, Task,
+    btrfs::BtrfsOps,
     btrfs::ensure_snapshot_of,
-    crypto::blake3_file,
+    config::{Config, Task},
+    crypto::{blake3_file, encrypting_writer, parse_recipient},
     manifest::{
         Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo, parse_backup,
         parse_latest,
     },
+    remote::RemoteBackend,
     state::{BackupState, PartRecord, read_state},
     util::{
         GIB, IO_BUF_SIZE, SNAPSHOT_PART_PREFIX, available_space_bytes, backup_output_dir,
@@ -453,9 +455,7 @@ async fn send_into_parts<B: BtrfsOps>(
     public_key: &str,
     state: &mut PersistentState,
 ) -> Result<String> {
-    let recipient: x25519::Recipient = public_key
-        .parse()
-        .map_err(|e| anyhow!("invalid age public key: {e}"))?;
+    let recipient = parse_recipient(public_key)?;
 
     let snapshot_path = task.snapshot_dir.join(snapshot_name);
     check_available_space(&snapshot_path, output_dir).await?;
@@ -530,16 +530,15 @@ fn encrypt_into_parts(
         let path = output_dir.join(format!("{SNAPSHOT_PART_PREFIX}{index}.age"));
         let write_err = || format!("failed to write {path:?}");
         let file = std::fs::File::create(&path).with_context(write_err)?;
-        let encryptor =
-            age::Encryptor::with_recipients(std::iter::once(recipient as &dyn age::Recipient))
-                .map_err(|e| anyhow!("failed to create encryptor: {e}"))?;
-        let mut writer = encryptor
-            .wrap_output(HashingWriter {
+        let mut writer = encrypting_writer(
+            recipient,
+            HashingWriter {
                 inner: file,
                 hasher: blake3::Hasher::new(),
                 written: 0,
-            })
-            .with_context(write_err)?;
+            },
+        )
+        .with_context(write_err)?;
         while n > 0 {
             stream_hasher.update(&buf[..n]);
             writer.write_all(&buf[..n]).with_context(write_err)?;

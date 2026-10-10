@@ -75,7 +75,7 @@ tasks:
 
 `s3.upload_speed_limit_kbps` paces how fast bcb reads into each multipart part, but each part is then sent at line rate, so the uplink alternates between idle and saturated and the effective average stays below the limit. If the bursts disturb other traffic, shape the NAS's upload with router QoS or `tc` instead.
 
-Finish any unfinished backup or restore before upgrading bcb: a new version may not resume another version's local progress. When base_dir still holds files in an older local layout, bcb refuses to run and lists them; delete them once you've confirmed they're no longer needed.
+Finish any unfinished backup or restore before upgrading bcb: a new version may not resume another version's local progress.
 
 `backup_data` accepts STANDARD, STANDARD_IA, ONEZONE_IA, GLACIER_IR, GLACIER and DEEP_ARCHIVE.
 

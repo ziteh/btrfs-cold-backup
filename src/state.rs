@@ -183,27 +183,4 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-
-    /// State files written before a field was removed must still load.
-    #[test]
-    fn test_read_state_ignores_removed_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("restore_state.yaml");
-        std::fs::write(
-            &path,
-            "task_name: movies\n\
-             level: 0\n\
-             timestamp: 2026-06-02T14:30\n\
-             snapshot_name: bcb_level0.20260602T1430\n\
-             manifest_blake3: abc\n\
-             parts: {}\n\
-             stream_verified: false\n\
-             receive_completed: false\n\
-             last_updated: 0\n",
-        )
-        .unwrap();
-
-        let state: RestoreState = read_state(&path).unwrap().unwrap();
-        assert_eq!(state.manifest_blake3, "abc");
-    }
 }

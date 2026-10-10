@@ -215,21 +215,6 @@ pub fn restore_state_path(work_dir: &Path) -> PathBuf {
     work_dir.join("state.yaml")
 }
 
-/// Lists entries in base_dir left by the layout used before backup/ and restore/.
-pub fn find_old_layout(base_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(base_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "run" || name == "task" || name.starts_with("restore-") {
-            found.push(entry.path());
-        }
-    }
-    found.sort();
-    Ok(found)
-}
-
 pub fn s3_latest_manifest_key(prefix: &str, sanitized_subvol: &str) -> String {
     format!("{prefix}manifests/{sanitized_subvol}/latest.yaml")
 }
@@ -344,31 +329,6 @@ mod tests {
         );
         assert!(!work_dir.to_string_lossy().contains(':'));
         assert_eq!(restore_state_path(&work_dir), work_dir.join("state.yaml"));
-    }
-
-    #[test]
-    fn test_find_old_layout() {
-        let dir = tempfile::tempdir().unwrap();
-        for d in [
-            "run",
-            "task",
-            "restore-movies-level0-x",
-            "backup",
-            "restore",
-            "log",
-        ] {
-            std::fs::create_dir(dir.path().join(d)).unwrap();
-        }
-        std::fs::write(dir.path().join("bcb.lock"), "").unwrap();
-        let found = find_old_layout(dir.path()).unwrap();
-        assert_eq!(
-            found,
-            vec![
-                dir.path().join("restore-movies-level0-x"),
-                dir.path().join("run"),
-                dir.path().join("task"),
-            ]
-        );
     }
 
     #[test]

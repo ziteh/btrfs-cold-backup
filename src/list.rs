@@ -1,7 +1,8 @@
 use anyhow::Result;
 
 use crate::{
-    Config, RemoteBackend, Task,
+    config::{Config, Task},
+    remote::RemoteBackend,
     util::{parse_backup_dir_name, sanitize_subvolume_path},
 };
 

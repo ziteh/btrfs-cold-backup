@@ -5,8 +5,11 @@ use std::path::PathBuf;
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    BtrfsDriver, Config, RestoreTier, RetrievalOptions, S3Backend, Task, backup::backup_task,
-    restore::restore_task,
+    backup::backup_task,
+    btrfs::BtrfsDriver,
+    config::{Config, Task},
+    remote::{RestoreTier, S3Backend},
+    restore::{RetrievalOptions, restore_task},
 };
 
 use crate::common::*;

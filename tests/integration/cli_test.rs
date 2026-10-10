@@ -7,7 +7,10 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use btrfs_cold_backup::{Config, RestoreConfig, S3Config, S3StorageClass, Task, generate_key_pair};
+use btrfs_cold_backup::{
+    config::{Config, RestoreConfig, S3Config, S3StorageClass, Task},
+    crypto::generate_key_pair,
+};
 
 fn run_bcb(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_bcb"))
