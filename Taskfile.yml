@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+silent: true
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the bcb binary (dev)
+    cmds:
+      - cargo build --bin bcb
+
+  release:
+    desc: Build the bcb binary (release)
+    cmds:
+      - cargo build --release --bin bcb
+
+  fmt:
+    desc: Format the code
+    cmds:
+      - cargo fmt
+
+  fmt:check:
+    desc: Check formatting
+    cmds:
+      - cargo fmt --check
+
+  lint:
+    desc: Run clippy with warnings denied
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  test:
+    desc: Run unit and integration tests
+    cmds:
+      - cargo test --lib --bins --test integration
+
+  coverage:
+    desc: Run unit and integration tests with the CI coverage floor
+    cmds:
+      - cargo llvm-cov --lib --bins --test integration --fail-under-lines 70
+
+  vm:
+    desc: Run the VM tests in a Multipass VM (pass --fresh to recreate the VM)
+    cmds:
+      - bash scripts/run-vm-tests.sh {{.CLI_ARGS}}
+
+  drill:
+    desc: Run the power-loss drill (run after the VM tests, before a release)
+    cmds:
+      - bash scripts/power-loss-drill.sh
+
+  ci:
+    desc: Run the same checks as the CI test job
+    cmds:
+      - task: fmt:check
+      - task: lint
+      - task: coverage
