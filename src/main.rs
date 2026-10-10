@@ -113,13 +113,17 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::from_file(&cli.config)?;
-    // Backup and restore also log to a file under base_dir, so unattended runs leave a trail.
-    let file_log_dir = matches!(
-        cli.command,
-        Commands::Backup { .. } | Commands::Restore { .. }
-    )
-    .then(|| config.base_dir.join("log"));
-    init_logging(file_log_dir);
+
+    // Unattended commands log to a file as well as stderr, so a run leaves a trail.
+    {
+        let file_log_dir = matches!(
+            cli.command,
+            Commands::Backup { .. } | Commands::Restore { .. }
+        )
+        .then(|| config.base_dir.join("log"));
+
+        init_logging(file_log_dir);
+    }
 
     match cli.command {
         Commands::Genkey { .. } => unreachable!("handled above"),
