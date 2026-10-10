@@ -109,6 +109,10 @@ enum Commands {
         /// Archive retrieval tier.
         #[arg(long, value_enum, default_value_t = RetrievalTier::Standard)]
         restore_tier: RetrievalTier,
+        /// Expected download speed in kilobit/s for retrieval pacing; overrides
+        /// s3.restore.expected_download_kbps.
+        #[arg(long)]
+        download_kbps: Option<u64>,
     },
 }
 
@@ -122,7 +126,7 @@ async fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let config = Config::from_file(&cli.config)?;
+    let mut config = Config::from_file(&cli.config)?;
 
     // Unattended commands log to a file as well as stderr, so a run leaves a trail.
     {
@@ -185,7 +189,11 @@ async fn main() -> Result<ExitCode> {
             private_key,
             restore_days,
             restore_tier,
+            download_kbps,
         } => {
+            if let Some(kbps) = download_kbps {
+                config.s3.restore.expected_download_kbps = kbps;
+            }
             let request = RestoreRequest {
                 level,
                 timestamp: Timestamp::from_cli_date(&date)?,

@@ -121,7 +121,7 @@ Requesting all parts at once wastes retrieval cost if the download cannot finish
 - `--restore-tier`: `standard` (default), `bulk` or `expedited`.
 - `--restore-days`: how long a retrieved copy stays downloadable. With pacing enabled it must be at least `lead_days` + 1.
 - `lead_days`: defaults to 1.5× the tier's documented retrieval time. Override with `s3.restore.lead_days`.
-- `expected_download_kbps`: kilobit/s. A lower estimate is safer.
+- `expected_download_kbps`: kilobit/s. A lower estimate is safer. `--download-kbps` overrides it for one run.
 
 A copy that expires before download is re-requested on the next run, and the partial download resumes.
 
@@ -256,7 +256,6 @@ The VM suite is part of `cargo test`. A test skips itself, still reporting "ok",
 - [ ] `restore --dry-run` and a `--force` passthrough for `btrfs receive`
 - [ ] `bcb verify --deep`: sample-retrieve and BLAKE3-verify actual part contents
 - [ ] Add btrbk to the VM for E2E testing
-- [ ] `--download-kbps` to override `expected_download_kbps`
 - [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink
 - [ ] Optional S3 Object Lock for level 0 data parts only (per-object retention set at upload, e.g. Compliance mode matching the Deep Archive minimum storage duration); needs `s3:PutObjectRetention` and a bucket created with Object Lock enabled
 - [ ] Unit/integration coverage for `S3Backend` and `BtrfsDriver`, which only the VM suite exercises (e.g. a fake `btrfs` on `PATH`, an in-process fake S3 endpoint)
