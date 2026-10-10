@@ -11,8 +11,9 @@ target/
 logs/
 *.log
 .env
-.env.local
+*.local
 *.local.*
+.codegraph/
 
 # OS
 .DS_Store
