@@ -25,18 +25,21 @@ tasks:
     cmds:
       - cargo fmt
       - shfmt -w scripts
+      - uvx ruff format scripts
 
   fmt:check:
     desc: Check formatting
     cmds:
       - cargo fmt --check
       - shfmt -d scripts
+      - uvx ruff format --check scripts
 
   lint:
-    desc: Run clippy with warnings denied, and shellcheck
+    desc: Run clippy with warnings denied, shellcheck, and ruff
     cmds:
       - cargo clippy --all-targets -- -D warnings
       - shellcheck -x -S warning scripts/*.sh
+      - uvx ruff check scripts
 
   test:
     desc: Run unit and integration tests
@@ -61,7 +64,7 @@ tasks:
   aws-drill:
     desc: Run the real AWS drill; re-run until it exits 0 (see docs/aws-drill.md)
     cmds:
-      - bash scripts/aws-drill.sh {{.CLI_ARGS}}
+      - python3 scripts/aws-drill.py {{.CLI_ARGS}}
 
   aws-drill:setup:
     desc: One-time AWS setup for the drill (pass the bucket name after --)

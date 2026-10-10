@@ -1,6 +1,11 @@
 # Rust
 target/
 
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+
 # Key
 *.key
 *.pem

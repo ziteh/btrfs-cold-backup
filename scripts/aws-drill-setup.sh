@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time AWS setup for scripts/aws-drill.sh: the drill bucket, its lifecycle rules, the
+# One-time AWS setup for scripts/aws-drill.py: the drill bucket, its lifecycle rules, the
 # IAM users and their host profiles. Run it with administrator credentials (the default AWS
 # CLI chain, e.g. `AWS_PROFILE=admin`). Safe to re-run: it creates only what is missing, and
 # re-applies the policies and lifecycle rules so they follow the files in contrib/aws/.

@@ -1,6 +1,6 @@
 # Real AWS Drill
 
-The VM test suite runs against SeaweedFS, which never enforces Glacier's access restrictions or retrieval scheduling, and every VM test stores parts as `STANDARD`. [scripts/aws-drill.sh](../scripts/aws-drill.sh) covers what only real AWS can show:
+The VM test suite runs against SeaweedFS, which never enforces Glacier's access restrictions or retrieval scheduling, and every VM test stores parts as `STANDARD`. [scripts/aws-drill.py](../scripts/aws-drill.py) covers what only real AWS can show:
 
 - IAM: [contrib/aws/bcb-backup-policy.json](../contrib/aws/bcb-backup-policy.json) is enough for every command but restore, which it is denied; [contrib/aws/bcb-restore-policy.json](../contrib/aws/bcb-restore-policy.json) is enough for restore; `bcb check` fails without `s3:PutObjectTagging`.
 - Storage classes and tags: parts land in the level's class (`DEEP_ARCHIVE`, `GLACIER`), manifests in `STANDARD`, each tagged `bcb-backup-level`, and a lifecycle rule filtering on that tag is accepted.
@@ -30,7 +30,7 @@ The first run backs up, checks, and requests retrieval. Later runs finish the re
 
 Each run writes under its own prefix, `aws-drill/run-<UTC time>-<commit>/`, so runs never interfere and nothing needs deleting by hand.
 
-Host requirements: `multipass`, `cargo-zigbuild`, and AWS CLI v2.
+Host requirements: Python 3.11+, `multipass`, `cargo-zigbuild`, and AWS CLI v2.
 
 Optional environment variables:
 
