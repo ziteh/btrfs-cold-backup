@@ -62,6 +62,11 @@ tasks:
       - task: lint
       - task: coverage
 
+  spell:
+    desc: Run the spell checker
+    cmds:
+      - pnpx cspell .
+
   got-hooks:
     desc: Install the git hooks managed by lefthook
     cmds:

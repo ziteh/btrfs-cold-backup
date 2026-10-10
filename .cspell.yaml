@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/streetsidesoftware/cspell/main/cspell.schema.json
+# https://cspell.org/docs/Configuration
+
+version: "0.2"
+language: "en"
+caseSensitive: false
+allowCompoundWords: true # true to allow "stringlength"
+useGitignore: true
+ignorePaths:
+  - "**/{cspell.*,cSpell.*,.cspell.*,cspell.config.*}"
+  - "**/target/**"
+  - "**/.vscode/**"
+  - "Cargo.lock"
+words:
+  - ENOSPC
+  - PDEATHSIG
+  - EPIPE
+  - btrfs
+  - btrbk
+  - tmpfs
+  - kbps
+  - withf
+  - zite
+  - ziteh
+  - encryptor
+  - decryptor
+  - pgrep
+  - unrestorable
+  - unrequested
+  - fsutil
+  - rsplit
+  - SeaweedFS
+  - clippy
+  - urandom
+  - gantt
+  - nocapture
+  - statvfs
+  - bavail
+  - awscliv
+  - awscli
+  - prctl
+  - tbcb
+  - rfind
+  - journalctl
+  - libc
+  - serde
+  - frsize
+  - cpus
+  - testcreds
+  - sysrq
+  - ntfy
+  - elif
+  - inum
+  - chronyc
+  - nohup
+  - unwritable
+  - unpaced
+  - pnpx
