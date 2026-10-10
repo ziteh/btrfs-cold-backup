@@ -78,7 +78,7 @@ pub struct LatestManifest {
     pub format_version: String,
     pub source_uuid: String,
     /// The newest backup of each level, keyed by level. Completing a level N backup drops
-    /// every entry above N, whose incremental chain it voided.
+    /// every entry above N, so the entries always form one chain, each the parent of the next.
     pub levels: BTreeMap<u32, LatestEntry>,
 }
 

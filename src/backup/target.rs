@@ -90,8 +90,8 @@ async fn is_backed_up<R: RemoteBackend>(
     Ok(true)
 }
 
-/// The snapshot an incremental target is sent relative to: the newest backup of the level
-/// below, from the latest manifest. It is matched by UUID, not just name, so a same-named
+/// The snapshot an incremental target is sent relative to: the newest backup of any lower
+/// level, from the latest manifest, so a level may be skipped. It is matched by UUID, not just name, so a same-named
 /// snapshot of another subvolume can't silently become the base of an incremental.
 async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
     btrfs: &B,
@@ -115,11 +115,10 @@ async fn resolve_parent<B: BtrfsOps, R: RemoteBackend>(
             target.source_uuid
         ));
     }
-    let parent = latest.levels.get(&(level - 1)).ok_or_else(|| {
-        anyhow!(
-            "no level {0} entry in latest manifest; run a level {0} backup first",
-            level - 1
-        )
+    // Publishing a level drops every deeper entry, so the entries below `level` form one chain
+    // and the deepest of them is its newest backup.
+    let (_, parent) = latest.levels.range(..level).next_back().ok_or_else(|| {
+        anyhow!("no backup below level {level} in latest manifest; run a level 0 backup first")
     })?;
     if !snapshots.contains(&parent.snapshot_name) {
         return Err(anyhow!(

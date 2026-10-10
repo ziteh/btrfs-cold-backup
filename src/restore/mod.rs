@@ -188,9 +188,8 @@ fn preflight(
         && !target_dir.join(parent).exists()
     {
         return Err(anyhow!(
-            "parent snapshot '{parent}' not found in {target_dir:?}; restore the level {} \
-             backup it was built on first",
-            request.level.saturating_sub(1)
+            "parent snapshot '{parent}' not found in {target_dir:?}; restore the backup it \
+             names first"
         ));
     }
 

@@ -33,14 +33,14 @@ bcb is specifically designed for S3 Glacier Deep Archive.
 
 ### Backup levels
 
-A level-N backup is a `btrfs send -p` against the newest level N-1 backup. Restoring level N requires levels 0 to N-1 restored first, so a lower level must remain on S3 while any higher level depends on it.
+A level-N backup is a `btrfs send -p` against the newest backup of any lower level, as in Unix `dump`: with no level 1 newer than the latest level 0, a level 2 builds on the level 0 directly, so a schedule may skip levels. Restoring a backup requires its chain of parents restored first, so a backup must remain on S3 while any backup depends on it. See [ADR 0002](docs/decision/0002-incremental-parent-is-newest-lower-level.md).
 
 ## Backup workflow
 
 `bcb backup --level N` processes each enabled task sequentially. Per task:
 
 1. **Select snapshot**: the newest `bcb_level<N>.*` snapshot in `snapshot_dir`. If its manifest exists on S3, the task is skipped.
-2. **Check chain** (level > 0): the parent is the level N-1 backup recorded in `latest.yaml`, matched to a local snapshot by btrfs UUID. HEAD every part of every lower level; abort if any is missing or has a different size.
+2. **Check chain** (level > 0): the parent is the deepest lower-level backup recorded in `latest.yaml`, matched to a local snapshot by btrfs UUID. HEAD every part of every lower level; abort if any is missing or has a different size.
 3. **Check space**: `base_dir` must have free space for about one full stream.
 4. **Send and encrypt**: run `btrfs send` (`-p` for incrementals), hash the whole stream, split it into 3 GiB parts, then encrypt and hash each part into `base_dir`.
 5. **Upload**: one S3 object per part, sent as multipart chunks, with the level's storage class and a `bcb-backup-level` tag.
@@ -96,7 +96,7 @@ Retrieval takes hours to days, so `bcb restore` is idempotent and intended to be
 
 - A part that fails on the S3 side is logged and retried on the next run.
 - Under a systemd timer, set `SuccessExitStatus=2`.
-- Restore levels in order onto the same target: 0, 1, …, N.
+- Restore a backup's chain in order onto the same target: level 0 first, then each backup whose `parent_snapshot` is the one just restored, as recorded in each manifest.
 
 ### Retrieval pacing
 
@@ -167,7 +167,7 @@ bcb_level<N>.<YYYYMMDD>T<hhmm>
 ```
 
 - The snapshot must originate from the task's `subvolume` (btrfs Parent UUID). If the source is replaced (e.g. new disk), backups fail until a level 0 backup starts a new chain.
-- A level-N (N > 0) snapshot must be newer than its level N-1 parent, and the parent must exist locally. In the contrib setup, `snapshot_preserve_min latest` retains it and `bcb-run` prunes only after a successful backup.
+- A level-N (N > 0) snapshot must be newer than its parent, and the parent must exist locally. In the contrib setup, `snapshot_preserve_min latest` retains it and `bcb-run` prunes only after a successful backup.
 - Timestamps (snapshot names, `--date`, manifests) are local time without a zone. On hosts observing DST, the repeated hour can misorder or collide snapshots; run bcb on a host without DST.
 - btrbk's same-minute suffix (`_<n>`) is unsupported. bcb fails and names the snapshot; delete or rename it.
 
@@ -178,7 +178,8 @@ bcb **never** deletes from S3. Configure [bucket lifecycle rules][s3-lifecycle].
 - Do not expire `manifest` objects.
 - Expire a level only after the last incremental built on it.
 - Observe each storage class's minimum storage duration.
-- If a lower level is missing, the next incremental aborts. Run a level N-1 backup to start a new chain.
+- If a lower level is missing, the next incremental aborts. Run a backup of a lower level to start a new chain.
+- A backup must succeed at the same or a lower level before a level's expiration. Otherwise everything built on the expiring backup becomes unrestorable at once, and the next incremental aborts; watch a failing level 0 most closely.
 
 ## Verifying backups
 

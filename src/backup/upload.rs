@@ -174,10 +174,9 @@ pub(super) async fn publish_manifest<R: RemoteBackend>(
     state.save()
 }
 
-/// Records the backup as the newest of its level, and drops every deeper level's entry:
-/// those were built on the snapshot this backup supersedes, so leaving them would let a later
-/// incremental chain silently onto a stale parent instead of failing and asking for a fresh
-/// one.
+/// Records the backup as the newest of its level, and drops every deeper level's entry: those
+/// are older than this backup, and an incremental takes the deepest lower entry as its parent,
+/// so leaving them would chain it onto a stale parent instead of this backup.
 pub(super) async fn publish_latest<R: RemoteBackend>(
     remote: &R,
     layout: &TaskLayout,

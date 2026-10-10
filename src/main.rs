@@ -72,7 +72,7 @@ enum Commands {
 
     /// Run a backup.
     Backup {
-        /// Backup level: 0 is full, N is incremental relative to the newest level N-1 backup.
+        /// Backup level: 0 is full, N is incremental relative to the newest lower-level backup.
         #[arg(long)]
         level: u32,
         /// Limit to a single task by name (default: all enabled tasks).

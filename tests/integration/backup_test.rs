@@ -7,6 +7,7 @@ use btrfs_cold_backup::{
     config::StorageClass,
     manifest::{LatestEntry, LatestManifest},
     remote::ObjectMetadata,
+    timestamp::Timestamp,
 };
 use tokio::io::AsyncRead;
 
@@ -282,6 +283,103 @@ async fn level2_incremental_should_use_level1_as_parent() {
         .expect("must not be skipped");
     assert_eq!(backup.level, 2);
     assert_eq!(backup.parent_snapshot.as_deref(), Some(parent));
+}
+
+/// Latest manifest of movies with an entry per snapshot name, each at the level and time its
+/// name holds.
+fn latest_with(snapshot_names: &[&str]) -> Vec<u8> {
+    let mut latest = LatestManifest::new(SOURCE_UUID.to_string());
+    for name in snapshot_names {
+        let level = name["bcb_level".len()..name.find('.').unwrap()]
+            .parse()
+            .unwrap();
+        latest.levels.insert(
+            level,
+            LatestEntry {
+                timestamp: Timestamp::from_snapshot_name(name).unwrap(),
+                snapshot_name: name.to_string(),
+                snapshot_uuid: snap_uuid(name),
+            },
+        );
+    }
+    yaml(&latest)
+}
+
+/// Runs a level `level` backup of `snap` against a latest manifest holding `latest` and
+/// returns the parent it was sent relative to, or the error.
+async fn incremental_parent(latest: &[&str], snap: &'static str, level: u32) -> Result<String> {
+    let work_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(work_dir.path());
+    config.s3.storage_class.backup_data = vec![StorageClass::Standard; 4];
+    let task = movies_task();
+
+    let mut local: Vec<String> = latest.iter().map(|s| s.to_string()).collect();
+    local.push(snap.to_string());
+    let mut btrfs = btrfs_with_uuids();
+    btrfs
+        .expect_list_snapshots()
+        .returning(move |_| Ok(local.clone()));
+    btrfs
+        .expect_send_incremental()
+        .returning(|_, _| Ok(fake_stream()));
+
+    let latest_bytes = latest_with(latest);
+    let mut remote = MockRemote::new();
+    remote
+        .expect_head_metadata()
+        .withf(|key| key.contains("latest.yaml"))
+        .returning(|_| head(true));
+    remote
+        .expect_head_metadata()
+        .withf(|key| key.contains("/manifest.yaml"))
+        .returning(|_| head(false));
+    remote
+        .expect_download()
+        .withf(|key| key.contains("latest.yaml"))
+        .returning(move |_| Ok(latest_bytes.clone()));
+    expect_parts_on_s3(&mut remote, work_dir.path());
+    expect_ancestors(&mut remote, |_| Ok(Some(ANCESTOR_PART_SIZE)));
+    remote.expect_upload_file().returning(|_, _, _, _| Ok(()));
+    remote.expect_upload_bytes().returning(|_, _, _, _| Ok(()));
+
+    let backup = backup_task(&config, &task, level, &btrfs, &remote)
+        .await?
+        .expect("must not be skipped");
+    Ok(backup.parent_snapshot.expect("an incremental has a parent"))
+}
+
+/// Without a level 1 backup, a level 2 builds on level 0 directly, as in Unix `dump`.
+#[tokio::test]
+async fn level2_should_use_level0_as_parent_when_no_level1_exists() {
+    let parent = incremental_parent(&["bcb_level0.20260101T0100"], "bcb_level2.20260215T0100", 2)
+        .await
+        .unwrap();
+    assert_eq!(parent, "bcb_level0.20260101T0100");
+}
+
+#[tokio::test]
+async fn level3_should_use_deepest_lower_level_as_parent() {
+    let parent = incremental_parent(
+        &["bcb_level0.20260101T0100", "bcb_level1.20260401T0100"],
+        "bcb_level3.20260405T0100",
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(parent, "bcb_level1.20260401T0100");
+}
+
+/// Only lower levels can be parents: a backup never builds on one of its own level or deeper.
+#[tokio::test]
+async fn level1_should_fail_when_latest_has_no_lower_level() {
+    let err = incremental_parent(&["bcb_level2.20260101T0100"], "bcb_level1.20260215T0100", 1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("run a level 0 backup first"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Level 1 backup whose level 0 ancestor's parts are answered by `part_size`.

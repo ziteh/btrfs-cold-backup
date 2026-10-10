@@ -264,7 +264,7 @@ async fn restore_preflight_failures_then_chain_should_round_trip() {
     assert_exit(&wrong, 1, "no retrieval was requested");
 
     let orphan = restore(&env, &f, &f.config_path, 1, "20260602", &f.private_key_path);
-    assert_exit(&orphan, 1, "restore the level 0 backup");
+    assert_exit(&orphan, 1, "restore the backup it names first");
 
     let mut offline: Config =
         serde_yaml::from_slice(&std::fs::read(&f.config_path).unwrap()).unwrap();

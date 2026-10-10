@@ -220,7 +220,7 @@ async fn restore_without_parent_on_target_should_fail_before_requesting_retrieva
         .expect_err("a missing parent must fail the restore")
         .to_string();
     assert!(
-        err.contains("bcb_level0.20260601T1430") && err.contains("level 0"),
+        err.contains("bcb_level0.20260601T1430") && err.contains("restore the backup it names"),
         "unexpected error: {err}"
     );
 }

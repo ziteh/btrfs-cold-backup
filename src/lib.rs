@@ -4,8 +4,9 @@
 //! Terms used throughout:
 //!
 //! - **task**: one subvolume to back up, with the directory btrbk puts its snapshots in.
-//! - **level**: 0 is a full backup; level N is an incremental relative to the newest
-//!   level N-1 backup. Restoring level N needs levels 0..N restored first.
+//! - **level**: 0 is a full backup; level N is an incremental relative to the newest backup
+//!   of any lower level, as in Unix `dump`. Restoring it needs its chain of parents restored
+//!   first.
 //! - **backup id**: a backup's level and its snapshot's timestamp ([`timestamp::BackupId`]).
 //! - **part**: one encrypted piece of a backup's send stream, uploaded as one S3 object.
 //! - **multipart chunk**: the unit a part is uploaded in.
