@@ -41,7 +41,7 @@ rustup target add "$TARGET"
 # depend on.
 echo "==> Building bcb and the VM tests..."
 cargo zigbuild --bin bcb --test vm --target "$TARGET"
-test_bin=$(ls -t target/"$TARGET"/debug/deps/vm-* 2>/dev/null | grep -v '\.d$' | head -1)
+test_bin=$(find target/"$TARGET"/debug/deps -name 'vm-*' ! -name '*.d' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
 if [ -z "$test_bin" ]; then
     echo "Error: VM test binary not found"
     exit 1

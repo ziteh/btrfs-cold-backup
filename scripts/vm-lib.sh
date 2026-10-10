@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by run-vm-tests.sh and power-loss-drill.sh; source it, don't run it.
 #
 # `multipass exec` has two quirks every caller has to avoid:
@@ -26,8 +27,11 @@ vm_target() {
     local arch
     arch=$(multipass exec "$VM" -- uname -m | cat)
     case "$arch" in
-        aarch64|x86_64) echo "$arch-unknown-linux-gnu" ;;
-        *) echo "unsupported VM architecture: $arch" >&2; return 1 ;;
+        aarch64 | x86_64) echo "$arch-unknown-linux-gnu" ;;
+        *)
+            echo "unsupported VM architecture: $arch" >&2
+            return 1
+            ;;
     esac
 }
 

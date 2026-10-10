@@ -24,16 +24,19 @@ tasks:
     desc: Format the code
     cmds:
       - cargo fmt
+      - shfmt -w scripts
 
   fmt:check:
     desc: Check formatting
     cmds:
       - cargo fmt --check
+      - shfmt -d scripts
 
   lint:
-    desc: Run clippy with warnings denied
+    desc: Run clippy with warnings denied, and shellcheck
     cmds:
       - cargo clippy --all-targets -- -D warnings
+      - shellcheck -x -S warning scripts/*.sh
 
   test:
     desc: Run unit and integration tests

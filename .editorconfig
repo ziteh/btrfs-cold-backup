@@ -15,3 +15,7 @@ trim_trailing_whitespace = false
 
 [*.{yml,yaml,json}]
 indent_size = 2
+
+[*.sh]
+# shfmt-only key: indent case branches under `case`.
+switch_case_indent = true

@@ -26,7 +26,10 @@ for arg in "$@"; do
     case "$arg" in
         --reset) RESET=true ;;
         --no-s3) WITH_S3=false ;;
-        *) echo "unknown option: $arg" >&2; exit 1 ;;
+        *)
+            echo "unknown option: $arg" >&2
+            exit 1
+            ;;
     esac
 done
 
@@ -58,8 +61,8 @@ fi
 # anyway, so this only triggers on a fresh local VM.
 if ! command -v aws &>/dev/null; then
     case "$(uname -m)" in
-        aarch64|arm64) awscli_arch=aarch64 ;;
-        *)             awscli_arch=x86_64 ;;
+        aarch64 | arm64) awscli_arch=aarch64 ;;
+        *) awscli_arch=x86_64 ;;
     esac
     curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip
     unzip -q -o /tmp/awscliv2.zip -d /tmp
@@ -84,8 +87,8 @@ fi
 
 if [ ! -f "$SEAWEEDFS_BIN" ]; then
     case "$(uname -m)" in
-        aarch64|arm64) weed_arch=arm64 ;;
-        *)             weed_arch=amd64 ;;
+        aarch64 | arm64) weed_arch=arm64 ;;
+        *) weed_arch=amd64 ;;
     esac
     # Piping curl straight into `grep -m1` risks curl seeing SIGPIPE (exit 23) when grep
     # quits after its first match, so capture the full response before grepping it.

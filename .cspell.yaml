@@ -1,58 +1,56 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/streetsidesoftware/cspell/main/cspell.schema.json
-# https://cspell.org/docs/Configuration
-
 version: "0.2"
-language: "en"
+language: en
 caseSensitive: false
-allowCompoundWords: true # true to allow "stringlength"
+allowCompoundWords: true
 useGitignore: true
 ignorePaths:
   - "**/{cspell.*,cSpell.*,.cspell.*,cspell.config.*}"
   - "**/target/**"
   - "**/.vscode/**"
-  - "Cargo.lock"
+  - Cargo.lock
 words:
-  - ENOSPC
-  - PDEATHSIG
-  - EPIPE
-  - btrfs
+  - awscli
+  - awscliv
+  - bavail
   - btrbk
-  - tmpfs
+  - btrfs
+  - chronyc
+  - clippy
+  - cpus
+  - decryptor
+  - elif
+  - encryptor
+  - ENOSPC
+  - EPIPE
+  - frsize
+  - fsutil
+  - gantt
+  - inum
+  - journalctl
   - kbps
+  - libc
+  - nocapture
+  - nohup
+  - ntfy
+  - PDEATHSIG
+  - pgrep
+  - pnpx
+  - prctl
+  - rfind
+  - rsplit
+  - SeaweedFS
+  - serde
+  - shfmt
+  - statvfs
+  - sysrq
+  - tbcb
+  - testcreds
+  - tmpfs
+  - unpaced
+  - unrequested
+  - unrestorable
+  - unwritable
+  - urandom
   - withf
   - zite
   - ziteh
-  - encryptor
-  - decryptor
-  - pgrep
-  - unrestorable
-  - unrequested
-  - fsutil
-  - rsplit
-  - SeaweedFS
-  - clippy
-  - urandom
-  - gantt
-  - nocapture
-  - statvfs
-  - bavail
-  - awscliv
-  - awscli
-  - prctl
-  - tbcb
-  - rfind
-  - journalctl
-  - libc
-  - serde
-  - frsize
-  - cpus
-  - testcreds
-  - sysrq
-  - ntfy
-  - elif
-  - inum
-  - chronyc
-  - nohup
-  - unwritable
-  - unpaced
-  - pnpx

@@ -131,7 +131,10 @@ vm_run() {
 
 prepare_vm() {
     for cmd in aws jq multipass cargo-zigbuild; do
-        command -v "$cmd" >/dev/null || { echo "$cmd is required on the host" >&2; exit 1; }
+        command -v "$cmd" >/dev/null || {
+            echo "$cmd is required on the host" >&2
+            exit 1
+        }
     done
     # Checked before the build, which takes minutes, rather than at first use after it.
     for profile in "$PROFILE" "$NO_TAG_PROFILE" "$RESTORE_PROFILE"; do
@@ -359,12 +362,15 @@ new=false
 for arg in "$@"; do
     case "$arg" in
         --new) new=true ;;
-        *) echo "unknown option: $arg" >&2; exit 1 ;;
+        *)
+            echo "unknown option: $arg" >&2
+            exit 1
+            ;;
     esac
 done
 
-if ! $new && multipass info "$VM" &>/dev/null \
-    && vm_exec 'grep -qx PHASE=waiting /var/lib/bcb-aws-drill/run.env 2>/dev/null'; then
+if ! $new && multipass info "$VM" &>/dev/null &&
+    vm_exec 'grep -qx PHASE=waiting /var/lib/bcb-aws-drill/run.env 2>/dev/null'; then
     finish_run
 fi
 start_run
