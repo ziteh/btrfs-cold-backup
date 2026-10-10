@@ -61,3 +61,8 @@ tasks:
       - task: fmt:check
       - task: lint
       - task: coverage
+
+  got-hooks:
+    desc: Install the git hooks managed by lefthook
+    cmds:
+      - lefthook install

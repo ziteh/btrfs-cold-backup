@@ -1,0 +1,9 @@
+pre-commit:
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt
+      stage_fixed: true
+    lint:
+      glob: "*.{rs,toml}"
+      run: cargo clippy --all-targets -- -D warnings
