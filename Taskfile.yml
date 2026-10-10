@@ -55,6 +55,16 @@ tasks:
     cmds:
       - bash scripts/power-loss-drill.sh
 
+  aws-drill:
+    desc: Run the real AWS drill; re-run until it exits 0 (see docs/aws-drill.md)
+    cmds:
+      - bash scripts/aws-drill.sh {{.CLI_ARGS}}
+
+  aws-drill:setup:
+    desc: One-time AWS setup for the drill (pass the bucket name after --)
+    cmds:
+      - bash scripts/aws-drill-setup.sh {{.CLI_ARGS}}
+
   ci:
     desc: Run the same checks as the CI test job
     cmds:

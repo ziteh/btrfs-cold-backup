@@ -1,0 +1,17 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-drill-runs",
+      "Filter": { "Prefix": "aws-drill/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 7 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    },
+    {
+      "ID": "expire-level-1-by-tag",
+      "Filter": { "Tag": { "Key": "bcb-backup-level", "Value": "1" } },
+      "Status": "Enabled",
+      "Expiration": { "Days": 7 }
+    }
+  ]
+}

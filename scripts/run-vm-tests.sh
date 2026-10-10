@@ -11,7 +11,6 @@ S3_ENDPOINT=http://localhost:8333
 S3_BUCKET=bcb-test
 S3_USER=s3testcreds
 S3_PASS=s3testcreds
-TARGET=aarch64-unknown-linux-gnu
 
 # Reset every run: the VM is long-lived, and state left by earlier runs (a full disk, stray
 # fixtures) otherwise surfaces as failures that look like bcb bugs. `--fresh` also recreates
@@ -35,6 +34,7 @@ if ! command -v cargo-zigbuild &>/dev/null; then
     cargo install cargo-zigbuild
 fi
 
+TARGET=$(vm_target)
 rustup target add "$TARGET"
 
 # The dev profile keeps debug_assertions, which the BCB_TEST_* hooks the VM tests drive
@@ -48,11 +48,8 @@ if [ -z "$test_bin" ]; then
 fi
 
 echo "==> Uploading to VM..."
-for pair in "target/$TARGET/debug/bcb:bcb" "$test_bin:vm-tests"; do
-    multipass exec "$VM" -- sudo rm -f "/home/ubuntu/${pair##*:}"
-    multipass transfer "${pair%:*}" "$VM:/home/ubuntu/${pair##*:}"
-    multipass exec "$VM" -- chmod +x "/home/ubuntu/${pair##*:}"
-done
+vm_upload "target/$TARGET/debug/bcb" bcb
+vm_upload "$test_bin" vm-tests
 
 echo "==> Running VM tests..."
 multipass exec "$VM" -- sudo env \

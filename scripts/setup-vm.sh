@@ -19,7 +19,18 @@ S3_PASS=s3testcreds
 # doesn't inherit leftovers of earlier ones: a full disk, stray fixtures, objects under old
 # prefixes. Left off by default because the power-loss drill re-runs this script after a
 # reboot, and CI starts from a clean machine anyway.
-if [ "${1:-}" = "--reset" ]; then
+# `--no-s3` skips SeaweedFS, for the AWS drill, which talks to real S3.
+RESET=false
+WITH_S3=true
+for arg in "$@"; do
+    case "$arg" in
+        --reset) RESET=true ;;
+        --no-s3) WITH_S3=false ;;
+        *) echo "unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
+if $RESET; then
     systemctl stop bcb-weed &>/dev/null || true
     pkill -x weed || true
     while pgrep -x weed &>/dev/null; do sleep 0.5; done
@@ -63,6 +74,12 @@ if ! mountpoint -q "$BTRFS_MOUNT"; then
         mkfs.btrfs -q "$LOOP_IMG"
     fi
     mount -o loop "$LOOP_IMG" "$BTRFS_MOUNT"
+fi
+
+if ! $WITH_S3; then
+    echo "VM ready."
+    echo "btrfs mount      : $BTRFS_MOUNT"
+    exit 0
 fi
 
 if [ ! -f "$SEAWEEDFS_BIN" ]; then

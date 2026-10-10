@@ -16,7 +16,40 @@ bcb genkey --output ./bcb_private.key
 sudo bcb check
 ```
 
-AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy needs `PutObject`, `PutObjectTagging`, `GetObject`, `HeadObject`, `ListBucket`, `ListBucketMultipartUploads`, `AbortMultipartUpload`, `DeleteObject`, `RestoreObject`, and `HeadBucket` on the bucket. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
+AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy is [contrib/aws/bcb-policy.json](../contrib/aws/bcb-policy.json), with `BUCKET_NAME` replaced. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
+
+Optional hardening for the credentials, since anyone holding them can call S3 directly, not just through bcb:
+
+- Keep `~/.aws/credentials` readable by root only (`chmod 600`), with no other profiles on the host.
+- Encrypt them at rest with [systemd-creds][systemd-creds] (bound to the TPM2 where available) so a copied disk or image does not leak them, and let the service decrypt them at runtime:
+
+  ```bash
+  sudo systemd-creds encrypt --name=aws /root/.aws/credentials /etc/credstore.encrypted/bcb-aws
+  ```
+
+  ```ini
+  # systemctl edit bcb-backup@.service
+  [Service]
+  LoadCredentialEncrypted=aws:/etc/credstore.encrypted/bcb-aws
+  Environment=AWS_SHARED_CREDENTIALS_FILE=%d/aws
+  ```
+
+  Then remove the plaintext file. Interactive `sudo bcb ...` runs need the same variable pointed at a decrypted copy.
+- Restrict the bcb IAM user to your own source IP with a bucket policy, so credentials copied off the host are useless elsewhere. Scope it with `aws:PrincipalArn` so console access from other places is unaffected; with a dynamic IPv4 address, use an IPv6 prefix (requires S3's dual-stack endpoint) or route through a host with a fixed address.
+
+  ```json
+  {
+    "Sid": "BcbFromHomeOnly",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": ["arn:aws:s3:::BUCKET_NAME", "arn:aws:s3:::BUCKET_NAME/*"],
+    "Condition": {
+      "ArnEquals": { "aws:PrincipalArn": "arn:aws:iam::ACCOUNT_ID:user/bcb" },
+      "NotIpAddress": { "aws:SourceIp": ["203.0.113.10/32"] }
+    }
+  }
+  ```
 
 Snapshots come from btrbk, one [config][btrbk-conf] per level so each can be created and pruned independently ([contrib/btrbk/](../contrib/btrbk/), level 1 identical to level 0 except `snapshot_name bcb_level1`).
 
@@ -42,7 +75,8 @@ Notes:
 
 - Each level 1 is the cumulative delta since the last level 0 and grows over the half year; if that gets large, add a monthly level 1 and weekly level 2 instead.
 - Set bucket lifecycle expirations filtered on the `bcb-backup-level` tag (see [README](../README.md#retention)) to at least 13 months so the current and previous chains always survive.
-- Drill restores: `bcb list` regularly, and walk a full restore on a test machine at least yearly to prove the private key and procedure work. See [restore-drill-runbook.md](restore-drill-runbook.md) for a runbook that exercises the real Glacier retrieval path (which no automated test does).
+- Drill restores: `bcb list` regularly, and walk a full restore on a test machine at least yearly to prove the private key and procedure work. [aws-drill.md](aws-drill.md) exercises the real Glacier retrieval path, which the VM tests cannot.
 - Run `bcb verify` regularly (e.g. a monthly systemd timer, wired into the same `OnFailure=` alerting as the backup jobs): it audits every backup's incremental chain, part existence and size, and storage class against S3 via HeadObject/ListObjectsV2 only, so it never triggers an archive retrieval or its cost. Pass `--max-age-days` to also flag a task whose newest backup is older than expected — the one check that can catch a schedule that silently stopped running. It complements, not replaces, an actual restore drill: it cannot detect data corrupted in a way that preserves size, nor verify the private key still works.
 
 [btrbk-conf]: https://digint.ch/btrbk/doc/btrbk.conf.5.html
+[systemd-creds]: https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html

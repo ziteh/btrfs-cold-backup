@@ -220,6 +220,8 @@ cargo clippy
 bash scripts/run-vm-tests.sh
 ```
 
+The [AWS drill](docs/aws-drill.md) (`task aws-drill`) runs backup and restore against real S3 with archive storage classes.
+
 The VM suite is part of `cargo test`. A test skips itself, still reporting "ok", when its required environment variables are unset. Use `cargo test -- --nocapture` to see the "skipping: ..." messages.
 
 > See also [Taskfile](./Taskfile.yml).
