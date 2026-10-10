@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time AWS setup for scripts/aws-drill.sh: the drill bucket, its lifecycle rules, the two
+# One-time AWS setup for scripts/aws-drill.sh: the drill bucket, its lifecycle rules, the
 # IAM users and their host profiles. Run it with administrator credentials (the default AWS
 # CLI chain, e.g. `AWS_PROFILE=admin`). Safe to re-run: it creates only what is missing, and
 # re-applies the policies and lifecycle rules so they follow the files in contrib/aws/.
@@ -14,6 +14,7 @@ BUCKET=${1:?usage: $0 <bucket>}
 REGION=us-east-1
 PROFILE=${BCB_DRILL_PROFILE:-bcb-drill}
 NO_TAG_PROFILE=${BCB_DRILL_NO_TAG_PROFILE:-bcb-drill-no-tag}
+RESTORE_PROFILE=${BCB_DRILL_RESTORE_PROFILE:-bcb-drill-restore}
 
 policy() { sed "s/BUCKET_NAME/$BUCKET/g" "$POLICY_DIR/$1"; }
 
@@ -79,8 +80,9 @@ profile_user() {
         sed -n 's|.*:user/||p'
 }
 
-setup_user bcb-drill "$PROFILE" "$(policy bcb-policy.json)"
-setup_user bcb-drill-no-tag "$NO_TAG_PROFILE" "$(policy bcb-policy.json |
+setup_user bcb-drill "$PROFILE" "$(policy bcb-backup-policy.json)"
+setup_user bcb-drill-no-tag "$NO_TAG_PROFILE" "$(policy bcb-backup-policy.json |
     jq '(.Statement[] | select(.Sid == "Objects") | .Action) -= ["s3:PutObjectTagging"]')"
+setup_user bcb-drill-restore "$RESTORE_PROFILE" "$(policy bcb-restore-policy.json)"
 
 echo "==> Done. Run: BCB_DRILL_BUCKET=$BUCKET task aws-drill"

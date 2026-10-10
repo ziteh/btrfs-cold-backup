@@ -111,6 +111,7 @@ Retrieval takes hours to days, so `bcb restore` is idempotent and intended to be
 
 - A part that fails on the S3 side is logged and retried on the next run.
 - Under a systemd timer, set `SuccessExitStatus=2`.
+- Run it with credentials for [contrib/aws/bcb-restore-policy.json](contrib/aws/bcb-restore-policy.json): the backup policy lacks `s3:RestoreObject`.
 - Restore a backup's chain in order onto the same target: level 0 first, then each backup whose `parent_snapshot` is the one just restored, as recorded in each manifest.
 
 ### Retrieval pacing
@@ -259,7 +260,6 @@ The VM suite is part of `cargo test`. A test skips itself, still reporting "ok",
 - [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink
 - [ ] `bcb check` needs `s3:DeleteObject` to remove its probe object; drop that permission (least privilege, so stolen credentials cannot even place delete markers) by checking write access another way
 - [ ] Optional S3 Object Lock for level 0 data parts only (per-object retention set at upload, e.g. Compliance mode matching the Deep Archive minimum storage duration); needs `s3:PutObjectRetention` and a bucket created with Object Lock enabled
-- [ ] Split IAM policies: a backup policy without `s3:RestoreObject` for the host, and a restore policy kept offline with the private key, so stolen host credentials cannot run up retrieval costs
 - [ ] Unit/integration coverage for `S3Backend` and `BtrfsDriver`, which only the VM suite exercises (e.g. a fake `btrfs` on `PATH`, an in-process fake S3 endpoint)
 
 ## License

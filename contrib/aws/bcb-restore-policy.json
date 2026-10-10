@@ -4,20 +4,13 @@
     {
       "Sid": "Bucket",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Action": ["s3:ListBucket"],
       "Resource": "arn:aws:s3:::BUCKET_NAME"
     },
     {
       "Sid": "Objects",
       "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:PutObjectTagging",
-        "s3:GetObject",
-        "s3:DeleteObject",
-        "s3:RestoreObject",
-        "s3:AbortMultipartUpload"
-      ],
+      "Action": ["s3:GetObject", "s3:RestoreObject"],
       "Resource": "arn:aws:s3:::BUCKET_NAME/*"
     }
   ]

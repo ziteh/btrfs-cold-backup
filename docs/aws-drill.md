@@ -2,7 +2,7 @@
 
 The VM test suite runs against SeaweedFS, which never enforces Glacier's access restrictions or retrieval scheduling, and every VM test stores parts as `STANDARD`. [scripts/aws-drill.sh](../scripts/aws-drill.sh) covers what only real AWS can show:
 
-- IAM: [contrib/aws/bcb-policy.json](../contrib/aws/bcb-policy.json) is enough for every command, and `bcb check` fails without `s3:PutObjectTagging`.
+- IAM: [contrib/aws/bcb-backup-policy.json](../contrib/aws/bcb-backup-policy.json) is enough for every command but restore, which it is denied; [contrib/aws/bcb-restore-policy.json](../contrib/aws/bcb-restore-policy.json) is enough for restore; `bcb check` fails without `s3:PutObjectTagging`.
 - Storage classes and tags: parts land in the level's class (`DEEP_ARCHIVE`, `GLACIER`), manifests in `STANDARD`, each tagged `bcb-backup-level`, and a lifecycle rule filtering on that tag is accepted.
 - Multipart: parts larger than one chunk; a backup killed mid-upload resumes and its orphaned multipart upload is aborted.
 - Retrieval: `RestoreObject`, `x-amz-restore` parsing, no re-request of a retrieval in progress, and a level 0 and level 1 restore that match their snapshots byte for byte.
@@ -34,8 +34,9 @@ Host requirements: `multipass`, `cargo-zigbuild`, and AWS CLI v2.
 
 Optional environment variables:
 
-- `BCB_DRILL_PROFILE`: profile with the production policy. Default `bcb-drill`.
-- `BCB_DRILL_NO_TAG_PROFILE`: profile without `s3:PutObjectTagging`. Default `bcb-drill-no-tag`.
+- `BCB_DRILL_PROFILE`: profile with the backup policy. Default `bcb-drill`.
+- `BCB_DRILL_NO_TAG_PROFILE`: profile with the backup policy minus `s3:PutObjectTagging`. Default `bcb-drill-no-tag`.
+- `BCB_DRILL_RESTORE_PROFILE`: profile with the restore policy. Default `bcb-drill-restore`.
 
 Credentials are exported from these profiles on the host and passed to the VM over stdin. They are never written to the VM.
 
@@ -47,7 +48,7 @@ Run with administrator credentials (e.g. `AWS_PROFILE=admin`), and AWS CLI v2 an
 bash scripts/aws-drill-setup.sh <drill bucket>
 ```
 
-It creates the bucket in `us-east-1`, its lifecycle rules, and the IAM users `bcb-drill` (the production policy) and `bcb-drill-no-tag` (the same without `s3:PutObjectTagging`). It then writes an access key for each to the host profiles and checks that each profile authenticates as its user. It is safe to re-run: it creates only what is missing, replaces a profile's key only if the profile doesn't work, and re-applies the policies and lifecycle rules from [contrib/aws/](../contrib/aws/).
+It creates the bucket in `us-east-1`, its lifecycle rules, and the IAM users `bcb-drill` (the backup policy), `bcb-drill-no-tag` (the same without `s3:PutObjectTagging`) and `bcb-drill-restore` (the restore policy). It then writes an access key for each to the host profiles and checks that each profile authenticates as its user. It is safe to re-run: it creates only what is missing, replaces a profile's key only if the profile doesn't work, and re-applies the policies and lifecycle rules from [contrib/aws/](../contrib/aws/).
 
 Set an AWS Budgets alert by hand as a guard against a runaway cost.
 

@@ -19,6 +19,7 @@ source "$SCRIPT_DIR/vm-lib.sh"
 BUCKET=${BCB_DRILL_BUCKET:?set BCB_DRILL_BUCKET to the drill bucket (see docs/aws-drill.md)}
 PROFILE=${BCB_DRILL_PROFILE:-bcb-drill}
 NO_TAG_PROFILE=${BCB_DRILL_NO_TAG_PROFILE:-bcb-drill-no-tag}
+RESTORE_PROFILE=${BCB_DRILL_RESTORE_PROFILE:-bcb-drill-restore}
 
 # Runs in the VM before every script below.
 PRELUDE='
@@ -133,7 +134,7 @@ prepare_vm() {
         command -v "$cmd" >/dev/null || { echo "$cmd is required on the host" >&2; exit 1; }
     done
     # Checked before the build, which takes minutes, rather than at first use after it.
-    for profile in "$PROFILE" "$NO_TAG_PROFILE"; do
+    for profile in "$PROFILE" "$NO_TAG_PROFILE" "$RESTORE_PROFILE"; do
         if ! aws configure export-credentials --profile "$profile" >/dev/null; then
             echo "AWS profile '$profile' is not usable; see docs/aws-drill.md" >&2
             exit 1
@@ -264,6 +265,11 @@ EOF
 
     echo "==> Requesting retrieval"
     vm_run "$PROFILE" <<'EOF'
+restore restore0-backup-policy 0 "$DATE0" "$M/restore" "$D/key"
+check "a restore with the backup policy exits 1" [ "$rc" = 1 ]
+check "it is denied the retrieval request" grep -q "restore_object failed" "$LAST_LOG"
+EOF
+    vm_run "$RESTORE_PROFILE" <<'EOF'
 restore restore0-wrong-key 0 "$DATE0" "$M/restore" "$D/wrong.key"
 check "a restore with the wrong key exits 1" [ "$rc" = 1 ]
 check "it requests no retrieval" requested_no_retrieval
@@ -325,7 +331,7 @@ EOF
 finish_run() {
     echo "==> Finishing the waiting drill run"
     local rc=0
-    vm_run "$PROFILE" <<'EOF' || rc=$?
+    vm_run "$RESTORE_PROFILE" <<'EOF' || rc=$?
 # A completed restore removes its work dir, so running it again would start over; each
 # level's completion is recorded instead.
 for level in 0 1; do

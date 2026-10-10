@@ -16,7 +16,7 @@ bcb genkey --output ./bcb_private.key
 sudo bcb check
 ```
 
-AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy is [contrib/aws/bcb-policy.json](../contrib/aws/bcb-policy.json), with `BUCKET_NAME` replaced. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
+AWS credentials go in root's `~/.aws/credentials` (bcb uses the AWS SDK default chain). The IAM policy is [contrib/aws/bcb-backup-policy.json](../contrib/aws/bcb-backup-policy.json), with `BUCKET_NAME` replaced. It lacks `s3:RestoreObject`, so stolen host credentials cannot run up retrieval costs; restore uses [contrib/aws/bcb-restore-policy.json](../contrib/aws/bcb-restore-policy.json) instead, with credentials kept offline alongside the private key. `PutObjectTagging` is easy to miss since every upload sets its tag inline via `PutObject`, but AWS checks it as a separate permission — without it, `bcb check` fails at the write probe rather than passing and only failing later during a real backup.
 
 Optional hardening for the credentials, since anyone holding them can call S3 directly, not just through bcb:
 
