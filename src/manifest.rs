@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 use crate::remote::RemoteBackend;
 use crate::timestamp::{BackupId, Timestamp};
 
-/// Shared by [`BackupManifest`] and [`LatestManifest`]. Readers reject any other major version; a
-/// minor bump may only add fields that have a serde default, so older readers still parse it.
+/// Shared by [`BackupManifest`] and [`LatestManifest`]. Readers reject any other major
+/// version; a minor bump may only add fields that have a serde default, so older readers still
+/// parse it.
 pub const FORMAT_VERSION: &str = "1.0";
 
+/// One encrypted part, with the size and BLAKE3 of its ciphertext.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestPart {
     pub index: String,
@@ -39,14 +41,18 @@ pub struct BackupManifest {
     pub created_at: i64,
     pub level: u32,
     pub snapshot_name: String,
+    /// The snapshot the stream is incremental to; None for level 0.
     pub parent_snapshot: Option<String>,
     /// btrfs UUID of the backed-up subvolume.
     pub source_uuid: String,
     /// btrfs UUID of the snapshot that was sent.
     pub snapshot_uuid: String,
     pub system: SystemInfo,
+    /// The key the parts are encrypted to, so a restore can check its private key first.
     pub age_public_key: String,
+    /// Total size of the encrypted parts.
     pub total_size_bytes: u64,
+    /// BLAKE3 of the whole plaintext send stream.
     pub blake3: String,
     pub parts: Vec<ManifestPart>,
 }
@@ -71,9 +77,8 @@ pub struct LatestEntry {
 pub struct LatestManifest {
     pub format_version: String,
     pub source_uuid: String,
-    /// The newest backup of each level, keyed by level. Callers rely on the key being the
-    /// level: completing a level-N backup drops every entry above N, whose incremental chain
-    /// it voided.
+    /// The newest backup of each level, keyed by level. Completing a level N backup drops
+    /// every entry above N, whose incremental chain it voided.
     pub levels: BTreeMap<u32, LatestEntry>,
 }
 

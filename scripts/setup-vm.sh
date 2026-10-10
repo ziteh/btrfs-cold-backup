@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Sets up the test environment the VM tests need: a btrfs loopback mount and a local
+# S3-compatible server (SeaweedFS) with the test bucket. Runs as root inside the test VM, or
+# on a CI runner. Safe to re-run.
 set -euo pipefail
 
 LOOP_IMG=/var/lib/bcb-test/btrfs.img
@@ -29,7 +32,7 @@ fi
 # refuses everything until repaired.
 systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer &>/dev/null || true
 
-# Sync clock before apt
+# apt rejects repository metadata dated in the future, which a lagging VM clock makes it.
 chronyc makestep 2>/dev/null || true
 
 # Skipped once installed: re-running after a VM crash shouldn't depend on apt, which a crash
@@ -53,7 +56,6 @@ if ! command -v aws &>/dev/null; then
     rm -rf /tmp/awscliv2.zip /tmp/aws
 fi
 
-# btrfs loop device
 mkdir -p "$(dirname "$LOOP_IMG")" "$BTRFS_MOUNT"
 if ! mountpoint -q "$BTRFS_MOUNT"; then
     if [ ! -f "$LOOP_IMG" ]; then
@@ -63,19 +65,16 @@ if ! mountpoint -q "$BTRFS_MOUNT"; then
     mount -o loop "$LOOP_IMG" "$BTRFS_MOUNT"
 fi
 
-# Detect architecture for SeaweedFS downloads
-case "$(uname -m)" in
-    aarch64|arm64) ARCH=arm64 ;;
-    *)             ARCH=amd64 ;;
-esac
-
-# SeaweedFS server (S3-compatible; replaces MinIO, whose OSS project was archived)
 if [ ! -f "$SEAWEEDFS_BIN" ]; then
+    case "$(uname -m)" in
+        aarch64|arm64) weed_arch=arm64 ;;
+        *)             weed_arch=amd64 ;;
+    esac
     # Piping curl straight into `grep -m1` risks curl seeing SIGPIPE (exit 23) when grep
     # quits after its first match, so capture the full response before grepping it.
     release_json=$(curl -fsSL https://api.github.com/repos/seaweedfs/seaweedfs/releases/latest)
     version=$(grep -m1 '"tag_name"' <<<"$release_json" | cut -d'"' -f4)
-    curl -fsSL "https://github.com/seaweedfs/seaweedfs/releases/download/${version}/linux_${ARCH}.tar.gz" \
+    curl -fsSL "https://github.com/seaweedfs/seaweedfs/releases/download/${version}/linux_${weed_arch}.tar.gz" \
         -o /tmp/weed.tar.gz
     tar -xzf /tmp/weed.tar.gz -C "$(dirname "$SEAWEEDFS_BIN")" weed
     rm -f /tmp/weed.tar.gz

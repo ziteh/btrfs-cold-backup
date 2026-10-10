@@ -206,7 +206,7 @@ The VM suite is compiled into the same `cargo test` run, but each test skips its
 - [ ] Add btrbk to VM for E2E testing
 - [ ] `--download-kbps` override `expected_download_kbps`
 - [ ] Throttle the multipart upload body itself so `upload_speed_limit_kbps` smooths the uplink instead of bursting each part
-- [ ] Simplify `resolve_parent`'s parameter list (derive keys from one context instead of passing them separately)
+- [ ] Raise unit/integration coverage of code that only the VM suite exercises today: `S3Backend` (multipart upload, orphaned-upload cleanup, range download), `BtrfsDriver` (send stream exit handling, receive), and the `main.rs` command functions beyond argument parsing
 
 ## License
 

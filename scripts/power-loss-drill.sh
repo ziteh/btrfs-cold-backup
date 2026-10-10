@@ -8,11 +8,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VM=bcb-dev
 # shellcheck source=vm-lib.sh
 source "$SCRIPT_DIR/vm-lib.sh"
-
-vm() { vm_exec "$1"; }
 
 # Runs in the VM: shared settings for every step below.
 PRELUDE='
@@ -27,7 +24,7 @@ export BCB_TEST_SPLIT_SIZE=$((16 * 1024 * 1024))
 '
 
 setup() {
-    vm "$PRELUDE"'
+    vm_exec "$PRELUDE"'
     rm -rf "$D"; mkdir -p "$D"
     if [ -d "$M" ]; then
         # Every btrfs subvolume root has inode 256; deepest first, so nested ones go first.
@@ -68,7 +65,7 @@ EOF
 # abandoned once the VM stops answering.
 crash_when() {
     local condition=$1
-    vm "$PRELUDE"'
+    vm_exec "$PRELUDE"'
     # A systemd unit, because a background child of `multipass exec` dies with the session.
     systemctl reset-failed bcb-drill-backup &>/dev/null || true
     systemd-run --unit=bcb-drill-backup --setenv=BCB_TEST_SPLIT_SIZE="$BCB_TEST_SPLIT_SIZE" \
@@ -103,7 +100,7 @@ crash_when() {
 # A store that lost an acknowledged part makes the first resume fail on purpose, so allow
 # one retry; anything beyond that is a failure.
 resume_and_restore() {
-    vm "$PRELUDE"'
+    vm_exec "$PRELUDE"'
     for attempt in 1 2; do
         if "$BIN" --config "$CFG" backup --level 0 --task drill; then break; fi
         [ "$attempt" = 2 ] && exit 1

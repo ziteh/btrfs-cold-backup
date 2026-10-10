@@ -1,3 +1,6 @@
+//! Everything bcb runs the `btrfs` command for, behind [`BtrfsOps`] so backup and restore can
+//! be tested against a mock.
+
 use anyhow::{Context as _, Result, anyhow};
 use std::io::{self, Read};
 use std::path::Path;
@@ -13,6 +16,8 @@ use crate::timestamp::SNAPSHOT_PREFIX;
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
 pub trait BtrfsOps: Send + Sync {
+    /// Names of the bcb snapshots in `snapshot_dir`, sorted, which orders each level's
+    /// snapshots oldest first since their names differ only in the timestamp.
     async fn list_snapshots(&self, snapshot_dir: &Path) -> Result<Vec<String>>;
     async fn send_full(&self, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
     async fn send_incremental(

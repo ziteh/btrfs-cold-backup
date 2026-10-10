@@ -1,9 +1,10 @@
+//! `bcb check`: catches setup mistakes before the first scheduled backup hits them.
+
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    btrfs::BtrfsOps,
-    btrfs::ensure_snapshot_of,
+    btrfs::{BtrfsOps, ensure_snapshot_of},
     config::{Config, Task},
     remote::RemoteBackend,
 };
@@ -39,6 +40,7 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Checks every enabled task's subvolume and snapshot_dir, then the bucket's permissions.
 pub async fn check<B: BtrfsOps, R: RemoteBackend>(
     config: &Config,
     btrfs: &B,
