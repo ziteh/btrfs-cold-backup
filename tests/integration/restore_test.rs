@@ -118,7 +118,7 @@ async fn restore_should_fail_on_blake3_mismatch() {
     remote
         .expect_download_range_to_file()
         .returning(|_, _, _, path| {
-            std::fs::write(path, b"some random bytes")?;
+            std::fs::write(path, b"10 bytes!!")?;
             Ok(())
         });
 
@@ -129,7 +129,11 @@ async fn restore_should_fail_on_blake3_mismatch() {
         &remote,
     )
     .await;
-    assert!(result.is_err(), "restore should fail on BLAKE3 mismatch");
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(
+        err.contains("BLAKE3 mismatch for part 000000"),
+        "unexpected error: {err}"
+    );
     let state = saved_restore_state(&restore_work_dir(work_dir.path()));
     assert_eq!(state.parts["000000"], PartDownloadState::NotDownloaded);
 }

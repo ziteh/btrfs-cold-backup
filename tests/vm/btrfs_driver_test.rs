@@ -36,7 +36,7 @@ async fn subvolume_uuids_should_link_snapshot_to_its_source() {
 }
 
 #[tokio::test]
-async fn delete_subvolume_should_remove_snapshot_and_fail_for_missing_path() {
+async fn delete_subvolume_should_remove_snapshot() {
     let Some(mount) = btrfs_mount() else { return };
     let dir = test_dir(&mount, "delete");
     let subvol = dir.join("subvol");
@@ -44,12 +44,17 @@ async fn delete_subvolume_should_remove_snapshot_and_fail_for_missing_path() {
     btrfs_subvolume_create(&subvol);
     btrfs_snapshot(&subvol, &snap);
 
-    let driver = BtrfsDriver;
-    driver.delete_subvolume(&snap).await.unwrap();
-    assert!(!snap.exists());
-    assert!(driver.delete_subvolume(&snap).await.is_err());
+    BtrfsDriver.delete_subvolume(&snap).await.unwrap();
 
+    assert!(!snap.exists());
     btrfs_subvolume_delete(&subvol);
+}
+
+#[tokio::test]
+async fn delete_subvolume_should_fail_for_missing_path() {
+    let Some(mount) = btrfs_mount() else { return };
+    let missing = mount.join("does-not-exist-snap");
+    assert!(BtrfsDriver.delete_subvolume(&missing).await.is_err());
 }
 
 #[tokio::test]
