@@ -345,7 +345,7 @@ mod tests {
 ";
 
     #[test]
-    fn test_parse_subvolume_uuids_snapshot() {
+    fn subvolume_show_of_snapshot_should_parse_uuid_and_parent() {
         let uuids = parse_subvolume_uuids(SNAPSHOT_SHOW).unwrap();
         assert_eq!(uuids.uuid, "1c2d3e4f-0000-0000-0000-000000000002");
         assert_eq!(
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_subvolume_uuids_dash_parent_is_none() {
+    fn dash_parent_uuid_should_parse_as_none() {
         let out = "\tUUID: \t\t\tabc\n\tParent UUID: \t\t-\n\tReceived UUID: \t\t-\n";
         let uuids = parse_subvolume_uuids(out).unwrap();
         assert_eq!(uuids.uuid, "abc");
@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_fails_when_exit_status_is_lost() {
+    async fn stream_read_should_fail_when_exit_status_is_lost() {
         let mut child = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
         let (status_tx, status_rx) = oneshot::channel();
         drop(status_tx);
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_after_eof_stays_at_eof() {
+    async fn stream_read_after_eof_should_stay_at_eof() {
         let mut child = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
         let (status_tx, status_rx) = oneshot::channel();
         let status = child.wait().await.unwrap();
@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_subvolume_uuids_missing_uuid_is_err() {
+    fn subvolume_show_without_uuid_should_be_rejected() {
         assert!(parse_subvolume_uuids("\tParent UUID: \t\tabc\n").is_err());
         assert!(parse_subvolume_uuids("\tUUID: \t\t\t-\n").is_err());
     }

@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enabled_tasks_no_filter_returns_all_enabled() {
+    fn enabled_tasks_without_filter_should_return_every_enabled_task() {
         let tasks = vec![task("a", true), task("b", true), task("c", false)];
         let selected = enabled_tasks(&tasks, None);
         assert_eq!(
@@ -269,25 +269,25 @@ mod tests {
     }
 
     #[test]
-    fn test_enabled_tasks_by_name_ignores_disabled() {
+    fn enabled_tasks_by_name_should_not_select_disabled_task() {
         let tasks = vec![task("a", true), task("b", false)];
         assert!(enabled_tasks(&tasks, Some("b")).is_empty());
         assert_eq!(enabled_tasks(&tasks, Some("a")).len(), 1);
     }
 
     #[test]
-    fn test_enabled_tasks_unknown_name_is_empty() {
+    fn enabled_tasks_with_unknown_name_should_be_empty() {
         let tasks = vec![task("a", true)];
         assert!(enabled_tasks(&tasks, Some("nonexistent")).is_empty());
     }
 
     #[test]
-    fn test_aggregate_failures_empty_is_ok() {
+    fn aggregate_failures_should_be_ok_without_failures() {
         assert!(aggregate_failures("backup", &[]).is_ok());
     }
 
     #[test]
-    fn test_aggregate_failures_names_every_failed_task() {
+    fn aggregate_failures_should_name_every_failed_task() {
         let failed = vec!["a".to_string(), "b".to_string()];
         let err = aggregate_failures("backup", &failed).unwrap_err();
         assert_eq!(err.to_string(), "backup failed for task(s): a, b");

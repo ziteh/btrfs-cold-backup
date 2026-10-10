@@ -343,12 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_config() {
+    fn valid_config_should_pass_validation() {
         assert!(valid_config().validate().is_ok());
     }
 
     #[test]
-    fn test_parses_example_yaml() {
+    fn example_yaml_should_parse_and_validate() {
         let yaml = r#"
 base_dir: /var/lib/bcb/
 age_public_key: KEY
@@ -376,7 +376,7 @@ tasks:
     }
 
     #[test]
-    fn test_unsupported_storage_class_is_rejected_when_parsing() {
+    fn unsupported_storage_class_should_fail_to_parse() {
         for class in [
             "DEEP_FREEZE",
             "bogus",
@@ -391,7 +391,7 @@ tasks:
     }
 
     #[test]
-    fn test_task_name_rejects_path_traversal_and_whitespace() {
+    fn task_name_with_path_separator_dots_or_whitespace_should_be_rejected() {
         for name in ["../escape", "sub/dir", "..", "has space", ""] {
             let mut config = valid_config();
             config.tasks[0].name = name.to_string();
@@ -403,7 +403,7 @@ tasks:
     }
 
     #[test]
-    fn test_empty_fields_rejected() {
+    fn each_empty_required_field_should_be_rejected() {
         let mut config = valid_config();
         config.base_dir = PathBuf::new();
         assert_invalid(&config, "base_dir");
@@ -430,7 +430,7 @@ tasks:
     }
 
     #[test]
-    fn test_invalid_age_public_key() {
+    fn empty_or_malformed_age_public_key_should_be_rejected() {
         for key in ["", "invalid"] {
             let mut config = valid_config();
             config.age_public_key = key.to_string();
@@ -439,7 +439,7 @@ tasks:
     }
 
     #[test]
-    fn test_duplicate_task_names() {
+    fn duplicate_task_names_should_be_rejected() {
         let mut config = valid_config();
         let mut second = config.tasks[0].clone();
         second.subvolume = PathBuf::from("/mnt/data2");
@@ -449,7 +449,7 @@ tasks:
     }
 
     #[test]
-    fn test_duplicate_subvolume_rejected() {
+    fn duplicate_subvolume_should_be_rejected() {
         let mut config = valid_config();
         let mut second = config.tasks[0].clone();
         second.name = "other".to_string();
@@ -458,7 +458,7 @@ tasks:
     }
 
     #[test]
-    fn test_subvolume_sanitize_collision_rejected() {
+    fn subvolumes_sanitizing_to_the_same_name_should_be_rejected() {
         let mut config = valid_config();
         config.tasks[0].subvolume = PathBuf::from("/mnt/data/movies");
         let mut second = config.tasks[0].clone();
@@ -469,7 +469,7 @@ tasks:
     }
 
     #[test]
-    fn test_duplicate_snapshot_dir_rejected() {
+    fn snapshot_dir_shared_up_to_trailing_slash_should_be_rejected() {
         let mut config = valid_config();
         let mut second = config.tasks[0].clone();
         second.name = "other".to_string();
@@ -480,7 +480,7 @@ tasks:
     }
 
     #[test]
-    fn test_disabled_task_does_not_collide_on_subvolume() {
+    fn disabled_task_should_not_collide_on_subvolume() {
         let mut config = valid_config();
         let mut second = config.tasks[0].clone();
         second.name = "other".to_string();
@@ -490,21 +490,21 @@ tasks:
     }
 
     #[test]
-    fn test_s3_retry_max_attempts_zero() {
+    fn zero_retry_max_attempts_should_be_rejected() {
         let mut config = valid_config();
         config.s3.retry.max_attempts = 0;
         assert_invalid(&config, "max_attempts");
     }
 
     #[test]
-    fn test_s3_empty_backup_data_classes() {
+    fn empty_backup_data_storage_classes_should_be_rejected() {
         let mut config = valid_config();
         config.s3.storage_class.backup_data = vec![];
         assert_invalid(&config, "backup_data");
     }
 
     #[test]
-    fn test_s3_prefix_rules() {
+    fn s3_prefix_should_be_empty_or_relative_and_end_with_slash() {
         for ok in ["", "backups/", "a/b/"] {
             let mut config = valid_config();
             config.s3.prefix = ok.to_string();
@@ -524,7 +524,7 @@ tasks:
     }
 
     #[test]
-    fn test_archive_manifest_class_rejected() {
+    fn manifest_storage_class_should_reject_archive_tiers_but_allow_glacier_ir() {
         for class in [StorageClass::Glacier, StorageClass::DeepArchive] {
             let mut config = valid_config();
             config.s3.storage_class.manifest = class;
@@ -536,7 +536,7 @@ tasks:
     }
 
     #[test]
-    fn test_for_level_missing_entry_is_err() {
+    fn for_level_should_fail_for_a_level_without_storage_class() {
         let classes = StorageClasses {
             manifest: StorageClass::Standard,
             backup_data: vec![StorageClass::DeepArchive],
@@ -547,7 +547,7 @@ tasks:
     }
 
     #[test]
-    fn test_oversize_guard_parses_and_validates() {
+    fn oversize_guard_should_parse_and_reject_zero_history_or_rate_factor() {
         let yaml = "history: 5\nrate_factor: 10\nmin_size_gib: 20\nfallback_level0_ratio: 0.1\n";
         let guard: OversizeGuard = serde_yaml::from_str(yaml).unwrap();
         let mut config = valid_config();

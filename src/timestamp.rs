@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_days_since() {
+    fn days_since_should_return_fractional_signed_days() {
         assert_eq!(
             ts("2026-03-01T12:00")
                 .days_since(&ts("2026-02-27T00:00"))
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_id_from_snapshot_name() {
+    fn backup_id_should_parse_level_and_time_from_snapshot_name() {
         let id = BackupId::from_snapshot_name("bcb_level12.20260602T1430").unwrap();
         assert_eq!(id.level, 12);
         assert_eq!(id.timestamp, ts("2026-06-02T14:30"));
@@ -243,13 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn test_from_snapshot_name_valid() {
+    fn snapshot_name_should_parse_to_its_timestamp() {
         let t = Timestamp::from_snapshot_name("bcb_level1.20260602T1430").unwrap();
         assert_eq!(t, ts("2026-06-02T14:30"));
     }
 
     #[test]
-    fn test_from_snapshot_name_same_minute_error_is_specific() {
+    fn same_minute_snapshot_name_should_fail_with_specific_error() {
         let err = Timestamp::from_snapshot_name("bcb_level0.20260602T1430_1")
             .unwrap_err()
             .to_string();
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_snapshot_name_invalid() {
+    fn snapshot_name_without_bcb_minute_format_should_be_rejected() {
         for name in [
             "bcb_level0",
             // btrbk timestamp_format short (date only).
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_cli_date() {
+    fn cli_date_should_accept_date_or_minute_and_reject_others() {
         assert_eq!(
             Timestamp::from_cli_date("202606021430").unwrap(),
             ts("2026-06-02T14:30")
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rejects_malformed() {
+    fn timestamp_should_parse_only_iso_minute_format() {
         assert!("2026-06-02T14:30".parse::<Timestamp>().is_ok());
         for bad in ["2026-06-02 14:30", "2026-06-02T14:3", "202606021430", ""] {
             assert!(bad.parse::<Timestamp>().is_err(), "{bad:?}");
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_is_the_plain_string() {
+    fn timestamp_should_serialize_as_plain_string() {
         let t = ts("2026-06-02T14:30");
         assert_eq!(
             serde_yaml::to_string(&t).unwrap().trim(),
@@ -309,13 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering_is_chronological() {
+    fn timestamps_should_order_chronologically() {
         assert!(ts("2025-12-31T23:59") < ts("2026-01-01T00:00"));
         assert!(ts("2026-06-25T08:00") < ts("2026-06-25T20:00"));
     }
 
     #[test]
-    fn test_dir_name_round_trip() {
+    fn backup_id_should_round_trip_through_dir_name() {
         let id = BackupId {
             level: 3,
             timestamp: ts("2026-06-02T14:30"),
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dir_name_invalid() {
+    fn malformed_dir_name_should_not_parse() {
         for dir in [
             "bcb",
             "bcb_levelX_202606021430",

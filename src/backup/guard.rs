@@ -131,13 +131,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_median() {
+    fn median_should_handle_odd_and_even_counts() {
         assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
         assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
     }
 
     #[test]
-    fn test_days_since_parent_is_at_least_one() {
+    fn days_since_parent_should_be_at_least_one() {
         let ts = |s: &str| s.parse::<Timestamp>().unwrap();
         assert_eq!(
             days_since_parent(&ts("2026-01-15T01:00"), Some("bcb_level0.20260101T0100")).unwrap(),

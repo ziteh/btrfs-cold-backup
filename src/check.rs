@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_executable_true_for_executable_file() {
+    fn is_executable_should_be_true_for_executable_file() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("mybin");
         make_executable(&bin);
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_executable_false_for_non_executable_file() {
+    fn is_executable_should_be_false_for_non_executable_file() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notexec");
         std::fs::write(&file, b"data").unwrap();
@@ -133,12 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_executable_false_for_missing_path() {
+    fn is_executable_should_be_false_for_missing_path() {
         assert!(!is_executable(Path::new("/nonexistent/path/for/bcb/test")));
     }
 
     #[test]
-    fn test_any_dir_has_executable_finds_it_in_second_dir() {
+    fn any_dir_has_executable_should_search_past_first_dir() {
         let empty_dir = tempfile::tempdir().unwrap();
         let bin_dir = tempfile::tempdir().unwrap();
         make_executable(&bin_dir.path().join("mybin"));
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_any_dir_has_executable_false_when_nowhere_found() {
+    fn any_dir_has_executable_should_be_false_when_nowhere_found() {
         let empty_dir = tempfile::tempdir().unwrap();
         let dirs = vec![empty_dir.path().to_path_buf()];
         assert!(!any_dir_has_executable(dirs.into_iter(), "mybin"));
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_fails_when_subvolume_missing() {
+    async fn check_should_fail_when_subvolume_missing() {
         let config = valid_config(PathBuf::from("/mnt/snapshots"));
 
         let mut btrfs = MockBtrfsOps::new();
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_fails_when_newest_snapshot_is_from_another_subvolume() {
+    async fn check_should_fail_naming_newest_snapshot_from_another_subvolume() {
         let dir = tempfile::tempdir().unwrap();
         let config = valid_config(dir.path().to_path_buf());
 
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_skips_disabled_tasks() {
+    async fn check_should_skip_disabled_tasks() {
         let mut config = valid_config(PathBuf::from("/mnt/snapshots"));
         config.tasks[0].enabled = false;
 
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_fails_when_snapshot_dir_not_a_directory() {
+    async fn check_should_fail_when_snapshot_dir_is_not_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         let not_a_dir = dir.path().join("plain_file");
         std::fs::write(&not_a_dir, b"oops").unwrap();
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_fails_when_snapshot_dir_missing() {
+    async fn check_should_fail_when_snapshot_dir_missing() {
         let config = valid_config(PathBuf::from("/nonexistent/snapshot/dir/for/bcb/test"));
 
         let btrfs = btrfs_with_snapshots(&[], SOURCE_UUID);
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_succeeds_and_verifies_credentials() {
+    async fn check_should_pass_and_verify_credentials_for_healthy_task() {
         let dir = tempfile::tempdir().unwrap();
         let config = valid_config(dir.path().to_path_buf());
 
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_fails_when_verify_credentials_fails() {
+    async fn check_should_fail_when_credentials_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let config = valid_config(dir.path().to_path_buf());
 
@@ -302,6 +302,10 @@ mod tests {
             .expect_verify_credentials()
             .returning(|| Err(anyhow::anyhow!("no access")));
 
-        assert!(check(&config, &btrfs, &remote).await.is_err());
+        let err = check(&config, &btrfs, &remote).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no access"),
+            "unexpected error: {err:#}"
+        );
     }
 }

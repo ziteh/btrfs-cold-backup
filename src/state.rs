@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load_round_trip() {
+    fn backup_and_restore_state_should_round_trip_through_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/state.yaml");
 
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_saved_file_records_when() {
+    fn saved_file_should_record_when_it_was_saved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.yaml");
         StateFile::create(path.clone(), backup_state()).unwrap();
@@ -225,14 +225,14 @@ mod tests {
     }
 
     #[test]
-    fn test_load_missing_is_none() {
+    fn load_of_missing_file_should_return_none() {
         let loaded =
             StateFile::<BackupState>::load(PathBuf::from("/nonexistent/path/state.yaml")).unwrap();
         assert!(loaded.is_none());
     }
 
     #[test]
-    fn test_load_error_names_the_file() {
+    fn load_error_should_name_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("restore_state.yaml");
         std::fs::write(&path, b"").unwrap();
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_parts() {
+    fn pending_parts_should_exclude_downloaded_ones() {
         let state = RestoreState {
             manifest_blake3: String::new(),
             parts: [

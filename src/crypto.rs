@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt_round_trip() {
+    fn encrypted_payload_should_decrypt_to_original() {
         let identity = x25519::Identity::generate();
         let ciphertext = encrypt(&identity.to_public(), b"round trip payload");
         assert_ne!(ciphertext, b"round trip payload");
@@ -136,20 +136,20 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_with_wrong_key_fails() {
+    fn decrypt_with_wrong_key_should_fail() {
         let ciphertext = encrypt(&x25519::Identity::generate().to_public(), b"secret");
         assert!(decrypt(&x25519::Identity::generate(), &ciphertext).is_err());
     }
 
     #[test]
-    fn test_decrypt_truncated_file_fails() {
+    fn decrypt_of_truncated_file_should_fail() {
         let identity = x25519::Identity::generate();
         let ciphertext = encrypt(&identity.to_public(), &[7u8; 4096]);
         assert!(decrypt(&identity, &ciphertext[..ciphertext.len() / 2]).is_err());
     }
 
     #[tokio::test]
-    async fn test_blake3_file_detects_content_change() {
+    async fn blake3_file_should_match_iff_content_matches() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.bin");
         let b = dir.path().join("b.bin");
@@ -164,13 +164,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_identity_rejects_garbage() {
+    fn parse_identity_should_reject_non_key_text() {
         let err = parse_identity("not a key").err().unwrap().to_string();
         assert!(err.contains("private key"), "unexpected error: {err}");
     }
 
     #[test]
-    fn test_ensure_key_pair() {
+    fn ensure_key_pair_should_fail_naming_the_public_key_on_mismatch() {
         let identity = x25519::Identity::generate();
         let public_key = identity.to_public().to_string();
         assert!(ensure_key_pair(&public_key, &identity).is_ok());

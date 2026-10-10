@@ -171,7 +171,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_decrypted_parts_joins_parts_in_order() {
+    fn decrypted_parts_should_join_parts_in_index_order() {
         let dir = tempfile::tempdir().unwrap();
         let identity = x25519::Identity::generate();
         let mut paths = Vec::new();

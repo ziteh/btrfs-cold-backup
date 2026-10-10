@@ -611,13 +611,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_expiry_date_valid() {
+    fn restore_header_expiry_date_should_parse_to_unix_time() {
         let header = r#"ongoing-request="false", expiry-date="Fri, 21 Dec 2012 00:00:00 GMT""#;
         assert_eq!(parse_expiry_date(header), Some(1356048000));
     }
 
     #[test]
-    fn test_parse_expiry_date_invalid_is_none() {
+    fn restore_header_without_valid_expiry_date_should_be_none() {
         for header in [
             r#"ongoing-request="true""#,
             r#"expiry-date="Fri, 21 Dec 2012"#,

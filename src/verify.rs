@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_task_no_backups_is_a_task_issue() {
+    async fn verify_should_report_task_level_issue_when_no_backups() {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| Ok(vec![]));
 
@@ -254,35 +254,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_task_clean_backup_has_no_issues() {
+    async fn verify_should_report_nothing_for_intact_backup() {
         let backup = backup_with_one_part(1024);
         let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "DEEP_ARCHIVE"), None).await;
         assert!(issues.is_empty(), "issues: {issues:?}");
     }
 
     #[tokio::test]
-    async fn test_verify_task_detects_size_mismatch() {
+    async fn verify_should_report_part_size_mismatch() {
         let backup = backup_with_one_part(1024);
         let issues = verify_one(MANIFEST_KEY, backup, on_s3(999, "DEEP_ARCHIVE"), None).await;
         assert_single_issue(&issues, "S3 reports 999 bytes");
     }
 
     #[tokio::test]
-    async fn test_verify_task_detects_storage_class_drift() {
+    async fn verify_should_report_storage_class_drift() {
         let backup = backup_with_one_part(1024);
         let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "STANDARD"), None).await;
         assert_single_issue(&issues, "storage class");
     }
 
     #[tokio::test]
-    async fn test_verify_task_detects_missing_part() {
+    async fn verify_should_report_missing_part() {
         let backup = backup_with_one_part(1024);
         let issues = verify_one(MANIFEST_KEY, backup, None, None).await;
         assert_single_issue(&issues, "is missing");
     }
 
     #[tokio::test]
-    async fn test_verify_task_detects_broken_chain() {
+    async fn verify_should_report_incremental_whose_parent_is_gone() {
         let mut backup = backup_with_one_part(1024);
         backup.level = 1;
         backup.snapshot_name = "bcb_level1.20260602T1430".to_string();
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_task_detects_stale_backup() {
+    async fn verify_should_report_backup_older_than_threshold() {
         let mut backup = backup_with_one_part(1024);
         backup.created_at = now_unix() - 100 * 86400;
         let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "DEEP_ARCHIVE"), Some(30)).await;
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_task_fresh_backup_within_threshold_is_ok() {
+    async fn verify_should_accept_backup_within_threshold() {
         let backup = backup_with_one_part(1024);
         let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "DEEP_ARCHIVE"), Some(30)).await;
         assert!(issues.is_empty(), "issues: {issues:?}");

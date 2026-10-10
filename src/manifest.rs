@@ -180,14 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_round_trip() {
+    fn backup_manifest_should_round_trip_through_yaml() {
         let backup = sample_backup(1, Some("bcb_level0.20260601T1430"));
         let yaml = serde_yaml::to_string(&backup).unwrap();
         assert_eq!(BackupManifest::parse(yaml.as_bytes()).unwrap(), backup);
     }
 
     #[test]
-    fn test_backup_null_parent_round_trip() {
+    fn level0_manifest_should_round_trip_without_parent() {
         let backup = sample_backup(0, None);
         let yaml = serde_yaml::to_string(&backup).unwrap();
         assert!(
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_latest_round_trip() {
+    fn latest_manifest_should_round_trip_through_yaml() {
         let mut latest = LatestManifest::new("src-uuid".to_string());
         latest.levels.insert(
             0,
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_accepts_newer_minor_with_unknown_field() {
+    fn parse_should_accept_newer_minor_version_with_unknown_field() {
         let mut backup = sample_backup(0, None);
         backup.format_version = format!("{}.99", major(FORMAT_VERSION));
         let mut yaml = serde_yaml::to_string(&backup).unwrap();
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rejects_unknown_major_version() {
+    fn parse_should_reject_unknown_major_version() {
         let yaml = "format_version: '999.0'\nsomething_else: 1\n";
         let err = BackupManifest::parse(yaml.as_bytes())
             .unwrap_err()
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rejects_missing_format_version() {
+    fn parse_should_reject_missing_format_version() {
         let mut value = serde_yaml::to_value(sample_backup(0, None)).unwrap();
         value.as_mapping_mut().unwrap().remove("format_version");
         let yaml = serde_yaml::to_string(&value).unwrap();

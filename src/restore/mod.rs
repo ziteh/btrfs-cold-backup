@@ -340,14 +340,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_restore_space_counts_the_receive_only_on_the_same_filesystem() {
+    fn required_restore_space_should_count_receive_only_on_same_filesystem() {
         assert_eq!(required_restore_space(10, 100, false), 10);
         assert_eq!(required_restore_space(10, 100, true), 110);
         assert_eq!(required_restore_space(0, 100, false), 0);
     }
 
     #[test]
-    fn ensure_restore_space_boundaries() {
+    fn ensure_restore_space_should_pass_at_exact_requirement_and_fail_below() {
         let dir = Path::new("/work");
         assert!(ensure_restore_space(50, 50, dir).is_ok());
         assert!(ensure_restore_space(51, 50, dir).is_ok());

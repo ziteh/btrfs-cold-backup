@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_subvolume_path() {
+    fn subvolume_path_should_sanitize_to_underscored_name() {
         for (path, expected) in [
             ("/mnt/data", "mnt_data"),
             ("/mnt/data/", "mnt_data"),
@@ -169,14 +169,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_dot_vs_underscore_no_collision() {
+    fn dot_and_underscore_in_subvolume_should_not_collide() {
         let a = sanitize_subvolume_path(Path::new("/mnt/data.1")).unwrap();
         let b = sanitize_subvolume_path(Path::new("/mnt/data_1")).unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
-    fn test_s3_keys() {
+    fn s3_keys_should_follow_bucket_layout() {
         let l = layout("/mnt/data");
         assert_eq!(
             l.part_key(&id(0), "000000"),
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_paths() {
+    fn local_paths_should_follow_base_dir_layout() {
         let l = layout("/mnt/data");
         assert_eq!(
             l.backup_state_path(2),
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tags() {
+    fn level_and_manifest_tags_should_use_bcb_backup_level_key() {
         assert_eq!(level_tag(2), "bcb-backup-level=2");
         assert_eq!(manifest_tag(), "bcb-backup-level=manifest");
     }

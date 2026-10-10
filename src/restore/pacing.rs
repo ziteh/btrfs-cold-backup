@@ -149,20 +149,20 @@ mod tests {
     }
 
     #[test]
-    fn test_select_retrievals_fills_the_budget_in_order() {
+    fn select_retrievals_should_fill_the_budget_in_order() {
         let parts = [part("0", 10), part("1", 10), part("2", 10)];
         assert_eq!(select_retrievals(&parts, 0, 0, 25), ["0", "1"]);
     }
 
     #[test]
-    fn test_select_retrievals_counts_in_progress_but_not_ready_bytes() {
+    fn select_retrievals_should_count_in_progress_but_not_ready_bytes() {
         let parts = [part("0", 10), part("1", 10)];
         assert_eq!(select_retrievals(&parts, 1000, 10, 25), ["0"]);
         assert!(select_retrievals(&parts, 0, 20, 25).is_empty());
     }
 
     #[test]
-    fn test_select_retrievals_requests_partial_downloads_regardless_of_budget() {
+    fn select_retrievals_should_request_partial_downloads_regardless_of_budget() {
         let parts = [
             Unrequested {
                 partially_downloaded: true,
@@ -174,20 +174,20 @@ mod tests {
     }
 
     #[test]
-    fn test_select_retrievals_forces_the_smallest_part_when_nothing_else_moves() {
+    fn select_retrievals_should_force_smallest_part_when_nothing_else_moves() {
         let parts = [part("0", 30), part("1", 20), part("2", 40)];
         assert_eq!(select_retrievals(&parts, 0, 0, 5), ["1"]);
     }
 
     #[test]
-    fn test_select_retrievals_does_not_force_while_something_is_in_flight() {
+    fn select_retrievals_should_not_force_while_something_is_in_flight() {
         let parts = [part("0", 30)];
         assert!(select_retrievals(&parts, 0, 1, 5).is_empty());
         assert!(select_retrievals(&parts, 1, 0, 5).is_empty());
     }
 
     #[test]
-    fn test_buffer_target_unpaced_is_unbounded() {
+    fn buffer_target_should_be_unbounded_without_pacing() {
         let retrieval = RetrievalOptions {
             days: 1,
             tier: RetrievalTier::Bulk,
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_target_rejects_restore_days_within_lead_window() {
+    fn buffer_target_should_reject_restore_days_within_lead_window() {
         let config = RestoreConfig {
             expected_download_kbps: 8,
             lead_days: Some(2.0),
@@ -209,7 +209,10 @@ mod tests {
             days,
             tier: RetrievalTier::Standard,
         };
-        assert!(retrieval_buffer_target(&config, &retrieval(2)).is_err());
+        let err = retrieval_buffer_target(&config, &retrieval(2))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would expire"), "unexpected error: {err}");
         // 8 kbps is 1000 bytes/s, so two lead days hold 172.8 MB.
         assert_eq!(
             retrieval_buffer_target(&config, &retrieval(3)).unwrap(),

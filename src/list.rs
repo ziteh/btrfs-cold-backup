@@ -45,7 +45,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_backup_id() {
+    fn manifest_key_should_parse_to_its_backup_id() {
         let id =
             manifest_backup_id("backups/manifests/mnt_data/bcb_level12_202606021430/manifest.yaml")
                 .unwrap();
@@ -54,7 +54,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_backup_id_rejects_unrelated_keys() {
+    fn latest_or_unrelated_keys_should_not_parse_as_backup() {
         assert!(manifest_backup_id("backups/manifests/mnt_data/latest.yaml").is_none());
         assert!(
             manifest_backup_id("backups/manifests/mnt_data/bcb_levelX_bad/manifest.yaml").is_none()
@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_backups_sorted_and_filtered() {
+    async fn list_backups_should_skip_latest_and_sort_chronologically() {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
@@ -78,7 +78,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_backups_empty_is_ok() {
+    async fn list_backups_should_return_empty_when_no_manifests() {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| Ok(vec![]));
         assert!(list_backups(&remote, &layout()).await.unwrap().is_empty());

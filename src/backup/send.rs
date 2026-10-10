@@ -198,7 +198,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ensure_enough_space_boundaries() {
+    fn ensure_enough_space_should_pass_at_exact_requirement_and_fail_below() {
         let snap = Path::new("/snap");
         assert!(ensure_enough_space(100, 50, snap).is_ok());
         assert!(ensure_enough_space(50, 50, snap).is_ok());
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_required_space_exceeds_snapshot_size() {
+    fn required_space_should_exceed_snapshot_size() {
         assert!(required_space(1 << 30) > 1 << 30);
     }
 
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_into_parts_round_trips_and_records_hashes() {
+    fn encrypt_into_parts_should_split_encrypt_and_record_each_part() {
         let dir = tempfile::tempdir().unwrap();
         let identity = x25519::Identity::generate();
         let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_into_parts_stream_on_part_boundary_has_no_empty_part() {
+    fn stream_ending_on_part_boundary_should_not_produce_empty_part() {
         let dir = tempfile::tempdir().unwrap();
         let identity = x25519::Identity::generate();
         let data = vec![7u8; 8192];

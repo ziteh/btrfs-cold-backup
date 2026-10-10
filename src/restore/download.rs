@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_part_resumes_from_saved_offset() {
+    async fn download_part_should_resume_from_saved_offset() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("part.age");
         let mut state = state_file(dir.path(), PartDownloadState::NotDownloaded);
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_part_fails_remotely_when_a_range_comes_back_short() {
+    async fn download_part_should_fail_as_remote_error_when_range_comes_back_short() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("part.age");
         let mut state = state_file(dir.path(), PartDownloadState::NotDownloaded);
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_part_restarts_when_file_shorter_than_saved_offset() {
+    async fn download_part_should_restart_when_file_is_shorter_than_saved_offset() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("part.age");
         let mut state = state_file(

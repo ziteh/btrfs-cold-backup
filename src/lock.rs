@@ -49,7 +49,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_acquire_lock() {
+    fn acquire_should_create_the_lock_file() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("test.lock");
 
@@ -58,7 +58,7 @@ mod tests {
     }
 
     #[test]
-    fn test_second_acquire_fails_while_held() {
+    fn second_acquire_should_fail_while_lock_is_held() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("held.lock");
 
@@ -67,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reacquire_after_release() {
+    fn acquire_should_succeed_again_after_release() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("release.lock");
 
@@ -76,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn test_losing_contender_does_not_clobber_pid() {
+    fn losing_contender_should_not_overwrite_holders_pid() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("pid.lock");
 

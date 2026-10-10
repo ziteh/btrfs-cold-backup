@@ -93,7 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_write_atomic_replaces_content_and_leaves_no_tmp() {
+    fn write_atomic_should_replace_content_and_leave_no_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.yaml");
         write_atomic(&path, b"old").unwrap();
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_base_dir_tightens_existing_dir() {
+    fn prepare_base_dir_should_tighten_existing_dir_to_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("bcb");
@@ -116,18 +116,18 @@ mod tests {
     }
 
     #[test]
-    fn test_available_space_bytes_returns_plausible_value() {
+    fn available_space_should_be_positive_for_existing_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(available_space_bytes(dir.path()).unwrap() > 0);
     }
 
     #[test]
-    fn test_available_space_bytes_missing_path_is_err() {
+    fn available_space_should_fail_for_missing_path() {
         assert!(available_space_bytes(Path::new("/nonexistent/path/for/bcb/test")).is_err());
     }
 
     #[test]
-    fn test_device_of_missing_path_uses_existing_ancestor() {
+    fn device_of_missing_path_should_use_existing_ancestor() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             device_of(&dir.path().join("not/yet/created")).unwrap(),
