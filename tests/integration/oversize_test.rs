@@ -11,12 +11,12 @@ use btrfs_cold_backup::{
 
 use crate::common::*;
 
-const LEVEL0: &str = "bcb_level0.20270101T0100";
+pub(crate) const LEVEL0: &str = "bcb_level0.20270101T0100";
 const LEVEL0_PART_SIZE: u64 = 100;
 
 /// A guard that only the size per day or the level 0 ratio can trip: the minimum size is
 /// below the few hundred bytes the test stream encrypts to.
-fn guard(history: usize, fallback_level0_ratio: f64) -> OversizeGuard {
+pub(crate) fn guard(history: usize, fallback_level0_ratio: f64) -> OversizeGuard {
     OversizeGuard {
         history,
         rate_factor: 2.0,
@@ -25,7 +25,7 @@ fn guard(history: usize, fallback_level0_ratio: f64) -> OversizeGuard {
     }
 }
 
-fn config(base_dir: &Path, guard: OversizeGuard) -> Config {
+pub(crate) fn config(base_dir: &Path, guard: OversizeGuard) -> Config {
     let mut config = test_config(base_dir);
     config.s3.storage_class.backup_data = vec![StorageClass::Standard; 4];
     config.oversize_guard = Some(guard);
@@ -48,7 +48,7 @@ fn incremental(snapshot: &str, parent: &str, total_size_bytes: u64) -> BackupMan
 
 /// S3 holding a level 0 of `level0_size` bytes as the only latest entry, and `history`
 /// incrementals, expecting exactly `uploads` part uploads.
-fn remote(
+pub(crate) fn remote(
     base_dir: &Path,
     level0_size: u64,
     history: Vec<BackupManifest>,
@@ -120,7 +120,7 @@ fn remote(
 }
 
 /// Three weekly level 3 backups of `bytes_per_day` bytes per day each.
-fn weekly_history(bytes_per_day: u64) -> Vec<BackupManifest> {
+pub(crate) fn weekly_history(bytes_per_day: u64) -> Vec<BackupManifest> {
     [
         ("bcb_level3.20270108T0100", LEVEL0),
         ("bcb_level3.20270115T0100", LEVEL0),

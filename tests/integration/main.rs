@@ -1,6 +1,7 @@
 mod backup_resume_test;
 mod backup_test;
 mod cli_test;
+mod commands_test;
 mod common;
 mod oversize_test;
 mod prune_test;

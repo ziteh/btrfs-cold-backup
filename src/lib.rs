@@ -21,6 +21,7 @@
 pub mod backup;
 pub mod btrfs;
 pub mod check;
+pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod fsutil;

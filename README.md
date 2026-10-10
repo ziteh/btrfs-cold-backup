@@ -260,7 +260,7 @@ The VM suite is part of `cargo test`. A test skips itself, still reporting "ok",
 - [ ] `bcb check` needs `s3:DeleteObject` to remove its probe object; drop that permission (least privilege, so stolen credentials cannot even place delete markers) by checking write access another way
 - [ ] Optional S3 Object Lock for level 0 data parts only (per-object retention set at upload, e.g. Compliance mode matching the Deep Archive minimum storage duration); needs `s3:PutObjectRetention` and a bucket created with Object Lock enabled
 - [ ] Split IAM policies: a backup policy without `s3:RestoreObject` for the host, and a restore policy kept offline with the private key, so stolen host credentials cannot run up retrieval costs
-- [ ] Unit/integration coverage for code only the VM suite exercises: `S3Backend`, `BtrfsDriver`, and the `main.rs` command functions
+- [ ] Unit/integration coverage for `S3Backend` and `BtrfsDriver`, which only the VM suite exercises (e.g. a fake `btrfs` on `PATH`, an in-process fake S3 endpoint)
 
 ## License
 

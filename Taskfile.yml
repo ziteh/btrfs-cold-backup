@@ -43,7 +43,7 @@ tasks:
   coverage:
     desc: Run unit and integration tests with the CI coverage floor
     cmds:
-      - cargo llvm-cov --lib --bins --test integration --fail-under-lines 70
+      - cargo llvm-cov --lib --bins --test integration --fail-under-lines 79
 
   vm:
     desc: Run the VM tests in a Multipass VM (pass --fresh to recreate the VM)
@@ -77,7 +77,7 @@ tasks:
     cmds:
       - pnpx cspell .
 
-  got-hooks:
+  git-hooks:
     desc: Install the git hooks managed by lefthook
     cmds:
       - lefthook install
