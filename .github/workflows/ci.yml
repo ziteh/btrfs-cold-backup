@@ -33,11 +33,11 @@ jobs:
       # separately (uninstrumented) in the vm job below, so their coverage isn't reflected in
       # this number.
       #
-      # The 70% floor is a regression guard, not a target: it's set a couple points below what
+      # The 77% floor is a regression guard, not a target: it's set a couple points below what
       # this scope currently measures. Raise it as coverage improves; don't lower it to make a
       # failing PR pass.
       - name: Test with coverage
-        run: cargo llvm-cov --lib --bins --test integration --fail-under-lines 70
+        run: cargo llvm-cov --lib --bins --test integration --fail-under-lines 77
 
   vm:
     runs-on: ubuntu-latest
@@ -61,7 +61,7 @@ jobs:
       - name: Set up btrfs loopback mount and S3-compatible test server
         run: sudo bash scripts/setup-vm.sh
 
-      - name: Build bcb binary (dev profile, keeps BCB_TEST_PAUSE_* hooks compiled in)
+      - name: Build bcb binary (dev profile, keeps the BCB_TEST_* hooks compiled in)
         run: cargo build --bin bcb
 
       - name: Build vm test binary
