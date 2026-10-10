@@ -28,6 +28,7 @@ pub mod layout;
 pub mod list;
 pub mod lock;
 pub mod manifest;
+pub mod prune;
 pub mod remote;
 pub mod restore;
 pub mod state;

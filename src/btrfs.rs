@@ -28,6 +28,7 @@ pub trait BtrfsOps: Send + Sync {
     async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids>;
     /// Runs `btrfs receive` into `target_dir`, feeding it `stream`.
     async fn receive(&self, target_dir: &Path, stream: Box<dyn Read + Send>) -> Result<()>;
+    async fn delete_subvolume(&self, path: &Path) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +280,20 @@ impl BtrfsOps for BtrfsDriver {
         }
         parse_subvolume_uuids(&String::from_utf8_lossy(&output.stdout))
             .map_err(|e| anyhow!("{path:?}: {e}"))
+    }
+
+    async fn delete_subvolume(&self, path: &Path) -> Result<()> {
+        let output = Command::new("btrfs")
+            .args(["subvolume", "delete", path_to_str(path, "path")?])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "failed to delete subvolume {path:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
     }
 
     async fn receive(&self, target_dir: &Path, mut stream: Box<dyn Read + Send>) -> Result<()> {

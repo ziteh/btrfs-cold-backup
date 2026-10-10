@@ -118,6 +118,7 @@ bcb genkey --output ./bcb_private.key   # generate an age key pair; store the pr
 sudo bcb check                          # validate config, binaries and S3 connectivity
 bcb backup --level 0                    # back up every enabled task
 bcb list                                # list backups on S3
+bcb prune-snapshots --dry-run           # list local snapshots no backup needs
 bcb verify                              # audit backups without triggering retrieval
 bcb restore --task <name> --level 0 --date <YYYYMMDDHHMM> --target <path> --private-key <key>
 ```
@@ -169,7 +170,8 @@ bcb_level<N>.<YYYYMMDD>T<hhmm>
 ```
 
 - The snapshot must originate from the task's `subvolume` (btrfs Parent UUID). If the source is replaced (e.g. new disk), backups fail until a level 0 backup starts a new chain.
-- A level-N (N > 0) snapshot must be newer than its parent, and the parent must exist locally. In the contrib setup, `snapshot_preserve_min latest` retains it and `bcb-run` prunes only after a successful backup.
+- A level-N (N > 0) snapshot must be newer than its parent, and the parent must exist locally.
+- Let `bcb prune-snapshots` delete old snapshots instead of btrbk (no `snapshot_preserve*` in the btrbk config), since only bcb knows which ones are still needed. Per task it keeps the snapshot of each `latest.yaml` entry, the target and parent of each unfinished backup, and the newest snapshot of each level. Snapshots not named `bcb_level<N>.<YYYYMMDD>T<hhmm>` or not taken from the task's `subvolume` are never touched. If `latest.yaml` is missing, nothing is deleted; if it belongs to another subvolume or names a snapshot that isn't local, the task fails and nothing is deleted. `--dry-run` lists what would be deleted.
 - Timestamps (snapshot names, `--date`, manifests) are local time without a zone. On hosts observing DST, the repeated hour can misorder or collide snapshots; run bcb on a host without DST.
 - btrbk's same-minute suffix (`_<n>`) is unsupported. bcb fails and names the snapshot; delete or rename it.
 

@@ -9,7 +9,7 @@ use btrfs_cold_backup::{
     manifest::{LatestEntry, LatestManifest},
     remote::ObjectMetadata,
     state::{BackupState, BackupTarget, PartRecord, SentStream, StateFile},
-    timestamp::{BackupId, Timestamp},
+    timestamp::BackupId,
 };
 use tokio::io::AsyncRead;
 
@@ -292,13 +292,11 @@ async fn level2_incremental_should_use_level1_as_parent() {
 fn latest_with(snapshot_names: &[&str]) -> Vec<u8> {
     let mut latest = LatestManifest::new(SOURCE_UUID.to_string());
     for name in snapshot_names {
-        let level = name["bcb_level".len()..name.find('.').unwrap()]
-            .parse()
-            .unwrap();
+        let id = BackupId::from_snapshot_name(name).unwrap();
         latest.levels.insert(
-            level,
+            id.level,
             LatestEntry {
-                timestamp: Timestamp::from_snapshot_name(name).unwrap(),
+                timestamp: id.timestamp,
                 snapshot_name: name.to_string(),
                 snapshot_uuid: snap_uuid(name),
             },
@@ -405,12 +403,7 @@ async fn level1_should_fail_when_latest_has_no_lower_level() {
 /// Saves an unfinished backup of `snapshot` against `parent`, sent as one part that is not
 /// yet uploaded, as an interrupted run of its level leaves it. Returns its state's path.
 fn save_unfinished(base_dir: &Path, snapshot: &str, parent: Option<&str>) -> PathBuf {
-    let id = BackupId {
-        level: snapshot["bcb_level".len()..snapshot.find('.').unwrap()]
-            .parse()
-            .unwrap(),
-        timestamp: Timestamp::from_snapshot_name(snapshot).unwrap(),
-    };
+    let id = BackupId::from_snapshot_name(snapshot).unwrap();
     let task_dir = base_dir.join("backup/mnt_data_movies");
     let parts_dir = task_dir.join(id.dir_name());
     std::fs::create_dir_all(&parts_dir).unwrap();

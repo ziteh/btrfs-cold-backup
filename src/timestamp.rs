@@ -159,6 +159,16 @@ impl BackupId {
         )
     }
 
+    /// The backup a btrbk snapshot name, `bcb_level<N>.<YYYYMMDD>T<hhmm>`, would become.
+    pub fn from_snapshot_name(name: &str) -> Result<Self> {
+        let timestamp = Timestamp::from_snapshot_name(name)?;
+        let level = name[SNAPSHOT_PREFIX.len()..]
+            .split_once('.')
+            .and_then(|(level, _)| level.parse().ok())
+            .ok_or_else(|| anyhow!("invalid level in snapshot name '{name}'"))?;
+        Ok(Self { level, timestamp })
+    }
+
     /// Inverse of [`BackupId::dir_name`].
     pub fn parse_dir_name(dir: &str) -> Option<Self> {
         let rest = dir.strip_prefix(SNAPSHOT_PREFIX)?;
@@ -185,6 +195,16 @@ mod tests {
 
     fn ts(s: &str) -> Timestamp {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_backup_id_from_snapshot_name() {
+        let id = BackupId::from_snapshot_name("bcb_level12.20260602T1430").unwrap();
+        assert_eq!(id.level, 12);
+        assert_eq!(id.timestamp, ts("2026-06-02T14:30"));
+        assert!(BackupId::from_snapshot_name("bcb_levelX.20260602T1430").is_err());
+        assert!(BackupId::from_snapshot_name("bcb_level1.20260602T1430_1").is_err());
+        assert!(BackupId::from_snapshot_name("other.20260602T1430").is_err());
     }
 
     #[test]

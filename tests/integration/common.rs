@@ -28,6 +28,7 @@ mock! {
         async fn send_incremental(&self, parent: &Path, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
         async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids>;
         async fn receive(&self, target_dir: &Path, stream: Box<dyn Read + Send>) -> Result<()>;
+        async fn delete_subvolume(&self, path: &Path) -> Result<()>;
     }
 }
 

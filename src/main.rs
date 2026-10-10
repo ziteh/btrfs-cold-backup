@@ -10,6 +10,7 @@ use btrfs_cold_backup::{
     layout::TaskLayout,
     list::list_backups,
     lock::InstanceLock,
+    prune::prune_task,
     remote::{RetrievalTier, S3Backend},
     restore::{RestoreRequest, RetrievalOptions, restore_task},
     timestamp::Timestamp,
@@ -70,6 +71,16 @@ enum Commands {
         max_age_days: Option<u64>,
     },
 
+    /// Delete the local snapshots no backup needs any more.
+    PruneSnapshots {
+        /// Limit to a single task by name (default: all enabled tasks).
+        #[arg(long)]
+        task: Option<String>,
+        /// List what would be deleted without deleting it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Run a backup.
     Backup {
         /// Backup level: 0 is full, N is incremental relative to the newest lower-level backup.
@@ -118,7 +129,7 @@ async fn main() -> Result<()> {
     {
         let file_log_dir = matches!(
             cli.command,
-            Commands::Backup { .. } | Commands::Restore { .. }
+            Commands::Backup { .. } | Commands::PruneSnapshots { .. } | Commands::Restore { .. }
         )
         .then(|| config.base_dir.join("log"));
 
@@ -134,6 +145,9 @@ async fn main() -> Result<()> {
             cmd_verify(&config, task.as_deref(), max_age_days).await
         }
         Commands::Backup { level, task } => cmd_backup(&config, level, task.as_deref()).await,
+        Commands::PruneSnapshots { task, dry_run } => {
+            cmd_prune_snapshots(&config, task.as_deref(), dry_run).await
+        }
         Commands::Restore {
             task,
             level,
@@ -268,6 +282,32 @@ async fn cmd_backup(config: &Config, level: u32, task: Option<&str>) -> Result<(
     aggregate_failures("backup", &failed)
 }
 
+async fn cmd_prune_snapshots(config: &Config, task: Option<&str>, dry_run: bool) -> Result<()> {
+    let (remote, _lock) = acquire_runtime(config).await?;
+    let tasks = enabled_tasks(&config.tasks, task);
+    if tasks.is_empty() {
+        return Err(anyhow!("no matching enabled tasks found"));
+    }
+
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    let mut failed = Vec::new();
+    for t in tasks {
+        match prune_task(config, t, &BtrfsDriver, &remote, dry_run).await {
+            Ok(pruned) => {
+                for name in pruned {
+                    println!("{}: {verb} {name}", t.name);
+                }
+            }
+            Err(e) => {
+                tracing::error!(task = %t.name, error = format!("{e:#}"), "prune failed");
+                eprintln!("{}: prune failed: {e:#}", t.name);
+                failed.push(t.name.clone());
+            }
+        }
+    }
+    aggregate_failures("prune-snapshots", &failed)
+}
+
 async fn cmd_restore(config: &Config, task: &str, request: &RestoreRequest) -> Result<()> {
     let (remote, _lock) = acquire_runtime(config).await?;
     let t = config
@@ -321,7 +361,7 @@ fn enabled_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
 }
 
 /// The aggregate error of a command that ran every selected task, or Ok if none failed.
-/// List, verify and backup run every task to completion rather than stopping at the first
+/// List, verify, prune and backup run every task to completion rather than stopping at the first
 /// failure: one failing task must never keep the others from being attempted.
 fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
     if failed.is_empty() {
@@ -331,7 +371,7 @@ fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
     }
 }
 
-/// What backup and restore need before touching anything: the external executables, a
+/// What backup, prune and restore need before touching anything: the external executables, a
 /// prepared base_dir, and the lock that keeps other bcb instances out.
 async fn acquire_runtime(config: &Config) -> Result<(S3Backend, InstanceLock)> {
     check::check_binaries()?;

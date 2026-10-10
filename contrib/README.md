@@ -22,6 +22,10 @@ the start. A run that keeps getting skipped shows up in `bcb verify --max-age-da
 lock covers `bcb-run` only: a timer firing during a manual `bcb restore` still fails on
 bcb's own lock and alerts, so pause the timers for long manual restores.
 
+btrbk only creates snapshots; `bcb prune-snapshots` deletes those no backup needs, so the
+btrbk configs set no `snapshot_preserve*`. For local recovery points, run a separate btrbk
+instance with its own `snapshot_name` and `snapshot_dir`.
+
 ## `snapshot_create` for incremental levels (level 1+)
 
 `bcb-level1.conf` ships with `snapshot_create always`. `onchange` is the alternative if the
@@ -31,7 +35,6 @@ subvolume can go long stretches without changing:
 | --- | --- | --- |
 | When nothing changed | Creates a snapshot anyway; bcb still uploads a near-empty incremental (S3 storage-class minimum object size/duration means the extra cost is negligible — a fraction of a cent per year even weekly) | btrbk creates nothing; bcb idempotently skips the upload |
 | Backup freshness monitoring | `bcb verify --max-age-days` stays meaningful: every scheduled run produces a new backup, so "no new backup" reliably means the schedule broke | `bcb verify --max-age-days` can false-positive on legitimately unchanged data — rely on a separate liveness signal (e.g. the dead man's switch in [../docs/periodic-backup-example.md](../docs/periodic-backup-example.md)) instead, since `bcb-run` still exits 0 on a skip |
-| Local recovery points | Fixed cadence: `snapshot_preserve 12m` keeps one per month regardless of whether data changed | Can leave gaps: no new snapshot at all when nothing changed, so local recovery-point granularity isn't guaranteed |
 | Chain length over time | Grows by one entry per schedule tick, even when empty | Grows only when there's real data, so restore chains stay shorter |
 | Depends on | Nothing beyond bcb/btrbk's normal behavior | btrbk's change detection (btrfs generation/transid based, not just mtime — reliable, but bcb has no way to cross-check it) |
 
