@@ -164,6 +164,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_identity_rejects_garbage() {
+        let err = parse_identity("not a key").err().unwrap().to_string();
+        assert!(err.contains("private key"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_ensure_key_pair() {
         let identity = x25519::Identity::generate();
         let public_key = identity.to_public().to_string();

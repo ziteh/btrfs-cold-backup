@@ -103,7 +103,7 @@ async fn check_newest_snapshot_origin<B: BtrfsOps>(
 mod tests {
     use super::*;
     use crate::btrfs::{MockBtrfsOps, SubvolumeUuids};
-    use crate::config::{S3Config, S3StorageClass, Task};
+    use crate::config::{S3Config, StorageClass, StorageClasses, Task};
     use crate::remote::MockRemoteBackend;
     use std::os::unix::fs::PermissionsExt;
 
@@ -160,14 +160,11 @@ mod tests {
                 bucket: "my-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 prefix: "backups/".to_string(),
-                endpoint: String::new(),
-                storage_class: S3StorageClass {
-                    manifest: "STANDARD".to_string(),
-                    backup_data: vec!["DEEP_ARCHIVE".to_string()],
+                storage_class: StorageClasses {
+                    manifest: StorageClass::Standard,
+                    backup_data: vec![StorageClass::DeepArchive],
                 },
-                retry: Default::default(),
-                upload_speed_limit_kbps: 0,
-                restore: Default::default(),
+                ..Default::default()
             },
             tasks: vec![Task {
                 name: "test".to_string(),

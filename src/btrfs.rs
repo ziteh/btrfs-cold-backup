@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use std::io;
+use anyhow::{Context as _, Result, anyhow};
+use std::io::{self, Read};
 use std::path::Path;
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::oneshot;
+
+use crate::timestamp::SNAPSHOT_PREFIX;
 
 #[allow(async_fn_in_trait)]
 #[cfg_attr(test, mockall::automock)]
@@ -19,6 +21,8 @@ pub trait BtrfsOps: Send + Sync {
         snapshot: &Path,
     ) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
     async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids>;
+    /// Runs `btrfs receive` into `target_dir`, feeding it `stream`.
+    async fn receive(&self, target_dir: &Path, stream: Box<dyn Read + Send>) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,12 +71,12 @@ fn parse_subvolume_uuids(show_output: &str) -> Result<SubvolumeUuids> {
     Ok(SubvolumeUuids { uuid, parent_uuid })
 }
 
-// Reads btrfs-send stdout; after EOF, blocks until the child exits and propagates
-// a non-zero exit code as an io::Error.  The child is awaited in a spawned task
-// so that poll_read can properly park and be woken rather than racing with try_wait.
-// Dropping BtrfsStream drops _kill_tx, which closes the kill channel and signals
-// the spawned task to SIGKILL the child — handles both early cancellation and a
-// btrfs process that ignores EPIPE.
+/// The stdout of `btrfs send`. At EOF it waits for the process to exit and turns a failed
+/// exit into a read error, so a stream cut short by a failing send can't pass for complete.
+///
+/// The process is awaited in a spawned task, so `poll_read` can park and be woken instead of
+/// polling `try_wait`. Dropping the stream drops `_kill_tx`, which tells that task to kill the
+/// process: this covers both a reader that stops early and a send that ignores EPIPE.
 struct BtrfsStream {
     stdout: Pin<Box<ChildStdout>>,
     status_rx: oneshot::Receiver<io::Result<(ExitStatus, Vec<u8>)>>,
@@ -149,6 +153,16 @@ fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("{label} path is not valid UTF-8"))
 }
 
+/// SIGKILL bypasses Drop, so kill_on_drop alone can't stop `btrfs send` from outliving a
+/// killed bcb; PR_SET_PDEATHSIG asks the kernel to kill it when bcb dies.
+#[cfg(target_os = "linux")]
+fn die_with_parent() -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
     let mut cmd = Command::new("btrfs");
     cmd.args(args)
@@ -157,7 +171,7 @@ fn spawn_send(args: &[&str]) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
         .kill_on_drop(true);
     #[cfg(target_os = "linux")]
     unsafe {
-        cmd.pre_exec(crate::util::die_with_parent);
+        cmd.pre_exec(die_with_parent);
     }
     let mut child = cmd.spawn()?;
 
@@ -221,7 +235,7 @@ impl BtrfsOps for BtrfsDriver {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("bcb_level") && entry.file_type().await?.is_dir() {
+            if name_str.starts_with(SNAPSHOT_PREFIX) && entry.file_type().await?.is_dir() {
                 names.push(name_str.into_owned());
             }
         }
@@ -260,6 +274,40 @@ impl BtrfsOps for BtrfsDriver {
         }
         parse_subvolume_uuids(&String::from_utf8_lossy(&output.stdout))
             .map_err(|e| anyhow!("{path:?}: {e}"))
+    }
+
+    async fn receive(&self, target_dir: &Path, mut stream: Box<dyn Read + Send>) -> Result<()> {
+        tokio::fs::create_dir_all(target_dir)
+            .await
+            .with_context(|| format!("failed to create {target_dir:?}"))?;
+        let target_dir = target_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut child = std::process::Command::new("btrfs")
+                .arg("receive")
+                .arg(&target_dir)
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("failed to run btrfs receive")?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("failed to open btrfs receive stdin"))?;
+            let written = io::copy(&mut stream, &mut stdin);
+            // Closing stdin ends the stream for receive.
+            drop(stdin);
+
+            // Checked first: a receive that died makes the write fail too, and its stderr says
+            // why.
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("btrfs receive failed: {}", stderr.trim()));
+            }
+            written.context("failed to feed the stream to btrfs receive")?;
+            Ok(())
+        })
+        .await?
     }
 }
 

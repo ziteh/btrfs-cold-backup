@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use btrfs_cold_backup::{
-    config::{Config, RestoreConfig, S3Config, S3StorageClass, Task},
+    config::{Config, RestoreConfig, S3Config, StorageClass, StorageClasses, Task},
     crypto::generate_key_pair,
 };
 
@@ -34,9 +34,9 @@ fn write_valid_config(dir: &Path, age_public_key: &str) -> std::path::PathBuf {
         s3: S3Config {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
-            storage_class: S3StorageClass {
-                manifest: "STANDARD".to_string(),
-                backup_data: vec!["STANDARD".to_string()],
+            storage_class: StorageClasses {
+                manifest: StorageClass::Standard,
+                backup_data: vec![StorageClass::Standard],
             },
             restore: RestoreConfig::default(),
             ..Default::default()

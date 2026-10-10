@@ -1,89 +1,68 @@
 use anyhow::Result;
 
-use crate::{
-    config::{Config, Task},
-    remote::RemoteBackend,
-    util::{parse_backup_dir_name, sanitize_subvolume_path},
-};
+use crate::{layout::TaskLayout, remote::RemoteBackend, timestamp::BackupId};
 
-pub struct BackupEntry {
-    pub level: u32,
-    pub timestamp: String,
+/// The backup in whose manifest directory `key` lies, if it is a backup manifest's key.
+fn manifest_backup_id(key: &str) -> Option<BackupId> {
+    let dir = key.strip_suffix("/manifest.yaml")?.rsplit('/').next()?;
+    BackupId::parse_dir_name(dir)
 }
 
-fn parse_entry(key: &str) -> Option<BackupEntry> {
-    let dir = key.split('/').find(|s| s.starts_with("bcb_level"))?;
-    let (level, timestamp) = parse_backup_dir_name(dir)?;
-    Some(BackupEntry { level, timestamp })
-}
-
+/// Every backup of the task that has a manifest on S3, oldest first.
 pub async fn list_backups<R: RemoteBackend>(
-    config: &Config,
-    task: &Task,
     remote: &R,
-) -> Result<Vec<BackupEntry>> {
-    let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let prefix = format!("{}manifests/{}/", config.s3.prefix, sanitized);
-    let keys = remote.list_with_prefix(&prefix).await?;
-
-    let mut entries: Vec<BackupEntry> = keys
-        .iter()
-        .filter(|k| k.ends_with("/manifest.yaml"))
-        .filter_map(|k| parse_entry(k))
-        .collect();
-
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.level.cmp(&b.level)));
-
-    Ok(entries)
+    layout: &TaskLayout,
+) -> Result<Vec<BackupId>> {
+    let keys = remote.list_with_prefix(&layout.manifests_prefix()).await?;
+    let mut ids: Vec<BackupId> = keys.iter().filter_map(|k| manifest_backup_id(k)).collect();
+    ids.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.level.cmp(&b.level)));
+    Ok(ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, Task};
     use crate::remote::MockRemoteBackend;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_parse_entry_valid_key() {
-        let entry = parse_entry("backups/manifests/mnt_data/bcb_level0_202606021430/manifest.yaml")
-            .unwrap();
-        assert_eq!(entry.level, 0);
-        assert_eq!(entry.timestamp, "2026-06-02T14:30");
-    }
-
-    #[test]
-    fn test_parse_entry_higher_level() {
-        let entry =
-            parse_entry("backups/manifests/mnt_data/bcb_level12_202612251015/manifest.yaml")
-                .unwrap();
-        assert_eq!(entry.level, 12);
-    }
-
-    #[test]
-    fn test_parse_entry_rejects_unrelated_keys() {
-        assert!(parse_entry("backups/manifests/mnt_data/latest.yaml").is_none());
-        assert!(parse_entry("backups/manifests/mnt_data/bcb_levelX_bad/manifest.yaml").is_none());
-        assert!(parse_entry("unrelated/key").is_none());
-    }
-
-    fn test_task() -> Task {
-        Task {
-            name: "data".to_string(),
-            description: String::new(),
-            subvolume: PathBuf::from("/mnt/data"),
-            snapshot_dir: PathBuf::from("/mnt/.snapshots"),
-            enabled: true,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_list_backups_sorted_and_filtered() {
+    fn layout() -> TaskLayout {
         let config = Config {
             base_dir: PathBuf::from("/tmp"),
             age_public_key: String::new(),
             s3: Default::default(),
             tasks: vec![],
         };
+        let task = Task {
+            name: "data".to_string(),
+            description: String::new(),
+            subvolume: PathBuf::from("/mnt/data"),
+            snapshot_dir: PathBuf::from("/mnt/.snapshots"),
+            enabled: true,
+        };
+        TaskLayout::new(&config, &task).unwrap()
+    }
+
+    #[test]
+    fn test_manifest_backup_id() {
+        let id =
+            manifest_backup_id("backups/manifests/mnt_data/bcb_level12_202606021430/manifest.yaml")
+                .unwrap();
+        assert_eq!(id.level, 12);
+        assert_eq!(id.timestamp.as_str(), "2026-06-02T14:30");
+    }
+
+    #[test]
+    fn test_manifest_backup_id_rejects_unrelated_keys() {
+        assert!(manifest_backup_id("backups/manifests/mnt_data/latest.yaml").is_none());
+        assert!(
+            manifest_backup_id("backups/manifests/mnt_data/bcb_levelX_bad/manifest.yaml").is_none()
+        );
+        assert!(manifest_backup_id("unrelated/key").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_backups_sorted_and_filtered() {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| {
             Ok(vec![
@@ -93,25 +72,14 @@ mod tests {
             ])
         });
 
-        let entries = list_backups(&config, &test_task(), &remote).await.unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].level, 0);
-        assert_eq!(entries[1].level, 1);
-        assert!(entries[0].timestamp < entries[1].timestamp);
+        let ids = list_backups(&remote, &layout()).await.unwrap();
+        assert_eq!(ids.iter().map(|id| id.level).collect::<Vec<_>>(), [0, 1]);
     }
 
     #[tokio::test]
     async fn test_list_backups_empty_is_ok() {
-        let config = Config {
-            base_dir: PathBuf::from("/tmp"),
-            age_public_key: String::new(),
-            s3: Default::default(),
-            tasks: vec![],
-        };
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| Ok(vec![]));
-
-        let entries = list_backups(&config, &test_task(), &remote).await.unwrap();
-        assert!(entries.is_empty());
+        assert!(list_backups(&remote, &layout()).await.unwrap().is_empty());
     }
 }

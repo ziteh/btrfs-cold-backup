@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use btrfs_cold_backup::{
     btrfs::{BtrfsOps, SubvolumeUuids},
-    config::{Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task},
-    manifest::{Backup, FORMAT_VERSION, LatestBackup, LatestManifest, PartInfo, SystemInfo},
-    remote::{ObjectMetadata, RemoteBackend, RestoreStatus, RestoreStatusDetail, RestoreTier},
-    restore::RetrievalOptions,
+    config::{Config, RestoreConfig, S3Config, S3RetryConfig, StorageClass, StorageClasses, Task},
+    manifest::{
+        BackupManifest, FORMAT_VERSION, LatestEntry, LatestManifest, ManifestPart, SystemInfo,
+    },
+    remote::{ObjectMetadata, RemoteBackend, Retrieval, RetrievalStatus, RetrievalTier},
+    restore::{RestoreProgress, RestoreRequest, RetrievalOptions, restore_task},
 };
 use mockall::mock;
 use tokio::io::AsyncRead;
@@ -25,6 +27,7 @@ mock! {
         async fn send_full(&self, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
         async fn send_incremental(&self, parent: &Path, snapshot: &Path) -> Result<Box<dyn AsyncRead + Send + Unpin>>;
         async fn subvolume_uuids(&self, path: &Path) -> Result<SubvolumeUuids>;
+        async fn receive(&self, target_dir: &Path, stream: Box<dyn Read + Send>) -> Result<()>;
     }
 }
 
@@ -32,14 +35,13 @@ mock! {
     pub Remote {}
     #[allow(async_fn_in_trait)]
     impl RemoteBackend for Remote {
-        async fn upload_bytes(&self, key: &str, data: Vec<u8>, storage_class: &str, tags: &str) -> Result<()>;
-        async fn upload_file(&self, key: &str, path: &Path, storage_class: &str, tags: &str) -> Result<()>;
-        async fn exists(&self, key: &str) -> Result<bool>;
+        async fn upload_bytes(&self, key: &str, data: Vec<u8>, storage_class: StorageClass, tags: &str) -> Result<()>;
+        async fn upload_file(&self, key: &str, path: &Path, storage_class: StorageClass, tags: &str) -> Result<()>;
         async fn download(&self, key: &str) -> Result<Vec<u8>>;
         async fn download_range_to_file(&self, key: &str, start: u64, end: u64, path: &Path) -> Result<()>;
-        async fn restore_status_detail(&self, key: &str) -> Result<RestoreStatusDetail>;
-        async fn request_restore(&self, key: &str, days: i32, tier: RestoreTier) -> Result<()>;
         async fn head_metadata(&self, key: &str) -> Result<Option<ObjectMetadata>>;
+        async fn retrieval_status(&self, key: &str) -> Result<Retrieval>;
+        async fn request_retrieval(&self, key: &str, days: i32, tier: RetrievalTier) -> Result<()>;
         async fn verify_credentials(&self) -> Result<()>;
         async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
     }
@@ -49,11 +51,6 @@ mock! {
 pub static TEST_IDENTITY: std::sync::LazyLock<age::x25519::Identity> =
     std::sync::LazyLock::new(age::x25519::Identity::generate);
 
-pub fn test_private_key() -> String {
-    use secrecy::ExposeSecret;
-    TEST_IDENTITY.to_string().expose_secret().to_string()
-}
-
 pub fn test_public_key() -> String {
     TEST_IDENTITY.to_public().to_string()
 }
@@ -61,7 +58,7 @@ pub fn test_public_key() -> String {
 pub fn retrieval() -> RetrievalOptions {
     RetrievalOptions {
         days: 1,
-        tier: RestoreTier::Standard,
+        tier: RetrievalTier::Standard,
     }
 }
 
@@ -74,9 +71,9 @@ pub fn test_config(base_dir: &Path) -> Config {
             region: "us-east-1".to_string(),
             prefix: "backups/".to_string(),
             endpoint: String::new(),
-            storage_class: S3StorageClass {
-                manifest: "STANDARD".to_string(),
-                backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],
+            storage_class: StorageClasses {
+                manifest: StorageClass::Standard,
+                backup_data: vec![StorageClass::Standard, StorageClass::Standard],
             },
             retry: S3RetryConfig::default(),
             upload_speed_limit_kbps: 0,
@@ -130,8 +127,8 @@ pub fn yaml<T: serde::Serialize>(value: &T) -> Vec<u8> {
     serde_yaml::to_string(value).unwrap().into_bytes()
 }
 
-pub fn part(index: &str, size_bytes: u64, blake3: &str) -> PartInfo {
-    PartInfo {
+pub fn part(index: &str, size_bytes: u64, blake3: &str) -> ManifestPart {
+    ManifestPart {
         index: index.to_string(),
         size_bytes,
         blake3: blake3.to_string(),
@@ -140,11 +137,11 @@ pub fn part(index: &str, size_bytes: u64, blake3: &str) -> PartInfo {
 
 /// Manifest of a level 0 backup of `bcb_level0.20260602T1430` of movies, encrypted to
 /// TEST_IDENTITY. Tests override the fields they exercise.
-pub fn manifest(parts: Vec<PartInfo>) -> Backup {
+pub fn manifest(parts: Vec<ManifestPart>) -> BackupManifest {
     let snapshot_name = "bcb_level0.20260602T1430";
-    Backup {
+    BackupManifest {
         format_version: FORMAT_VERSION.to_string(),
-        timestamp: "2026-06-02T14:30".to_string(),
+        timestamp: "2026-06-02T14:30".parse().unwrap(),
         created_at: 0,
         level: 0,
         snapshot_name: snapshot_name.to_string(),
@@ -164,8 +161,8 @@ pub fn latest_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
     let mut latest = LatestManifest::new(SOURCE_UUID.to_string());
     latest.levels.insert(
         level,
-        LatestBackup {
-            timestamp: "2026-06-01T14:30".to_string(),
+        LatestEntry {
+            timestamp: "2026-06-01T14:30".parse().unwrap(),
             snapshot_name: snapshot_name.to_string(),
             snapshot_uuid: snap_uuid(snapshot_name),
         },
@@ -176,7 +173,7 @@ pub fn latest_manifest_yaml(snapshot_name: &str, level: u32) -> Vec<u8> {
 /// `payload` encrypted to TEST_IDENTITY, as one part of a send stream that holds only it.
 pub struct EncryptedPart {
     pub bytes: Vec<u8>,
-    pub part: PartInfo,
+    pub part: ManifestPart,
     pub stream_blake3: String,
 }
 
@@ -207,15 +204,31 @@ pub fn decrypt(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn status(status: RestoreStatus) -> RestoreStatusDetail {
-    RestoreStatusDetail {
+pub fn status(status: RetrievalStatus) -> Retrieval {
+    Retrieval {
         status,
         expires_at: None,
     }
 }
 
-pub fn ready(_: &str) -> Result<RestoreStatusDetail> {
-    Ok(status(RestoreStatus::Ready))
+pub fn ready(_: &str) -> Result<Retrieval> {
+    Ok(status(RetrievalStatus::Ready))
+}
+
+/// A HEAD answer for an object that does or doesn't exist.
+pub fn head(exists: bool) -> Result<Option<ObjectMetadata>> {
+    Ok(exists.then(|| ObjectMetadata {
+        size_bytes: 0,
+        storage_class: "STANDARD".to_string(),
+    }))
+}
+
+/// Answers HEADs of every manifest and latest manifest as missing.
+pub fn expect_no_manifests(remote: &mut MockRemote) {
+    remote
+        .expect_head_metadata()
+        .withf(|key| key.contains("manifests/"))
+        .returning(|_| head(false));
 }
 
 /// Answers HEADs of this backup's parts as S3 would after good uploads: with the size of the
@@ -244,4 +257,44 @@ pub fn expect_parts_on_s3(remote: &mut MockRemote, base_dir: &Path) {
 /// The restore work dir of movies' level 0 backup restored with `--date 20260602`.
 pub fn restore_work_dir(base_dir: &Path) -> PathBuf {
     base_dir.join("restore/mnt_data_movies/bcb_level0_202606020000")
+}
+
+/// A restore of movies' level `level` backup of 2026-06-02T00:00 into
+/// `<base_dir>/restore_target`, decrypting with TEST_IDENTITY.
+pub fn restore_request(base_dir: &Path, level: u32) -> RestoreRequest {
+    RestoreRequest {
+        level,
+        timestamp: "2026-06-02T00:00".parse().unwrap(),
+        target_dir: base_dir.join("restore_target"),
+        identity: TEST_IDENTITY.clone(),
+        retrieval: retrieval(),
+    }
+}
+
+/// A btrfs whose receive fails, as it would on a machine without btrfs.
+pub fn btrfs_without_receive() -> MockBtrfs {
+    let mut btrfs = MockBtrfs::new();
+    btrfs.expect_receive().returning(|_, _| {
+        Err(anyhow::anyhow!(
+            "btrfs receive failed: not a btrfs filesystem"
+        ))
+    });
+    btrfs
+}
+
+pub async fn restore(
+    config: &Config,
+    request: &RestoreRequest,
+    btrfs: &MockBtrfs,
+    remote: &MockRemote,
+) -> Result<RestoreProgress> {
+    restore_task(config, &movies_task(), request, btrfs, remote).await
+}
+
+/// The restore state saved in `work_dir`.
+pub fn saved_restore_state(work_dir: &Path) -> btrfs_cold_backup::state::RestoreState {
+    btrfs_cold_backup::state::StateFile::load(work_dir.join("state.yaml"))
+        .unwrap()
+        .expect("no restore state saved")
+        .data
 }

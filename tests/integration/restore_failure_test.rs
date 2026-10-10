@@ -3,9 +3,9 @@ use std::path::Path;
 use anyhow::Result;
 use btrfs_cold_backup::{
     config::RestoreConfig,
-    manifest::Backup,
-    remote::{RestoreStatus, RestoreStatusDetail, RestoreTier},
-    restore::{RestoreProgress, RetrievalOptions, restore_task},
+    manifest::BackupManifest,
+    remote::{RemoteError, Retrieval, RetrievalStatus, RetrievalTier},
+    restore::{RestoreProgress, RestoreRequest, RetrievalOptions},
 };
 
 use crate::common::*;
@@ -17,7 +17,6 @@ use crate::common::*;
 async fn part_download_failure_should_not_abort_remaining_parts() {
     let work_dir = tempfile::tempdir().unwrap();
     let config = test_config(work_dir.path());
-    let target_dir = work_dir.path().join("restore_target");
 
     let encrypted = encrypted_part("000001", b"stream payload");
     let mut backup = manifest(vec![part("000000", 10, "h0"), encrypted.part]);
@@ -25,7 +24,7 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
     let manifest_yaml = yaml(&backup);
 
     let mut remote = MockRemote::new();
-    remote.expect_restore_status_detail().returning(ready);
+    remote.expect_retrieval_status().returning(ready);
     remote
         .expect_download()
         .withf(|key| key.contains("/manifest.yaml"))
@@ -33,7 +32,7 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
     remote
         .expect_download_range_to_file()
         .withf(|key, _, _, _| key.contains("000000"))
-        .returning(|_, _, _, _| Err(anyhow::anyhow!("connection lost")));
+        .returning(|_, _, _, _| Err(RemoteError::new("connection lost").into()));
     let bytes = encrypted.bytes;
     remote
         .expect_download_range_to_file()
@@ -44,14 +43,10 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
             Ok(())
         });
 
-    let progress = restore_task(
+    let progress = restore(
         &config,
-        &movies_task(),
-        0,
-        "20260602",
-        &target_dir,
-        &test_private_key(),
-        &retrieval(),
+        &restore_request(work_dir.path(), 0),
+        &btrfs_without_receive(),
         &remote,
     )
     .await
@@ -69,7 +64,7 @@ async fn part_download_failure_should_not_abort_remaining_parts() {
 /// each range request, by part key.
 async fn restore_two_parts(
     work_dir: &Path,
-    status: fn(&str) -> Result<RestoreStatusDetail>,
+    status: fn(&str) -> Result<Retrieval>,
     download: fn(&str, &Path) -> Result<()>,
 ) -> Result<RestoreProgress> {
     let manifest_yaml = yaml(&manifest(vec![
@@ -79,10 +74,10 @@ async fn restore_two_parts(
 
     let mut remote = MockRemote::new();
     remote
-        .expect_restore_status_detail()
+        .expect_retrieval_status()
         .withf(|key| key.contains("/manifest.yaml"))
         .returning(ready);
-    remote.expect_restore_status_detail().returning(status);
+    remote.expect_retrieval_status().returning(status);
     remote
         .expect_download()
         .returning(move |_| Ok(manifest_yaml.clone()));
@@ -90,14 +85,10 @@ async fn restore_two_parts(
         .expect_download_range_to_file()
         .returning(move |key, _, _, path| download(key, path));
 
-    restore_task(
+    restore(
         &test_config(work_dir),
-        &movies_task(),
-        0,
-        "20260602",
-        &work_dir.join("restore_target"),
-        &test_private_key(),
-        &retrieval(),
+        &restore_request(work_dir, 0),
+        &btrfs_without_receive(),
         &remote,
     )
     .await
@@ -123,7 +114,7 @@ async fn local_error_during_download_should_fail_the_run() {
     );
     assert!(
         !restore_work_dir(work_dir.path())
-            .join("part-000001.age")
+            .join("snapshot.part-000001.age")
             .exists(),
         "no other part may be tried after a local error"
     );
@@ -135,7 +126,7 @@ async fn local_error_during_download_should_fail_the_run() {
 async fn all_part_downloads_failing_should_fail_the_run() {
     let work_dir = tempfile::tempdir().unwrap();
     let err = restore_two_parts(work_dir.path(), ready, |_, _| {
-        Err(anyhow::anyhow!("connection lost"))
+        Err(RemoteError::new("connection lost").into())
     })
     .await
     .expect_err("a run with no successful download must fail");
@@ -150,7 +141,7 @@ async fn all_part_status_checks_failing_should_fail_the_run() {
     let work_dir = tempfile::tempdir().unwrap();
     let err = restore_two_parts(
         work_dir.path(),
-        |_| Err(anyhow::anyhow!("connection lost")),
+        |_| Err(RemoteError::new("connection lost").into()),
         |_, _| panic!("nothing may be downloaded"),
     )
     .await
@@ -161,12 +152,13 @@ async fn all_part_status_checks_failing_should_fail_the_run() {
     );
 }
 
-/// Restore of a level 1 backup whose manifest is readable and whose part is archived, with
-/// `private_key`; `tweak` adjusts the manifest. Requesting a retrieval fails the test.
+/// Restore of a level 1 backup whose manifest is readable and whose part is archived,
+/// decrypting with `identity`; `tweak` adjusts the manifest. Requesting a retrieval fails the
+/// test.
 async fn restore_level1_without_requests(
     work_dir: &Path,
-    private_key: &str,
-    tweak: fn(&mut Backup),
+    identity: age::x25519::Identity,
+    tweak: fn(&mut BackupManifest),
 ) -> Result<RestoreProgress> {
     let mut backup = manifest(vec![part("000000", 10, "parthash")]);
     backup.level = 1;
@@ -177,25 +169,25 @@ async fn restore_level1_without_requests(
     let manifest_yaml = yaml(&backup);
 
     let mut remote = MockRemote::new();
-    remote.expect_restore_status_detail().returning(|key| {
+    remote.expect_retrieval_status().returning(|key| {
         Ok(status(if key.contains("/manifest.yaml") {
-            RestoreStatus::Ready
+            RetrievalStatus::Ready
         } else {
-            RestoreStatus::NotRequested
+            RetrievalStatus::NotRequested
         }))
     });
     remote
         .expect_download()
         .returning(move |_| Ok(manifest_yaml.clone()));
 
-    restore_task(
+    let request = RestoreRequest {
+        identity,
+        ..restore_request(work_dir, 1)
+    };
+    restore(
         &test_config(work_dir),
-        &movies_task(),
-        1,
-        "20260602",
-        &work_dir.join("restore_target"),
-        private_key,
-        &retrieval(),
+        &request,
+        &btrfs_without_receive(),
         &remote,
     )
     .await
@@ -208,36 +200,14 @@ fn create_level0_on_target(work_dir: &Path) {
 /// A key that can't decrypt the backup must be caught before any retrieval is paid for.
 #[tokio::test]
 async fn restore_with_wrong_private_key_should_fail_before_requesting_retrieval() {
-    use secrecy::ExposeSecret;
-
     let work_dir = tempfile::tempdir().unwrap();
     create_level0_on_target(work_dir.path());
-    let other = age::x25519::Identity::generate().to_string();
-    let err = restore_level1_without_requests(work_dir.path(), other.expose_secret(), |_| {})
+    let other = age::x25519::Identity::generate();
+    let err = restore_level1_without_requests(work_dir.path(), other, |_| {})
         .await
         .expect_err("a wrong key must fail the restore")
         .to_string();
     assert!(err.contains("encrypted to"), "unexpected error: {err}");
-}
-
-#[tokio::test]
-async fn restore_with_unparsable_private_key_should_fail_before_any_s3_call() {
-    let work_dir = tempfile::tempdir().unwrap();
-    let remote = MockRemote::new();
-    let err = restore_task(
-        &test_config(work_dir.path()),
-        &movies_task(),
-        0,
-        "20260602",
-        &work_dir.path().join("restore_target"),
-        "not a key",
-        &retrieval(),
-        &remote,
-    )
-    .await
-    .expect_err("an unparsable key must fail the restore")
-    .to_string();
-    assert!(err.contains("private key"), "unexpected error: {err}");
 }
 
 /// An incremental can't be received without its parent, so the restore must say so before
@@ -245,7 +215,7 @@ async fn restore_with_unparsable_private_key_should_fail_before_any_s3_call() {
 #[tokio::test]
 async fn restore_without_parent_on_target_should_fail_before_requesting_retrieval() {
     let work_dir = tempfile::tempdir().unwrap();
-    let err = restore_level1_without_requests(work_dir.path(), &test_private_key(), |_| {})
+    let err = restore_level1_without_requests(work_dir.path(), TEST_IDENTITY.clone(), |_| {})
         .await
         .expect_err("a missing parent must fail the restore")
         .to_string();
@@ -259,7 +229,7 @@ async fn restore_without_parent_on_target_should_fail_before_requesting_retrieva
 async fn restore_without_enough_space_should_fail_before_requesting_retrieval() {
     let work_dir = tempfile::tempdir().unwrap();
     create_level0_on_target(work_dir.path());
-    let err = restore_level1_without_requests(work_dir.path(), &test_private_key(), |b| {
+    let err = restore_level1_without_requests(work_dir.path(), TEST_IDENTITY.clone(), |b| {
         b.parts[0].size_bytes = u64::MAX / 2;
     })
     .await
@@ -285,21 +255,16 @@ async fn restore_days_shorter_than_lead_window_should_be_rejected_before_any_s3_
     let remote = MockRemote::new();
 
     // The Bulk tier's default lead window is longer than the copy lifetime given here.
-    let err = restore_task(
-        &config,
-        &movies_task(),
-        0,
-        "20260602",
-        &work_dir.path().join("restore_target"),
-        &test_private_key(),
-        &RetrievalOptions {
+    let request = RestoreRequest {
+        retrieval: RetrievalOptions {
             days: 3,
-            tier: RestoreTier::Bulk,
+            tier: RetrievalTier::Bulk,
         },
-        &remote,
-    )
-    .await
-    .expect_err("insufficient restore-days must be rejected");
+        ..restore_request(work_dir.path(), 0)
+    };
+    let err = restore(&config, &request, &MockBtrfs::new(), &remote)
+        .await
+        .expect_err("insufficient restore-days must be rejected");
 
     assert!(
         err.to_string().contains("restore-days"),

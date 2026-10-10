@@ -2,127 +2,84 @@ use anyhow::Result;
 use std::collections::HashSet;
 
 use crate::{
-    config::{Config, Task},
+    config::{Config, StorageClass, Task},
+    layout::TaskLayout,
     list::list_backups,
-    manifest::{Backup, parse_backup},
-    remote::ObjectMetadata,
+    manifest::{BackupManifest, fetch_manifest},
     remote::RemoteBackend,
-    util::{now_unix, s3_backup_key, s3_manifest_key, sanitize_subvolume_path},
+    util::now_unix,
 };
 
 /// A problem found auditing a task's backups on S3.
 pub struct VerifyIssue {
-    pub level: u32,
-    pub timestamp: String,
+    /// The level of the backup at fault; None for a problem of the task as a whole.
+    pub level: Option<u32>,
     pub description: String,
 }
 
-/// Audits every backup on record for `task` — chain completeness, part existence and size,
-/// storage class, and (if `max_age_days` is set) freshness — entirely via HeadObject and
-/// ListObjectsV2, so this never requests or waits on an archive retrieval. Pass `None` for
-/// `max_age_days` to skip the freshness check.
+/// Audits every backup on record for `task`: chain completeness, part existence and size,
+/// storage class, and, if `max_age_days` is set, freshness. Uses only HeadObject,
+/// ListObjectsV2 and manifest downloads, so it never requests or waits on an archive
+/// retrieval.
 pub async fn verify_task<R: RemoteBackend>(
     config: &Config,
     task: &Task,
     remote: &R,
     max_age_days: Option<u64>,
 ) -> Result<Vec<VerifyIssue>> {
-    let sanitized = sanitize_subvolume_path(&task.subvolume)?;
-    let entries = list_backups(config, task, remote).await?;
-
-    let mut issues = Vec::new();
-
-    if entries.is_empty() {
-        issues.push(VerifyIssue {
-            level: 0,
-            timestamp: String::new(),
+    let layout = TaskLayout::new(config, task)?;
+    let ids = list_backups(remote, &layout).await?;
+    if ids.is_empty() {
+        return Ok(vec![VerifyIssue {
+            level: None,
             description: "no backups found for this task".to_string(),
-        });
-        return Ok(issues);
+        }]);
     }
 
-    // Collects every snapshot_name seen so far, so a level-N backup's parent_snapshot can be
-    // checked against it: a parent that's not in this map has no manifest currently on S3
-    // (deleted, expired, or never uploaded), so the chain is broken at that point.
-    let mut by_snapshot: HashSet<String> = HashSet::new();
+    let mut issues = Vec::new();
+    // Snapshots whose manifest is on S3. Backups are visited oldest first, so a parent not
+    // in here by the time its child is checked has no manifest: the chain is broken there.
+    let mut backed_up_snapshots: HashSet<String> = HashSet::new();
     let mut newest_created_at = 0i64;
 
-    for entry in &entries {
-        let manifest_key =
-            s3_manifest_key(&config.s3.prefix, &sanitized, entry.level, &entry.timestamp);
-        let backup = match remote.download(&manifest_key).await {
-            Ok(bytes) => match parse_backup(&bytes) {
-                Ok(b) => b,
-                Err(e) => {
-                    issues.push(VerifyIssue {
-                        level: entry.level,
-                        timestamp: entry.timestamp.clone(),
-                        description: format!("manifest {manifest_key} is corrupt: {e}"),
-                    });
-                    continue;
-                }
-            },
+    for id in &ids {
+        let mut issue = |description: String| {
+            issues.push(VerifyIssue {
+                level: Some(id.level),
+                description,
+            })
+        };
+        let backup = match fetch_manifest(remote, &layout.manifest_key(id)).await {
+            Ok(backup) => backup,
             Err(e) => {
-                issues.push(VerifyIssue {
-                    level: entry.level,
-                    timestamp: entry.timestamp.clone(),
-                    description: format!("manifest {manifest_key} unreadable: {e}"),
-                });
+                issue(format!("{e:#}"));
                 continue;
             }
         };
         newest_created_at = newest_created_at.max(backup.created_at);
 
         if let Some(parent) = &backup.parent_snapshot
-            && !by_snapshot.contains(parent)
+            && !backed_up_snapshots.contains(parent)
         {
-            issues.push(VerifyIssue {
-                level: entry.level,
-                timestamp: entry.timestamp.clone(),
-                description: format!(
-                    "parent snapshot '{parent}' has no manifest on S3; incremental chain is broken"
-                ),
-            });
+            issue(format!(
+                "parent snapshot '{parent}' has no manifest on S3; incremental chain is broken"
+            ));
         }
 
-        let level_class = config
-            .s3
-            .storage_class
-            .backup_data
-            .get(entry.level as usize);
-        let part_issues = check_parts(
-            remote,
-            &config.s3.prefix,
-            &sanitized,
-            entry.level,
-            &entry.timestamp,
-            &backup,
-            |part_key, meta| match level_class {
-                Some(expected) if &meta.storage_class != expected => Some(format!(
-                    "part {part_key}: storage class is {}, but level {} is configured for \
-                     {expected}",
-                    meta.storage_class, entry.level
-                )),
-                _ => None,
-            },
-        )
-        .await
-        .unwrap_or_else(|e| vec![(String::new(), format!("could not check parts: {e}"))]);
-        issues.extend(part_issues.into_iter().map(|(_, description)| VerifyIssue {
-            level: entry.level,
-            timestamp: entry.timestamp.clone(),
-            description,
-        }));
+        let expected_class = config.s3.storage_class.for_level(id.level).ok();
+        match check_parts(remote, &layout, &backup, expected_class).await {
+            Ok(part_issues) => part_issues.into_iter().for_each(|p| issue(p.description)),
+            Err(e) => issue(format!("could not check parts: {e}")),
+        }
 
-        by_snapshot.insert(backup.snapshot_name.clone());
+        backed_up_snapshots.insert(backup.snapshot_name);
     }
 
     if let Some(max_age_days) = max_age_days {
         let age_days = (now_unix() - newest_created_at) / 86400;
         if age_days > max_age_days as i64 {
             issues.push(VerifyIssue {
-                level: 0,
-                timestamp: String::new(),
+                level: None,
                 description: format!(
                     "newest backup is {age_days} day(s) old, exceeding the {max_age_days} day \
                      freshness threshold"
@@ -134,37 +91,51 @@ pub async fn verify_task<R: RemoteBackend>(
     Ok(issues)
 }
 
-/// HEADs every part of `backup` and describes each that is missing or not the size its
-/// manifest records, paired with the part's index. `check_found` adds caller-specific checks
-/// on parts that exist. A HEAD that fails for any other reason (e.g. the network) fails the
-/// whole check: it says nothing about the part, so callers must not act on it as missing.
+/// A part of a backup that is not on S3 as its manifest records it.
+pub struct PartIssue {
+    pub index: String,
+    pub description: String,
+}
+
+/// HEADs every part of `backup` and reports each that is missing, not the size its manifest
+/// records, or, if `expected_class` is given, of another storage class. A HEAD that fails for
+/// any other reason (e.g. the network) fails the whole check: it says nothing about the part,
+/// so callers must not act on it as missing.
 pub async fn check_parts<R: RemoteBackend>(
     remote: &R,
-    prefix: &str,
-    sanitized: &str,
-    level: u32,
-    timestamp: &str,
-    backup: &Backup,
-    mut check_found: impl FnMut(&str, &ObjectMetadata) -> Option<String>,
-) -> Result<Vec<(String, String)>> {
+    layout: &TaskLayout,
+    backup: &BackupManifest,
+    expected_class: Option<StorageClass>,
+) -> Result<Vec<PartIssue>> {
+    let id = backup.id();
     let mut issues = Vec::new();
     for part in &backup.parts {
-        let part_key = s3_backup_key(prefix, sanitized, level, timestamp, &part.index);
-        match remote.head_metadata(&part_key).await? {
-            Some(meta) => {
-                if meta.size_bytes != part.size_bytes {
-                    issues.push((
-                        part.index.clone(),
-                        format!(
-                            "part {part_key}: manifest says {} bytes, S3 reports {} bytes",
-                            part.size_bytes, meta.size_bytes
-                        ),
-                    ));
-                }
-                issues
-                    .extend(check_found(&part_key, &meta).map(|issue| (part.index.clone(), issue)));
-            }
-            None => issues.push((part.index.clone(), format!("part {part_key} is missing"))),
+        let key = layout.part_key(&id, &part.index);
+        let mut issue = |description: String| {
+            issues.push(PartIssue {
+                index: part.index.clone(),
+                description,
+            })
+        };
+        let Some(meta) = remote.head_metadata(&key).await? else {
+            issue(format!("part {key} is missing"));
+            continue;
+        };
+        if meta.size_bytes != part.size_bytes {
+            issue(format!(
+                "part {key}: manifest says {} bytes, S3 reports {} bytes",
+                part.size_bytes, meta.size_bytes
+            ));
+        }
+        if let Some(expected) = expected_class
+            && meta.storage_class != expected.as_str()
+        {
+            issue(format!(
+                "part {key}: storage class is {}, but level {} is configured for {}",
+                meta.storage_class,
+                id.level,
+                expected.as_str()
+            ));
         }
     }
     Ok(issues)
@@ -173,10 +144,13 @@ pub async fn check_parts<R: RemoteBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::S3StorageClass;
-    use crate::manifest::{PartInfo, SystemInfo};
-    use crate::remote::MockRemoteBackend;
+    use crate::config::{S3Config, StorageClasses};
+    use crate::manifest::{ManifestPart, SystemInfo};
+    use crate::remote::{MockRemoteBackend, ObjectMetadata};
     use std::path::PathBuf;
+
+    const MANIFEST_KEY: &str =
+        "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml";
 
     fn test_task() -> Task {
         Task {
@@ -192,27 +166,22 @@ mod tests {
         Config {
             base_dir: PathBuf::from("/tmp"),
             age_public_key: String::new(),
-            s3: crate::config::S3Config {
-                bucket: "bucket".to_string(),
-                region: "us-east-1".to_string(),
+            s3: S3Config {
                 prefix: "backups/".to_string(),
-                endpoint: String::new(),
-                storage_class: S3StorageClass {
-                    manifest: "STANDARD".to_string(),
-                    backup_data: vec!["DEEP_ARCHIVE".to_string()],
+                storage_class: StorageClasses {
+                    manifest: StorageClass::Standard,
+                    backup_data: vec![StorageClass::DeepArchive],
                 },
-                retry: Default::default(),
-                upload_speed_limit_kbps: 0,
-                restore: Default::default(),
+                ..Default::default()
             },
             tasks: vec![],
         }
     }
 
-    fn backup_with_one_part(size_bytes: u64) -> Backup {
-        Backup {
+    fn backup_with_one_part(size_bytes: u64) -> BackupManifest {
+        BackupManifest {
             format_version: crate::manifest::FORMAT_VERSION.to_string(),
-            timestamp: "2026-06-02T14:30".to_string(),
+            timestamp: "2026-06-02T14:30".parse().unwrap(),
             created_at: now_unix(),
             level: 0,
             snapshot_name: "bcb_level0.20260602T1430".to_string(),
@@ -223,7 +192,7 @@ mod tests {
             age_public_key: String::new(),
             total_size_bytes: size_bytes,
             blake3: "hash".to_string(),
-            parts: vec![PartInfo {
+            parts: vec![ManifestPart {
                 index: "000000".to_string(),
                 size_bytes,
                 blake3: "parthash".to_string(),
@@ -231,8 +200,47 @@ mod tests {
         }
     }
 
+    /// Verifies a task whose only backup is `backup`, at `manifest_key`, with its one part
+    /// answered by `head`. Returns each issue's description.
+    async fn verify_one(
+        manifest_key: &'static str,
+        backup: BackupManifest,
+        head: Option<ObjectMetadata>,
+        max_age_days: Option<u64>,
+    ) -> Vec<String> {
+        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
+        let mut remote = MockRemoteBackend::new();
+        remote
+            .expect_list_with_prefix()
+            .returning(move |_| Ok(vec![manifest_key.to_string()]));
+        remote
+            .expect_download()
+            .returning(move |_| Ok(manifest_yaml.clone()));
+        remote
+            .expect_head_metadata()
+            .returning(move |_| Ok(head.clone()));
+        verify_task(&test_config(), &test_task(), &remote, max_age_days)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.description)
+            .collect()
+    }
+
+    fn on_s3(size_bytes: u64, storage_class: &str) -> Option<ObjectMetadata> {
+        Some(ObjectMetadata {
+            size_bytes,
+            storage_class: storage_class.to_string(),
+        })
+    }
+
+    fn assert_single_issue(issues: &[String], needle: &str) {
+        assert_eq!(issues.len(), 1, "issues: {issues:?}");
+        assert!(issues[0].contains(needle), "issues: {issues:?}");
+    }
+
     #[tokio::test]
-    async fn test_verify_task_no_backups_is_an_issue() {
+    async fn test_verify_task_no_backups_is_a_task_issue() {
         let mut remote = MockRemoteBackend::new();
         remote.expect_list_with_prefix().returning(|_| Ok(vec![]));
 
@@ -240,124 +248,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].level, None);
         assert!(issues[0].description.contains("no backups found"));
     }
 
     #[tokio::test]
     async fn test_verify_task_clean_backup_has_no_issues() {
         let backup = backup_with_one_part(1024);
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| {
-            Ok(Some(ObjectMetadata {
-                size_bytes: 1024,
-                storage_class: "DEEP_ARCHIVE".to_string(),
-            }))
-        });
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, None)
-            .await
-            .unwrap();
-        assert!(
-            issues.is_empty(),
-            "expected no issues, got: {:?}",
-            issues.iter().map(|i| &i.description).collect::<Vec<_>>()
-        );
+        let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "DEEP_ARCHIVE"), None).await;
+        assert!(issues.is_empty(), "issues: {issues:?}");
     }
 
     #[tokio::test]
     async fn test_verify_task_detects_size_mismatch() {
         let backup = backup_with_one_part(1024);
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| {
-            Ok(Some(ObjectMetadata {
-                size_bytes: 999,
-                storage_class: "DEEP_ARCHIVE".to_string(),
-            }))
-        });
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, None)
-            .await
-            .unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(
-            issues[0].description.contains("size mismatch")
-                || issues[0].description.contains("bytes")
-        );
+        let issues = verify_one(MANIFEST_KEY, backup, on_s3(999, "DEEP_ARCHIVE"), None).await;
+        assert_single_issue(&issues, "S3 reports 999 bytes");
     }
 
     #[tokio::test]
     async fn test_verify_task_detects_storage_class_drift() {
         let backup = backup_with_one_part(1024);
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| {
-            Ok(Some(ObjectMetadata {
-                size_bytes: 1024,
-                storage_class: "STANDARD".to_string(),
-            }))
-        });
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, None)
-            .await
-            .unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].description.contains("storage class"));
+        let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "STANDARD"), None).await;
+        assert_single_issue(&issues, "storage class");
     }
 
     #[tokio::test]
     async fn test_verify_task_detects_missing_part() {
         let backup = backup_with_one_part(1024);
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| Ok(None));
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, None)
-            .await
-            .unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].description.contains("is missing"));
+        let issues = verify_one(MANIFEST_KEY, backup, None, None).await;
+        assert_single_issue(&issues, "is missing");
     }
 
     #[tokio::test]
@@ -366,87 +286,28 @@ mod tests {
         backup.level = 1;
         backup.snapshot_name = "bcb_level1.20260602T1430".to_string();
         backup.parent_snapshot = Some("bcb_level0.20260601T1430".to_string());
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level1_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| {
-            Ok(Some(ObjectMetadata {
-                size_bytes: 1024,
-                storage_class: "DEEP_ARCHIVE".to_string(),
-            }))
-        });
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, None)
-            .await
-            .unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].description.contains("chain is broken"));
+        let issues = verify_one(
+            "backups/manifests/mnt_data_movies/bcb_level1_202606021430/manifest.yaml",
+            backup,
+            on_s3(1024, "DEEP_ARCHIVE"),
+            None,
+        )
+        .await;
+        assert_single_issue(&issues, "chain is broken");
     }
 
     #[tokio::test]
     async fn test_verify_task_detects_stale_backup() {
         let mut backup = backup_with_one_part(1024);
         backup.created_at = now_unix() - 100 * 86400;
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| {
-            Ok(Some(ObjectMetadata {
-                size_bytes: 1024,
-                storage_class: "DEEP_ARCHIVE".to_string(),
-            }))
-        });
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, Some(30))
-            .await
-            .unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].description.contains("freshness threshold"));
+        let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "DEEP_ARCHIVE"), Some(30)).await;
+        assert_single_issue(&issues, "freshness threshold");
     }
 
     #[tokio::test]
     async fn test_verify_task_fresh_backup_within_threshold_is_ok() {
         let backup = backup_with_one_part(1024);
-        let manifest_yaml = serde_yaml::to_string(&backup).unwrap().into_bytes();
-
-        let mut remote = MockRemoteBackend::new();
-        remote.expect_list_with_prefix().returning(|_| {
-            Ok(vec![
-                "backups/manifests/mnt_data_movies/bcb_level0_202606021430/manifest.yaml"
-                    .to_string(),
-            ])
-        });
-        remote
-            .expect_download()
-            .returning(move |_| Ok(manifest_yaml.clone()));
-        remote.expect_head_metadata().returning(|_| {
-            Ok(Some(ObjectMetadata {
-                size_bytes: 1024,
-                storage_class: "DEEP_ARCHIVE".to_string(),
-            }))
-        });
-
-        let issues = verify_task(&test_config(), &test_task(), &remote, Some(30))
-            .await
-            .unwrap();
-        assert!(issues.is_empty());
+        let issues = verify_one(MANIFEST_KEY, backup, on_s3(1024, "DEEP_ARCHIVE"), Some(30)).await;
+        assert!(issues.is_empty(), "issues: {issues:?}");
     }
 }

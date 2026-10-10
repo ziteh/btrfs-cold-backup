@@ -1,10 +1,79 @@
+//! Local progress of an unfinished backup or restore, saved after every step so a run that
+//! is interrupted resumes where it stopped instead of starting over.
+
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::util::{now_unix, write_atomic};
+use crate::fsutil::write_atomic;
+use crate::timestamp::BackupId;
+
+/// A state of type `T` kept in the file at `path`.
+pub struct StateFile<T> {
+    path: PathBuf,
+    pub data: T,
+}
+
+/// The on-disk form of a state. `saved_at` lets an operator see when a run last made
+/// progress even after the file was copied elsewhere, or when base_dir is on a network share
+/// whose mtime comes from another clock.
+#[derive(Serialize, Deserialize)]
+struct Envelope<T> {
+    saved_at: String,
+    state: T,
+}
+
+impl<T: Serialize + DeserializeOwned> StateFile<T> {
+    /// Loads the state at `path`, or None when there is none yet.
+    pub fn load(path: PathBuf) -> Result<Option<Self>> {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("failed to read state file {path:?}")),
+        };
+        let envelope: Envelope<T> = serde_yaml::from_slice(&bytes).with_context(|| {
+            format!(
+                "failed to parse state file {path:?}; if it is damaged (e.g. empty after a \
+                 power loss), delete it to start over"
+            )
+        })?;
+        Ok(Some(Self {
+            path,
+            data: envelope.state,
+        }))
+    }
+
+    /// Creates the state at `path`, with its directory, and saves it.
+    pub fn create(path: PathBuf, data: T) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("failed to create {dir:?}"))?;
+        }
+        let state = Self { path, data };
+        state.save()?;
+        Ok(state)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let envelope = Envelope {
+            saved_at: humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
+            state: &self.data,
+        };
+        write_atomic(&self.path, serde_yaml::to_string(&envelope)?.as_bytes())
+    }
+
+    /// Deletes the file once the run it tracked is complete.
+    pub fn remove(self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!("failed to remove state file {:?}: {e}", self.path);
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// An encrypted part as written by the send stage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -13,32 +82,48 @@ pub struct PartRecord {
     pub blake3: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct BackupState {
-    pub level: u32,
+/// The snapshot a backup sends and what it was checked against when the backup started.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupTarget {
+    pub id: BackupId,
     pub snapshot_name: String,
+    /// The snapshot the incremental stream is relative to; None for level 0.
     pub parent_snapshot: Option<String>,
+    /// btrfs UUID of the backed-up subvolume.
     pub source_uuid: String,
+    /// btrfs UUID of the snapshot.
     pub snapshot_uuid: String,
-    pub timestamp: String,
-    pub output_dir: PathBuf,
-    pub stream_hash: Option<String>,
-    /// Every part of the stream, recorded together with `stream_hash`.
+}
+
+/// What the send stage produced: the stream's BLAKE3 and every encrypted part of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SentStream {
+    pub blake3: String,
     pub parts: BTreeMap<String, PartRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupState {
+    pub target: BackupTarget,
+    /// None until the send has finished.
+    pub sent: Option<SentStream>,
     pub uploaded_parts: BTreeSet<String>,
     pub manifest_uploaded: bool,
-    pub last_updated: i64,
 }
 
 impl BackupState {
-    pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.last_updated = now_unix();
-        write_atomic(path, serde_yaml::to_string(self)?.as_bytes())
+    pub fn new(target: BackupTarget) -> Self {
+        Self {
+            target,
+            sent: None,
+            uploaded_parts: BTreeSet::new(),
+            manifest_uploaded: false,
+        }
     }
 }
 
-/// Persisted download progress of one restore part. Retrieval status is not tracked here:
-/// every run re-checks it live against S3.
+/// Download progress of one restore part. Retrieval status is not kept here: every run
+/// checks it live, since a retrieved copy may have expired since the last run.
 ///
 /// `Downloaded` means fully downloaded *and* hash-verified, so it cannot be derived from a
 /// byte count: a run killed between the last byte and the hash check must resume, not be
@@ -51,39 +136,22 @@ pub enum PartDownloadState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RestorePartState {
-    pub size_bytes: u64,
-    pub blake3: String,
-    pub download_state: PartDownloadState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RestoreState {
+    /// The stream BLAKE3 of the manifest this state belongs to.
     pub manifest_blake3: String,
-    pub parts: BTreeMap<String, RestorePartState>,
-    /// Whether `btrfs receive` has completed and the target subvolume was verified.
+    /// Keyed by part index.
+    pub parts: BTreeMap<String, PartDownloadState>,
+    /// Whether `btrfs receive` has completed and the received snapshot was verified.
     pub receive_completed: bool,
-    pub last_updated: i64,
 }
 
 impl RestoreState {
-    pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.last_updated = now_unix();
-        write_atomic(path, serde_yaml::to_string(self)?.as_bytes())
-    }
-}
-
-/// Loads a state file, or returns None when there is none yet.
-pub fn read_state<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_yaml::from_slice(&bytes).map(Some).with_context(|| {
-            format!(
-                "failed to parse state file {path:?}; if it is damaged (e.g. empty after a \
-                 power loss), delete it to start over"
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("failed to read state file {path:?}")),
+    /// Indexes of the parts not yet downloaded and verified.
+    pub fn pending_parts(&self) -> impl Iterator<Item = &String> {
+        self.parts
+            .iter()
+            .filter(|(_, state)| **state != PartDownloadState::Downloaded)
+            .map(|(index, _)| index)
     }
 }
 
@@ -91,96 +159,102 @@ pub fn read_state<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_backup_state_default() {
-        let state = BackupState::default();
-        assert_eq!(state.level, 0);
-        assert!(state.stream_hash.is_none());
-        assert!(state.parts.is_empty());
-        assert!(!state.manifest_uploaded);
-    }
-
-    #[test]
-    fn test_backup_state_serialize_deserialize() {
-        let mut state = BackupState {
-            level: 0,
-            snapshot_name: "bcb_level0.20260602T1430".to_string(),
-            parent_snapshot: None,
-            source_uuid: "src-uuid".to_string(),
-            snapshot_uuid: "snap-uuid".to_string(),
-            timestamp: "2026-06-02T14:30".to_string(),
-            output_dir: PathBuf::from("/var/lib/bcb/backup/mnt_data/bcb_level0_20260602"),
-            stream_hash: Some("abc123".to_string()),
-            parts: BTreeMap::new(),
-            uploaded_parts: BTreeSet::new(),
-            manifest_uploaded: false,
-            last_updated: 1748872200,
-        };
-        state.parts.insert(
-            "000000".to_string(),
-            PartRecord {
-                size_bytes: 3221225472,
-                blake3: "hash1".to_string(),
+    fn backup_state() -> BackupState {
+        let mut state = BackupState::new(BackupTarget {
+            id: BackupId {
+                level: 1,
+                timestamp: "2026-06-02T14:30".parse().unwrap(),
             },
-        );
-        state.parts.insert(
-            "000001".to_string(),
-            PartRecord {
-                size_bytes: 1073741824,
-                blake3: "hash2".to_string(),
-            },
-        );
-
-        state.uploaded_parts.insert("000000".to_string());
-
-        let yaml = serde_yaml::to_string(&state).unwrap();
-        let deserialized: BackupState = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(state, deserialized);
-    }
-
-    #[test]
-    fn test_read_state_not_found() {
-        let result = read_state::<BackupState>(Path::new("/nonexistent/path/state.yaml"));
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_write_and_read_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.yaml");
-
-        let mut state = BackupState {
-            level: 1,
             snapshot_name: "bcb_level1.20260602T1430".to_string(),
             parent_snapshot: Some("bcb_level0.20260601T1000".to_string()),
             source_uuid: "src-uuid".to_string(),
             snapshot_uuid: "snap-uuid".to_string(),
-            timestamp: "2026-06-02T14:30".to_string(),
-            output_dir: PathBuf::from("/tmp/bcb/backup/mnt/bcb_level1_20260602"),
-            stream_hash: Some("streamhash".to_string()),
-            parts: BTreeMap::new(),
-            uploaded_parts: BTreeSet::new(),
-            manifest_uploaded: true,
-            last_updated: 12345,
-        };
-
-        state.save(&path).unwrap();
-        let loaded: BackupState = read_state(&path).unwrap().unwrap();
-        assert_eq!(state.snapshot_name, loaded.snapshot_name);
-        assert_eq!(state.output_dir, loaded.output_dir);
-        assert_eq!(state.stream_hash, loaded.stream_hash);
+        });
+        state.sent = Some(SentStream {
+            blake3: "streamhash".to_string(),
+            parts: [(
+                "000000".to_string(),
+                PartRecord {
+                    size_bytes: 3,
+                    blake3: "hash".to_string(),
+                },
+            )]
+            .into(),
+        });
+        state.uploaded_parts.insert("000000".to_string());
+        state
     }
 
     #[test]
-    fn test_read_state_error_names_the_file() {
+    fn test_save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/state.yaml");
+
+        StateFile::create(path.clone(), backup_state()).unwrap();
+        let loaded = StateFile::<BackupState>::load(path.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.data, backup_state());
+
+        let restore = RestoreState {
+            manifest_blake3: "abc".to_string(),
+            parts: [(
+                "000000".to_string(),
+                PartDownloadState::PartiallyDownloaded {
+                    downloaded_bytes: 7,
+                },
+            )]
+            .into(),
+            receive_completed: false,
+        };
+        let restore_path = dir.path().join("restore.yaml");
+        StateFile::create(restore_path.clone(), restore.clone()).unwrap();
+        let loaded = StateFile::<RestoreState>::load(restore_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.data, restore);
+    }
+
+    #[test]
+    fn test_saved_file_records_when() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.yaml");
+        StateFile::create(path.clone(), backup_state()).unwrap();
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        assert!(yaml.starts_with("saved_at: "), "{yaml}");
+    }
+
+    #[test]
+    fn test_load_missing_is_none() {
+        let loaded =
+            StateFile::<BackupState>::load(PathBuf::from("/nonexistent/path/state.yaml")).unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_load_error_names_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("restore_state.yaml");
         std::fs::write(&path, b"").unwrap();
 
-        let err = format!("{:#}", read_state::<RestoreState>(&path).unwrap_err());
+        let err = format!("{:#}", StateFile::<RestoreState>::load(path).err().unwrap());
         assert!(
             err.contains("restore_state.yaml"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_pending_parts() {
+        let state = RestoreState {
+            manifest_blake3: String::new(),
+            parts: [
+                ("000000".to_string(), PartDownloadState::Downloaded),
+                ("000001".to_string(), PartDownloadState::NotDownloaded),
+            ]
+            .into(),
+            receive_completed: false,
+        };
+        assert_eq!(state.pending_parts().collect::<Vec<_>>(), ["000001"]);
     }
 }

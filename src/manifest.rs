@@ -1,13 +1,21 @@
-use anyhow::{Result, anyhow};
+//! The formats bcb stores on S3: a manifest per backup, and per task a latest manifest
+//! pointing at the newest backup of each level. They outlive any one bcb version, so field
+//! changes must keep [`FORMAT_VERSION`]'s compatibility rule.
+
+use anyhow::{Context, Result, anyhow};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Shared by [`Backup`] and [`LatestManifest`]. Readers reject any other major version; a
+use crate::remote::RemoteBackend;
+use crate::timestamp::{BackupId, Timestamp};
+
+/// Shared by [`BackupManifest`] and [`LatestManifest`]. Readers reject any other major version; a
 /// minor bump may only add fields that have a serde default, so older readers still parse it.
 pub const FORMAT_VERSION: &str = "1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PartInfo {
+pub struct ManifestPart {
     pub index: String,
     pub size_bytes: u64,
     pub blake3: String,
@@ -22,10 +30,11 @@ pub struct SystemInfo {
     pub bcb_version: String,
 }
 
+/// Describes one backup: what was sent, from where, and how to verify and decrypt it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Backup {
+pub struct BackupManifest {
     pub format_version: String,
-    pub timestamp: String,
+    pub timestamp: Timestamp,
     /// Unix time when the backup ran (`timestamp` is the snapshot's, not the run's).
     pub created_at: i64,
     pub level: u32,
@@ -39,12 +48,21 @@ pub struct Backup {
     pub age_public_key: String,
     pub total_size_bytes: u64,
     pub blake3: String,
-    pub parts: Vec<PartInfo>,
+    pub parts: Vec<ManifestPart>,
+}
+
+impl BackupManifest {
+    pub fn id(&self) -> BackupId {
+        BackupId {
+            level: self.level,
+            timestamp: self.timestamp.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LatestBackup {
-    pub timestamp: String,
+pub struct LatestEntry {
+    pub timestamp: Timestamp,
     pub snapshot_name: String,
     pub snapshot_uuid: String,
 }
@@ -56,7 +74,7 @@ pub struct LatestManifest {
     /// The newest backup of each level, keyed by level. Callers rely on the key being the
     /// level: completing a level-N backup drops every entry above N, whose incremental chain
     /// it voided.
-    pub levels: BTreeMap<u32, LatestBackup>,
+    pub levels: BTreeMap<u32, LatestEntry>,
 }
 
 impl LatestManifest {
@@ -94,24 +112,50 @@ fn check_format_version(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn parse_backup(bytes: &[u8]) -> Result<Backup> {
+fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     check_format_version(bytes)?;
     Ok(serde_yaml::from_slice(bytes)?)
 }
 
-pub fn parse_latest(bytes: &[u8]) -> Result<LatestManifest> {
-    check_format_version(bytes)?;
-    Ok(serde_yaml::from_slice(bytes)?)
+impl BackupManifest {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        parse(bytes)
+    }
+}
+
+impl LatestManifest {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        parse(bytes)
+    }
+}
+
+/// Downloads and parses the backup manifest at `key`.
+pub async fn fetch_manifest<R: RemoteBackend>(remote: &R, key: &str) -> Result<BackupManifest> {
+    BackupManifest::parse(&remote.download(key).await?)
+        .with_context(|| format!("failed to parse manifest {key}"))
+}
+
+/// Downloads and parses the latest manifest at `key`, or None if there is none yet.
+pub async fn fetch_latest<R: RemoteBackend>(
+    remote: &R,
+    key: &str,
+) -> Result<Option<LatestManifest>> {
+    if remote.head_metadata(key).await?.is_none() {
+        return Ok(None);
+    }
+    let latest = LatestManifest::parse(&remote.download(key).await?)
+        .with_context(|| format!("failed to parse latest manifest {key}"))?;
+    Ok(Some(latest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_backup(level: u32, parent: Option<&str>) -> Backup {
-        Backup {
+    fn sample_backup(level: u32, parent: Option<&str>) -> BackupManifest {
+        BackupManifest {
             format_version: FORMAT_VERSION.to_string(),
-            timestamp: "2026-06-02T14:30".to_string(),
+            timestamp: "2026-06-02T14:30".parse().unwrap(),
             created_at: 0,
             level,
             snapshot_name: format!("bcb_level{level}.20260602T1430"),
@@ -122,7 +166,7 @@ mod tests {
             age_public_key: String::new(),
             total_size_bytes: 1024,
             blake3: "def456".to_string(),
-            parts: vec![PartInfo {
+            parts: vec![ManifestPart {
                 index: "000000".to_string(),
                 size_bytes: 1024,
                 blake3: "part1".to_string(),
@@ -134,7 +178,7 @@ mod tests {
     fn test_backup_round_trip() {
         let backup = sample_backup(1, Some("bcb_level0.20260601T1430"));
         let yaml = serde_yaml::to_string(&backup).unwrap();
-        assert_eq!(parse_backup(yaml.as_bytes()).unwrap(), backup);
+        assert_eq!(BackupManifest::parse(yaml.as_bytes()).unwrap(), backup);
     }
 
     #[test]
@@ -142,7 +186,7 @@ mod tests {
         let backup = sample_backup(0, None);
         let yaml = serde_yaml::to_string(&backup).unwrap();
         assert!(
-            parse_backup(yaml.as_bytes())
+            BackupManifest::parse(yaml.as_bytes())
                 .unwrap()
                 .parent_snapshot
                 .is_none()
@@ -154,14 +198,14 @@ mod tests {
         let mut latest = LatestManifest::new("src-uuid".to_string());
         latest.levels.insert(
             0,
-            LatestBackup {
-                timestamp: "2026-06-02T14:30".to_string(),
+            LatestEntry {
+                timestamp: "2026-06-02T14:30".parse().unwrap(),
                 snapshot_name: "bcb_level0.20260602T1430".to_string(),
                 snapshot_uuid: "snap-uuid".to_string(),
             },
         );
         let yaml = serde_yaml::to_string(&latest).unwrap();
-        assert_eq!(parse_latest(yaml.as_bytes()).unwrap(), latest);
+        assert_eq!(LatestManifest::parse(yaml.as_bytes()).unwrap(), latest);
     }
 
     #[test]
@@ -170,15 +214,17 @@ mod tests {
         backup.format_version = format!("{}.99", major(FORMAT_VERSION));
         let mut yaml = serde_yaml::to_string(&backup).unwrap();
         yaml.push_str("added_in_minor: true\n");
-        assert!(parse_backup(yaml.as_bytes()).is_ok());
+        assert!(BackupManifest::parse(yaml.as_bytes()).is_ok());
     }
 
     #[test]
     fn test_parse_rejects_unknown_major_version() {
         let yaml = "format_version: '999.0'\nsomething_else: 1\n";
-        let err = parse_backup(yaml.as_bytes()).unwrap_err().to_string();
+        let err = BackupManifest::parse(yaml.as_bytes())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not supported"), "unexpected error: {err}");
-        assert!(parse_latest(yaml.as_bytes()).is_err());
+        assert!(LatestManifest::parse(yaml.as_bytes()).is_err());
     }
 
     #[test]
@@ -186,7 +232,9 @@ mod tests {
         let mut value = serde_yaml::to_value(sample_backup(0, None)).unwrap();
         value.as_mapping_mut().unwrap().remove("format_version");
         let yaml = serde_yaml::to_string(&value).unwrap();
-        let err = parse_backup(yaml.as_bytes()).unwrap_err().to_string();
+        let err = BackupManifest::parse(yaml.as_bytes())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no format_version"), "unexpected error: {err}");
     }
 }

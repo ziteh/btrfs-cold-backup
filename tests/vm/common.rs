@@ -6,8 +6,8 @@ use std::process::{Command, Output};
 
 use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
-    config::{Config, RestoreConfig, S3Config, S3RetryConfig, S3StorageClass, Task},
-    util::sanitize_subvolume_path,
+    config::{Config, S3Config, StorageClass, StorageClasses, Task},
+    layout::sanitize_subvolume_path,
 };
 
 /// S3 prefix every VM test writes under.
@@ -112,15 +112,11 @@ pub(crate) fn s3_config(env: &VmEnv) -> S3Config {
         region: "us-east-1".to_string(),
         prefix: S3_PREFIX.to_string(),
         endpoint: env.s3_endpoint.clone(),
-        // Explicit because S3StorageClass::default() leaves `manifest` empty (serde
-        // defaults only apply when deserializing).
-        storage_class: S3StorageClass {
-            manifest: "STANDARD".to_string(),
-            backup_data: vec!["STANDARD".to_string(), "STANDARD".to_string()],
+        storage_class: StorageClasses {
+            manifest: StorageClass::Standard,
+            backup_data: vec![StorageClass::Standard, StorageClass::Standard],
         },
-        retry: S3RetryConfig::default(),
-        upload_speed_limit_kbps: 0,
-        restore: RestoreConfig::default(),
+        ..Default::default()
     }
 }
 

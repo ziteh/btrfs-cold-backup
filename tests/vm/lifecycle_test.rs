@@ -3,23 +3,15 @@
 
 use std::path::PathBuf;
 
-use age::secrecy::ExposeSecret;
 use btrfs_cold_backup::{
     backup::backup_task,
     btrfs::BtrfsDriver,
     config::{Config, Task},
-    remote::{RestoreTier, S3Backend},
-    restore::{RetrievalOptions, restore_task},
+    remote::{RetrievalTier, S3Backend},
+    restore::{RestoreRequest, RetrievalOptions, restore_task},
 };
 
 use crate::common::*;
-
-fn retrieval() -> RetrievalOptions {
-    RetrievalOptions {
-        days: 1,
-        tier: RestoreTier::Standard,
-    }
-}
 
 /// A subvolume with one snapshot per entry of `files`, taken after writing that file, at
 /// successive levels starting from 0; plus a config and task backing the subvolume up.
@@ -76,6 +68,20 @@ impl Chain {
             snapshots,
         }
     }
+
+    /// A restore of this chain's level `level` backup, of the snapshot taken on `date`.
+    fn restore_request(&self, level: u32, date: &str) -> RestoreRequest {
+        RestoreRequest {
+            level,
+            timestamp: btrfs_cold_backup::timestamp::Timestamp::from_cli_date(date).unwrap(),
+            target_dir: self.restore_dir.clone(),
+            identity: self.identity.clone(),
+            retrieval: RetrievalOptions {
+                days: 1,
+                tier: RetrievalTier::Standard,
+            },
+        }
+    }
 }
 
 impl Drop for Chain {
@@ -106,11 +112,8 @@ async fn level0_backup_and_restore_should_round_trip() {
     let progress = restore_task(
         &chain.config,
         &chain.task,
-        0,
-        "20260601",
-        &chain.restore_dir,
-        chain.identity.to_string().expose_secret(),
-        &retrieval(),
+        &chain.restore_request(0, "20260601"),
+        &BtrfsDriver,
         &remote,
     )
     .await
@@ -163,16 +166,12 @@ async fn incremental_chain_restore_should_recover_both_levels() {
             .await
             .unwrap();
     }
-    let private_key = chain.identity.to_string();
     for (level, date) in [(0, "20260601"), (1, "20260602")] {
         let progress = restore_task(
             &chain.config,
             &chain.task,
-            level,
-            date,
-            &chain.restore_dir,
-            private_key.expose_secret(),
-            &retrieval(),
+            &chain.restore_request(level, date),
+            &BtrfsDriver,
             &remote,
         )
         .await

@@ -46,64 +46,49 @@ async fn wait_for_incomplete_upload_count(
     }
 }
 
-fn spawn_bcb_backup(
-    env: &VmEnv,
-    config_path: &Path,
-    level: u32,
-    task: &str,
-    extra_env: &[(&str, &str)],
-) -> Child {
+fn spawn_bcb(env: &VmEnv, f: &Fixture, args: &[&str], extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(&env.bin_path);
-    cmd.args([
-        "--config",
-        config_path.to_str().unwrap(),
-        "backup",
-        "--level",
-        &level.to_string(),
-        "--task",
-        task,
-    ])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    cmd.arg("--config")
+        .arg(&f.config_path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
     cmd.spawn().expect("failed to spawn bcb")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_bcb_restore(
-    env: &VmEnv,
-    config_path: &Path,
-    task: &str,
-    level: u32,
-    date: &str,
-    target: &Path,
-    private_key_path: &Path,
-    extra_env: &[(&str, &str)],
-) -> Child {
-    let mut cmd = Command::new(&env.bin_path);
-    cmd.args([
-        "--config",
-        config_path.to_str().unwrap(),
-        "restore",
-        "--task",
-        task,
-        "--level",
-        &level.to_string(),
-        "--date",
-        date,
-        "--target",
-        target.to_str().unwrap(),
-        "--private-key",
-        private_key_path.to_str().unwrap(),
-    ])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().expect("failed to spawn bcb")
+/// Starts a level 0 backup of the fixture's task.
+fn spawn_backup(env: &VmEnv, f: &Fixture, extra_env: &[(&str, &str)]) -> Child {
+    spawn_bcb(
+        env,
+        f,
+        &["backup", "--level", "0", "--task", &f.task_name],
+        extra_env,
+    )
+}
+
+/// Starts a restore of the fixture's level 0 backup into its restore dir.
+fn spawn_restore(env: &VmEnv, f: &Fixture, extra_env: &[(&str, &str)]) -> Child {
+    spawn_bcb(
+        env,
+        f,
+        &[
+            "restore",
+            "--task",
+            &f.task_name,
+            "--level",
+            "0",
+            "--date",
+            "20260601",
+            "--target",
+            f.restore_dir.to_str().unwrap(),
+            "--private-key",
+            f.private_key_path.to_str().unwrap(),
+        ],
+        extra_env,
+    )
 }
 
 /// Blocks until a line containing `marker` appears on the child's stderr, or `timeout` elapses.
@@ -170,11 +155,9 @@ async fn kill_during_multipart_upload_then_resume_should_abort_orphan_and_succee
     let prefix = data_prefix(&fixture);
     let s3 = raw_s3_client(&env).await;
 
-    let mut child = spawn_bcb_backup(
+    let mut child = spawn_backup(
         &env,
-        &fixture.config_path,
-        0,
-        &fixture.task_name,
+        &fixture,
         &[("BCB_TEST_PAUSE_AFTER_S3_PART_NUMBER", "1")],
     );
     assert!(
@@ -285,13 +268,7 @@ async fn kill_during_send_then_resume_should_leave_no_orphan_children() {
         std::fs::write(subvol.join("hello.txt"), b"kill during send").unwrap();
     });
 
-    let mut child = spawn_bcb_backup(
-        &env,
-        &fixture.config_path,
-        0,
-        &fixture.task_name,
-        &[("BCB_TEST_PAUSE_DURING_SEND", "1")],
-    );
+    let mut child = spawn_backup(&env, &fixture, &[("BCB_TEST_PAUSE_DURING_SEND", "1")]);
     assert!(
         wait_for_marker(
             &mut child,
@@ -337,13 +314,7 @@ async fn kill_leaves_stale_lock_then_resume_should_not_error_on_lock_contention(
         std::fs::write(subvol.join("hello.txt"), b"stale lock test").unwrap();
     });
 
-    let mut child = spawn_bcb_backup(
-        &env,
-        &fixture.config_path,
-        0,
-        &fixture.task_name,
-        &[("BCB_TEST_PAUSE_DURING_SEND", "1")],
-    );
+    let mut child = spawn_backup(&env, &fixture, &[("BCB_TEST_PAUSE_DURING_SEND", "1")]);
     assert!(
         wait_for_marker(
             &mut child,
@@ -426,14 +397,9 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
     );
 
     let chunk_size: u64 = 1024 * 1024;
-    let mut child = spawn_bcb_restore(
+    let mut child = spawn_restore(
         &env,
-        &fixture.config_path,
-        &fixture.task_name,
-        0,
-        "20260601",
-        &fixture.restore_dir,
-        &fixture.private_key_path,
+        &fixture,
         &[
             ("BCB_TEST_PART_CHUNK_SIZE", &chunk_size.to_string()),
             (
@@ -454,17 +420,20 @@ async fn kill_during_restore_download_then_resume_should_recover_partial_downloa
     child.wait().unwrap();
 
     // The state proves the kill landed mid-part rather than after the part had finished.
-    let state: btrfs_cold_backup::state::RestoreState = serde_yaml::from_str(
-        &std::fs::read_to_string(restore_work_dir(&fixture).join("state.yaml")).unwrap(),
-    )
-    .unwrap();
+    let state =
+        btrfs_cold_backup::state::StateFile::<btrfs_cold_backup::state::RestoreState>::load(
+            restore_work_dir(&fixture).join("state.yaml"),
+        )
+        .unwrap()
+        .expect("restore state must exist")
+        .data;
     let part_state = state
         .parts
         .values()
         .next()
         .expect("restore state must have at least one part");
     assert_eq!(
-        part_state.download_state,
+        *part_state,
         btrfs_cold_backup::state::PartDownloadState::PartiallyDownloaded {
             downloaded_bytes: chunk_size
         },

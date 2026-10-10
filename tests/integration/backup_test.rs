@@ -4,7 +4,8 @@ use anyhow::Result;
 use btrfs_cold_backup::{
     backup::backup_task,
     btrfs::SubvolumeUuids,
-    manifest::{LatestBackup, LatestManifest},
+    config::StorageClass,
+    manifest::{LatestEntry, LatestManifest},
     remote::ObjectMetadata,
 };
 use tokio::io::AsyncRead;
@@ -26,13 +27,13 @@ async fn level0_full_backup_should_succeed_and_return_manifest() {
 
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_upload_file()
         .withf(|_, _, _, tags| tags == "bcb-backup-level=0")
@@ -87,7 +88,7 @@ async fn failed_send_should_remove_output_dir() {
     });
 
     let mut remote = MockRemote::new();
-    remote.expect_exists().returning(|_| Ok(false));
+    expect_no_manifests(&mut remote);
 
     let err = backup_task(&config, &task, 0, &btrfs, &remote)
         .await
@@ -136,13 +137,13 @@ async fn backup_should_fail_when_latest_manifest_is_corrupt() {
 
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
@@ -204,13 +205,13 @@ async fn level1_incremental_should_use_level0_as_parent() {
     let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
@@ -238,7 +239,7 @@ async fn level2_incremental_should_use_level1_as_parent() {
         .s3
         .storage_class
         .backup_data
-        .push("GLACIER".to_string());
+        .push(StorageClass::Glacier);
     let task = movies_task();
     let parent = "bcb_level1.20260601T1430";
     let snap = "bcb_level2.20260602T1430";
@@ -255,13 +256,13 @@ async fn level2_incremental_should_use_level1_as_parent() {
     let manifest_bytes = latest_manifest_yaml(parent, 1);
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
@@ -328,7 +329,7 @@ async fn level1_should_fail_before_send_when_level0_part_size_differs() {
 async fn backup_should_fail_when_no_storage_class_configured_for_level() {
     let work_dir = tempfile::tempdir().unwrap();
     let mut config = test_config(work_dir.path());
-    config.s3.storage_class.backup_data = vec!["STANDARD".to_string()];
+    config.s3.storage_class.backup_data = vec![StorageClass::Standard];
     let task = movies_task();
 
     // Fails before the send, which can take hours, not after it.
@@ -358,13 +359,13 @@ async fn level1_should_fail_when_no_remote_level0_exists() {
 
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(false)); // no level-0 backup
+        .returning(|_| head(false)); // no level-0 backup
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
 
     let result = backup_task(&config, &task, 1, &btrfs, &remote).await;
     assert!(result.is_err(), "should fail without level 0 remote backup");
@@ -386,13 +387,13 @@ async fn level1_should_fail_when_parent_snapshot_missing_locally() {
     let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
@@ -422,9 +423,9 @@ async fn backup_should_skip_already_completed_backup() {
     let manifest = backup_manifest_yaml("bcb_level0.20260602T1430", SOURCE_UUID);
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
         .expect_download()
         .withf(|key| key.contains("/manifest.yaml"))
@@ -462,9 +463,9 @@ async fn skip_should_fail_when_existing_manifest_is_from_another_source() {
     let manifest = backup_manifest_yaml("bcb_level0.20260602T1430", "someone-else-uuid");
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
         .expect_download()
         .withf(|key| key.contains("/manifest.yaml"))
@@ -510,13 +511,13 @@ async fn backup_should_fail_when_snapshot_parent_uuid_mismatches() {
 fn remote_with_latest(latest: Vec<u8>) -> MockRemote {
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
@@ -542,8 +543,8 @@ async fn level1_should_fail_when_latest_manifest_is_from_another_source() {
     let mut latest = LatestManifest::new("replaced-disk-uuid".to_string());
     latest.levels.insert(
         0,
-        LatestBackup {
-            timestamp: "2026-06-01T14:30".to_string(),
+        LatestEntry {
+            timestamp: "2026-06-01T14:30".parse().unwrap(),
             snapshot_name: parent.to_string(),
             snapshot_uuid: snap_uuid(parent),
         },
@@ -625,8 +626,8 @@ async fn level0_of_new_source_should_replace_latest_manifest() {
     let mut old = LatestManifest::new("old-disk-uuid".to_string());
     old.levels.insert(
         0,
-        LatestBackup {
-            timestamp: "2026-01-01T01:00".to_string(),
+        LatestEntry {
+            timestamp: "2026-01-01T01:00".parse().unwrap(),
             snapshot_name: "bcb_level0.20260101T0100".to_string(),
             snapshot_uuid: "old-snap-uuid".to_string(),
         },
@@ -656,7 +657,7 @@ async fn level0_of_new_source_should_replace_latest_manifest() {
         .expect("must not be skipped");
 
     let bytes = uploaded.lock().unwrap().clone().unwrap();
-    let latest = btrfs_cold_backup::manifest::parse_latest(&bytes).unwrap();
+    let latest = LatestManifest::parse(&bytes).unwrap();
     assert_eq!(latest.source_uuid, SOURCE_UUID);
     assert_eq!(latest.levels.len(), 1);
     assert_eq!(latest.levels[&0].snapshot_uuid, snap_uuid(snap));
@@ -708,24 +709,24 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_latest_m
     let mut stale_last = LatestManifest::new(SOURCE_UUID.to_string());
     stale_last.levels.insert(
         0,
-        LatestBackup {
-            timestamp: "2026-01-01T01:00".to_string(),
+        LatestEntry {
+            timestamp: "2026-01-01T01:00".parse().unwrap(),
             snapshot_name: "bcb_level0.20260101T0100".to_string(),
             snapshot_uuid: snap_uuid("bcb_level0.20260101T0100"),
         },
     );
     stale_last.levels.insert(
         1,
-        LatestBackup {
-            timestamp: "2026-01-07T03:00".to_string(),
+        LatestEntry {
+            timestamp: "2026-01-07T03:00".parse().unwrap(),
             snapshot_name: "bcb_level1.20260107T0300".to_string(),
             snapshot_uuid: snap_uuid("bcb_level1.20260107T0300"),
         },
     );
     stale_last.levels.insert(
         2,
-        LatestBackup {
-            timestamp: "2026-01-14T03:00".to_string(),
+        LatestEntry {
+            timestamp: "2026-01-14T03:00".parse().unwrap(),
             snapshot_name: "bcb_level2.20260114T0300".to_string(),
             snapshot_uuid: snap_uuid("bcb_level2.20260114T0300"),
         },
@@ -737,13 +738,13 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_latest_m
 
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))
@@ -772,7 +773,7 @@ async fn new_level0_backup_should_prune_stale_deeper_level_entries_from_latest_m
         .unwrap()
         .clone()
         .expect("latest manifest must be re-uploaded");
-    let uploaded = btrfs_cold_backup::manifest::parse_latest(&uploaded_bytes).unwrap();
+    let uploaded = LatestManifest::parse(&uploaded_bytes).unwrap();
     assert!(
         uploaded.levels.contains_key(&0),
         "new level 0 entry must be present"
@@ -805,13 +806,13 @@ async fn level1_should_fail_when_snapshot_not_newer_than_parent() {
     let manifest_bytes = latest_manifest_yaml(parent, 0);
     let mut remote = MockRemote::new();
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("latest.yaml"))
-        .returning(|_| Ok(true));
+        .returning(|_| head(true));
     remote
-        .expect_exists()
+        .expect_head_metadata()
         .withf(|key| key.contains("/manifest.yaml"))
-        .returning(|_| Ok(false));
+        .returning(|_| head(false));
     remote
         .expect_download()
         .withf(|key| key.contains("latest.yaml"))

@@ -1,14 +1,26 @@
 use age::secrecy::ExposeSecret;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use btrfs_cold_backup::{
+    backup::backup_task,
     btrfs::BtrfsDriver,
+    check,
     config::{Config, Task},
     crypto,
+    fsutil::prepare_base_dir,
+    layout::TaskLayout,
+    list::list_backups,
     lock::InstanceLock,
-    remote::{RestoreTier, S3Backend},
+    remote::{RetrievalTier, S3Backend},
+    restore::{RestoreRequest, RetrievalOptions, restore_task},
+    timestamp::Timestamp,
+    verify::verify_task,
 };
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Exit code of a restore that made progress but isn't done, so a scheduler can tell it from
+/// success (0) and failure (1).
+const EXIT_RESTORE_IN_PROGRESS: i32 = 2;
 
 #[derive(Parser)]
 #[command(name = "bcb", about = "btrfs cold backup", version)]
@@ -31,7 +43,7 @@ enum Commands {
     /// Validate config and connectivity
     Check,
 
-    /// Verify an age key pair can encrypt and decrypt together
+    /// Verify a private key matches the configured public key
     TestKeys {
         /// Path to the age private key file
         #[arg(long)]
@@ -86,221 +98,37 @@ enum Commands {
         #[arg(long, default_value_t = 3)]
         restore_days: i32,
         /// Archive retrieval tier
-        #[arg(long, value_enum, default_value_t = RestoreTier::Standard)]
-        restore_tier: RestoreTier,
+        #[arg(long, value_enum, default_value_t = RetrievalTier::Standard)]
+        restore_tier: RetrievalTier,
     },
-}
-
-fn select_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
-    tasks
-        .iter()
-        .filter(|t| t.enabled)
-        .filter(|t| name.is_none_or(|n| t.name == n))
-        .collect()
-}
-
-/// Turns the list of task names a command failed for into its aggregate error, or `Ok(())`
-/// if none did. Shared by List/Verify/Backup, which each run every selected task to
-/// completion and collect failures here rather than stopping at the first one — one failing
-/// task must never prevent the others from being attempted.
-fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!("{verb} failed for task(s): {}", failed.join(", ")))
-    }
-}
-
-async fn acquire_runtime(config: &Config) -> Result<(BtrfsDriver, S3Backend, InstanceLock)> {
-    // Up front, so a missing executable fails the run before any work starts.
-    btrfs_cold_backup::check::check_binaries()?;
-
-    btrfs_cold_backup::util::prepare_base_dir(&config.base_dir)
-        .map_err(|e| anyhow!("failed to prepare base_dir: {e}"))?;
-
-    let lock_path = config.base_dir.join("bcb.lock");
-    let lock = InstanceLock::acquire(&lock_path)?;
-    let btrfs = BtrfsDriver;
-    let remote = S3Backend::new(&config.s3).await?;
-    Ok((btrfs, remote, lock))
-}
-
-// Stderr obeys RUST_LOG as before; backup/restore additionally append INFO+ to a daily
-// rolling file under base_dir so unattended cron runs leave a trail to debug from.
-fn init_logging(file_log_dir: Option<std::path::PathBuf>) {
-    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
-
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-
-    let file_layer = file_log_dir.and_then(|dir| {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("cannot create log directory {dir:?}: {e}; file logging disabled");
-            return None;
-        }
-        // Capped so unattended cron runs don't let the log directory grow forever; 30 daily
-        // files covers a month, comfortably past the longest gap between scheduled backups
-        // described in the README (level 0 twice a year, level 1 weekly).
-        let appender = match tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("bcb.log")
-            .max_log_files(30)
-            .build(&dir)
-        {
-            Ok(appender) => appender,
-            Err(e) => {
-                eprintln!("cannot create log appender in {dir:?}: {e}; file logging disabled");
-                return None;
-            }
-        };
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_writer(appender)
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        )
-    });
-
-    tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(file_layer)
-        .init();
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Commands::Genkey { output } = &cli.command {
+        init_logging(None);
+        return cmd_genkey(output);
+    }
 
-    let file_log_dir = match &cli.command {
-        // Errors loading the config are swallowed here on purpose; the command arm reloads
-        // it and reports them properly.
-        Commands::Backup { .. } | Commands::Restore { .. } => Config::from_file(&cli.config)
-            .ok()
-            .map(|c| c.base_dir.join("log")),
-        _ => None,
-    };
+    let config = Config::from_file(&cli.config)?;
+    // Backup and restore also log to a file under base_dir, so unattended runs leave a trail.
+    let file_log_dir = matches!(
+        cli.command,
+        Commands::Backup { .. } | Commands::Restore { .. }
+    )
+    .then(|| config.base_dir.join("log"));
     init_logging(file_log_dir);
 
     match cli.command {
-        Commands::Genkey { output } => {
-            let pair = crypto::generate_key_pair();
-            crypto::write_private_key(&output, pair.private_key.expose_secret())?;
-            println!("{}", pair.public_key);
-        }
-
-        Commands::Check => {
-            let config = Config::from_file(&cli.config)?;
-            btrfs_cold_backup::check::check_binaries()?;
-            let btrfs = BtrfsDriver;
-            let remote = S3Backend::new(&config.s3).await?;
-            btrfs_cold_backup::check::check(&config, &btrfs, &remote).await?;
-            println!("OK");
-        }
-
-        Commands::TestKeys { private_key } => {
-            let config = Config::from_file(&cli.config)?;
-            let key_str = std::fs::read_to_string(&private_key)
-                .map_err(|e| anyhow!("failed to read private key {:?}: {e}", private_key))?;
-
-            let identity = crypto::parse_identity(key_str.trim())?;
-            crypto::ensure_key_pair(&config.age_public_key, &identity)?;
-            println!("OK: private key matches the configured public key");
-        }
-
-        Commands::List { task, level } => {
-            let config = Config::from_file(&cli.config)?;
-            let remote = S3Backend::new(&config.s3).await?;
-
-            let mut failed: Vec<String> = Vec::new();
-            for t in select_tasks(&config.tasks, task.as_deref()) {
-                match btrfs_cold_backup::list::list_backups(&config, t, &remote).await {
-                    Ok(entries) => {
-                        let mut shown = 0usize;
-                        for entry in entries {
-                            if level.is_none_or(|l| l == entry.level) {
-                                println!("{}\tlevel{}\t{}", t.name, entry.level, entry.timestamp);
-                                shown += 1;
-                            }
-                        }
-                        if shown == 0 {
-                            println!("{}: no backups found", t.name);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("{}: list failed: {e:#}", t.name);
-                        failed.push(t.name.clone());
-                    }
-                }
-            }
-            aggregate_failures("list", &failed)?;
-        }
-
+        Commands::Genkey { .. } => unreachable!("handled above"),
+        Commands::Check => cmd_check(&config).await,
+        Commands::TestKeys { private_key } => cmd_test_keys(&config, &private_key),
+        Commands::List { task, level } => cmd_list(&config, task.as_deref(), level).await,
         Commands::Verify { task, max_age_days } => {
-            let config = Config::from_file(&cli.config)?;
-            let remote = S3Backend::new(&config.s3).await?;
-
-            let mut failed: Vec<String> = Vec::new();
-            for t in select_tasks(&config.tasks, task.as_deref()) {
-                match btrfs_cold_backup::verify::verify_task(&config, t, &remote, max_age_days)
-                    .await
-                {
-                    Ok(issues) if issues.is_empty() => {
-                        println!("{}: OK", t.name);
-                    }
-                    Ok(issues) => {
-                        for issue in &issues {
-                            println!("{}: level {}: {}", t.name, issue.level, issue.description);
-                        }
-                        failed.push(t.name.clone());
-                    }
-                    Err(e) => {
-                        eprintln!("{}: verify failed: {e:#}", t.name);
-                        failed.push(t.name.clone());
-                    }
-                }
-            }
-            aggregate_failures("verify", &failed)?;
+            cmd_verify(&config, task.as_deref(), max_age_days).await
         }
-
-        Commands::Backup { level, task } => {
-            let config = Config::from_file(&cli.config)?;
-            let (btrfs, remote, _lock) = acquire_runtime(&config).await?;
-
-            let tasks = select_tasks(&config.tasks, task.as_deref());
-            if tasks.is_empty() {
-                return Err(anyhow!("no matching enabled tasks found"));
-            }
-
-            // One failing task must not block the others; run them all and report at the end.
-            // Outcomes go to tracing as well so the daily log file records them.
-            let mut failed: Vec<String> = Vec::new();
-            for t in tasks {
-                tracing::info!(task = %t.name, level, "backup started");
-                match btrfs_cold_backup::backup::backup_task(&config, t, level, &btrfs, &remote)
-                    .await
-                {
-                    Ok(Some(backup)) => {
-                        tracing::info!(task = %t.name, level, timestamp = %backup.timestamp, "backup completed");
-                        println!(
-                            "{}: level {} backup completed ({})",
-                            t.name, backup.level, backup.timestamp
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::info!(task = %t.name, level, "already backed up, skipped");
-                        println!("{}: level {level} already backed up, skipped", t.name);
-                    }
-                    Err(e) => {
-                        tracing::error!(task = %t.name, level, error = format!("{e:#}"), "backup failed");
-                        eprintln!("{}: level {level} backup failed: {e:#}", t.name);
-                        failed.push(t.name.clone());
-                    }
-                }
-            }
-            aggregate_failures("backup", &failed)?;
-        }
-
+        Commands::Backup { level, task } => cmd_backup(&config, level, task.as_deref()).await,
         Commands::Restore {
             task,
             level,
@@ -310,76 +138,249 @@ async fn main() -> Result<()> {
             restore_days,
             restore_tier,
         } => {
-            let config = Config::from_file(&cli.config)?;
-            let (_btrfs, remote, _lock) = acquire_runtime(&config).await?;
-
-            let t = config
-                .tasks
-                .iter()
-                .find(|t| t.name == task)
-                .ok_or_else(|| anyhow!("task '{task}' not found in config"))?;
-
-            let key_str = std::fs::read_to_string(&private_key)
-                .map_err(|e| anyhow!("failed to read private key {:?}: {e}", private_key))?;
-
-            let retrieval = btrfs_cold_backup::restore::RetrievalOptions {
-                days: restore_days,
-                tier: restore_tier,
-            };
-
-            tracing::info!(task = %t.name, level, date, "restore started");
-            let result = btrfs_cold_backup::restore::restore_task(
-                &config,
-                t,
+            let request = RestoreRequest {
                 level,
-                &date,
-                &target,
-                key_str.trim(),
-                &retrieval,
-                &remote,
-            )
-            .await;
-            match &result {
-                Ok(p) if p.completed => {
-                    tracing::info!(task = %t.name, level, "restore completed")
+                timestamp: Timestamp::from_cli_date(&date)?,
+                target_dir: target,
+                identity: read_private_key(&private_key)?,
+                retrieval: RetrievalOptions {
+                    days: restore_days,
+                    tier: restore_tier,
+                },
+            };
+            cmd_restore(&config, &task, &request).await
+        }
+    }
+}
+
+fn cmd_genkey(output: &Path) -> Result<()> {
+    let pair = crypto::generate_key_pair();
+    crypto::write_private_key(output, pair.private_key.expose_secret())?;
+    println!("{}", pair.public_key);
+    Ok(())
+}
+
+async fn cmd_check(config: &Config) -> Result<()> {
+    check::check_binaries()?;
+    let remote = S3Backend::new(&config.s3).await?;
+    check::check(config, &BtrfsDriver, &remote).await?;
+    println!("OK");
+    Ok(())
+}
+
+fn cmd_test_keys(config: &Config, private_key: &Path) -> Result<()> {
+    crypto::ensure_key_pair(&config.age_public_key, &read_private_key(private_key)?)?;
+    println!("OK: private key matches the configured public key");
+    Ok(())
+}
+
+async fn cmd_list(config: &Config, task: Option<&str>, level: Option<u32>) -> Result<()> {
+    let remote = S3Backend::new(&config.s3).await?;
+    let mut failed = Vec::new();
+    for t in enabled_tasks(&config.tasks, task) {
+        let ids = match TaskLayout::new(config, t) {
+            Ok(layout) => list_backups(&remote, &layout).await,
+            Err(e) => Err(e),
+        };
+        match ids {
+            Ok(ids) => {
+                let shown: Vec<_> = ids
+                    .into_iter()
+                    .filter(|id| level.is_none_or(|l| l == id.level))
+                    .collect();
+                if shown.is_empty() {
+                    println!("{}: no backups found", t.name);
                 }
-                Ok(p) => {
-                    tracing::info!(
-                        task = %t.name,
-                        level,
-                        parts_downloaded = p.parts_downloaded,
-                        parts_total = p.parts_total,
-                        bytes_remaining = p.bytes_remaining,
-                        "restore in progress"
-                    )
-                }
-                Err(e) => {
-                    tracing::error!(task = %t.name, level, error = format!("{e:#}"), "restore failed")
+                for id in shown {
+                    println!("{}\tlevel{}\t{}", t.name, id.level, id.timestamp);
                 }
             }
-            let progress = result?;
-
-            if progress.completed {
-                println!("restore complete");
-            } else {
-                println!(
-                    "restore in progress: {}/{} parts downloaded, {} bytes remaining; re-run once further retrievals complete",
-                    progress.parts_downloaded, progress.parts_total, progress.bytes_remaining
-                );
-                // Distinct exit code so schedulers can tell "not done yet" from success (0)
-                // and failure (1).
-                std::process::exit(2);
+            Err(e) => {
+                eprintln!("{}: list failed: {e:#}", t.name);
+                failed.push(t.name.clone());
             }
         }
     }
+    aggregate_failures("list", &failed)
+}
 
-    Ok(())
+async fn cmd_verify(config: &Config, task: Option<&str>, max_age_days: Option<u64>) -> Result<()> {
+    let remote = S3Backend::new(&config.s3).await?;
+    let mut failed = Vec::new();
+    for t in enabled_tasks(&config.tasks, task) {
+        match verify_task(config, t, &remote, max_age_days).await {
+            Ok(issues) if issues.is_empty() => println!("{}: OK", t.name),
+            Ok(issues) => {
+                for issue in &issues {
+                    match issue.level {
+                        Some(level) => {
+                            println!("{}: level {level}: {}", t.name, issue.description)
+                        }
+                        None => println!("{}: {}", t.name, issue.description),
+                    }
+                }
+                failed.push(t.name.clone());
+            }
+            Err(e) => {
+                eprintln!("{}: verify failed: {e:#}", t.name);
+                failed.push(t.name.clone());
+            }
+        }
+    }
+    aggregate_failures("verify", &failed)
+}
+
+async fn cmd_backup(config: &Config, level: u32, task: Option<&str>) -> Result<()> {
+    let (remote, _lock) = acquire_runtime(config).await?;
+    let tasks = enabled_tasks(&config.tasks, task);
+    if tasks.is_empty() {
+        return Err(anyhow!("no matching enabled tasks found"));
+    }
+
+    // Outcomes are logged too, so the log file records them.
+    let mut failed = Vec::new();
+    for t in tasks {
+        tracing::info!(task = %t.name, level, "backup started");
+        match backup_task(config, t, level, &BtrfsDriver, &remote).await {
+            Ok(Some(backup)) => {
+                tracing::info!(task = %t.name, level, timestamp = %backup.timestamp, "backup completed");
+                println!(
+                    "{}: level {level} backup completed ({})",
+                    t.name, backup.timestamp
+                );
+            }
+            Ok(None) => {
+                tracing::info!(task = %t.name, level, "already backed up, skipped");
+                println!("{}: level {level} already backed up, skipped", t.name);
+            }
+            Err(e) => {
+                tracing::error!(task = %t.name, level, error = format!("{e:#}"), "backup failed");
+                eprintln!("{}: level {level} backup failed: {e:#}", t.name);
+                failed.push(t.name.clone());
+            }
+        }
+    }
+    aggregate_failures("backup", &failed)
+}
+
+async fn cmd_restore(config: &Config, task: &str, request: &RestoreRequest) -> Result<()> {
+    let (remote, _lock) = acquire_runtime(config).await?;
+    let t = config
+        .tasks
+        .iter()
+        .find(|t| t.name == task)
+        .ok_or_else(|| anyhow!("task '{task}' not found in config"))?;
+    let level = request.level;
+
+    tracing::info!(task = %t.name, level, timestamp = %request.timestamp, "restore started");
+    let progress = match restore_task(config, t, request, &BtrfsDriver, &remote).await {
+        Ok(progress) => progress,
+        Err(e) => {
+            tracing::error!(task = %t.name, level, error = format!("{e:#}"), "restore failed");
+            return Err(e);
+        }
+    };
+    if progress.completed {
+        tracing::info!(task = %t.name, level, "restore completed");
+        println!("restore complete");
+        return Ok(());
+    }
+    tracing::info!(
+        task = %t.name,
+        level,
+        parts_downloaded = progress.parts_downloaded,
+        parts_total = progress.parts_total,
+        bytes_remaining = progress.bytes_remaining,
+        "restore in progress"
+    );
+    println!(
+        "restore in progress: {}/{} parts downloaded, {} bytes remaining; re-run once further \
+         retrievals complete",
+        progress.parts_downloaded, progress.parts_total, progress.bytes_remaining
+    );
+    std::process::exit(EXIT_RESTORE_IN_PROGRESS);
+}
+
+fn read_private_key(path: &Path) -> Result<age::x25519::Identity> {
+    let key = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read private key {path:?}"))?;
+    crypto::parse_identity(key.trim())
+}
+
+fn enabled_tasks<'a>(tasks: &'a [Task], name: Option<&str>) -> Vec<&'a Task> {
+    tasks
+        .iter()
+        .filter(|t| t.enabled)
+        .filter(|t| name.is_none_or(|n| t.name == n))
+        .collect()
+}
+
+/// The aggregate error of a command that ran every selected task, or Ok if none failed.
+/// List, verify and backup run every task to completion rather than stopping at the first
+/// failure: one failing task must never keep the others from being attempted.
+fn aggregate_failures(verb: &str, failed: &[String]) -> Result<()> {
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("{verb} failed for task(s): {}", failed.join(", ")))
+    }
+}
+
+/// What backup and restore need before touching anything: the external executables, a
+/// prepared base_dir, and the lock that keeps other bcb instances out.
+async fn acquire_runtime(config: &Config) -> Result<(S3Backend, InstanceLock)> {
+    check::check_binaries()?;
+    prepare_base_dir(&config.base_dir)?;
+    let lock = InstanceLock::acquire(&config.base_dir.join("bcb.lock"))?;
+    let remote = S3Backend::new(&config.s3).await?;
+    Ok((remote, lock))
+}
+
+/// Stderr obeys RUST_LOG. With `file_log_dir`, INFO and above also go to a daily rolling file
+/// there.
+fn init_logging(file_log_dir: Option<PathBuf>) {
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+
+    let file_layer = file_log_dir.and_then(|dir| match file_appender(&dir) {
+        Ok(appender) => Some(
+            tracing_subscriber::fmt::layer()
+                .with_writer(appender)
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        ),
+        Err(e) => {
+            eprintln!("file logging disabled: {e:#}");
+            None
+        }
+    });
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
+}
+
+/// Daily log files in `dir`, capped so the directory doesn't grow forever under unattended
+/// runs. The cap keeps logs well past the longest gap between the scheduled backups the
+/// README describes.
+fn file_appender(dir: &Path) -> Result<tracing_appender::rolling::RollingFileAppender> {
+    const MAX_LOG_FILES: usize = 30;
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create log directory {dir:?}"))?;
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("bcb.log")
+        .max_log_files(MAX_LOG_FILES)
+        .build(dir)
+        .with_context(|| format!("cannot create log appender in {dir:?}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn task(name: &str, enabled: bool) -> Task {
         Task {
@@ -392,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tasks_no_filter_returns_all_enabled() {
+    fn test_enabled_tasks_no_filter_returns_all_enabled() {
         let tasks = vec![task("a", true), task("b", true), task("c", false)];
-        let selected = select_tasks(&tasks, None);
+        let selected = enabled_tasks(&tasks, None);
         assert_eq!(
             selected.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"]
@@ -402,16 +403,16 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tasks_by_name_ignores_disabled() {
+    fn test_enabled_tasks_by_name_ignores_disabled() {
         let tasks = vec![task("a", true), task("b", false)];
-        assert!(select_tasks(&tasks, Some("b")).is_empty());
-        assert_eq!(select_tasks(&tasks, Some("a")).len(), 1);
+        assert!(enabled_tasks(&tasks, Some("b")).is_empty());
+        assert_eq!(enabled_tasks(&tasks, Some("a")).len(), 1);
     }
 
     #[test]
-    fn test_select_tasks_unknown_name_is_empty() {
+    fn test_enabled_tasks_unknown_name_is_empty() {
         let tasks = vec![task("a", true)];
-        assert!(select_tasks(&tasks, Some("nonexistent")).is_empty());
+        assert!(enabled_tasks(&tasks, Some("nonexistent")).is_empty());
     }
 
     #[test]

@@ -4,8 +4,8 @@ The VM test suite runs against a local S3-compatible server (SeaweedFS), which n
 enforces Glacier's access restrictions or retrieval scheduling — every test task's
 `storage_class.backup_data` is `STANDARD`. That leaves the following untested against real AWS:
 
-- `request_restore` actually issuing `RestoreObject` with `GlacierJobParameters.tier`
-- `restore_status_detail` parsing a real `x-amz-restore` response header
+- `request_retrieval` actually issuing `RestoreObject` with `GlacierJobParameters.tier`
+- `retrieval_status` parsing a real `x-amz-restore` response header
 - AWS's `RestoreAlreadyInProgress` / `ObjectAlreadyInActiveTierError` error handling when a
   retrieval starts between bcb's status check and its request
 - the retrieval-wave/budget scheduling in `restore.rs` behaving correctly under the real ~12h

@@ -213,7 +213,7 @@ async fn part_damaged_before_finalize_should_be_downloaded_again() {
     child.kill().unwrap();
     child.wait().unwrap();
 
-    let damaged = restore_work_dir(&f).join("part-000000.age");
+    let damaged = restore_work_dir(&f).join("snapshot.part-000000.age");
     let mut bytes = std::fs::read(&damaged).unwrap();
     bytes[1000] ^= 0xff;
     std::fs::write(&damaged, bytes).unwrap();
