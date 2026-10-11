@@ -31,6 +31,7 @@ words:
   - journalctl
   - kbps
   - libc
+  - LUKS
   - nocapture
   - nohup
   - ntfy
