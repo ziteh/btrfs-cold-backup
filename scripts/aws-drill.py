@@ -155,8 +155,8 @@ class Guest:
         return len(uploads.get("Uploads", []))
 
 
-def btrfs(*args):
-    run("btrfs", *args, stdout=subprocess.DEVNULL)
+def btrfs(*args, **kwargs):
+    run("btrfs", *args, stdout=subprocess.DEVNULL, **kwargs)
 
 
 def write_random(path, size):
