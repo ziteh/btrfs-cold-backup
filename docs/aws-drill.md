@@ -28,6 +28,12 @@ Like `bcb restore`, the drill is re-run until it exits 0:
 
 The first run backs up, checks, and requests retrieval. Later runs finish the restores. `task aws-drill -- --new` abandons a waiting run and starts over.
 
+`task` reports every failure of the script as exit code 201, so `task aws-drill` cannot tell a failed assertion (1) from a wait (2). To re-run unattended until the drill is done, loop on the script itself:
+
+```bash
+while python3 scripts/aws-drill.py; rc=$?; [ $rc -eq 2 ]; do sleep 1800; done; echo "exit=$rc"
+```
+
 Each run writes under its own prefix, `aws-drill/run-<UTC time>-<commit>/`, so runs never interfere and nothing needs deleting by hand.
 
 Host requirements: Python 3.11+, `multipass`, `cargo-zigbuild`, and AWS CLI v2.
